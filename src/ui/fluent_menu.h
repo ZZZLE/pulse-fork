@@ -71,6 +71,8 @@ struct FluentMenuItem {
     std::vector<FluentMenuItem> children;
     float glyph_scale = 1.0f;      // Per-item visual scale inside the fixed icon slot.
     bool accent_glyph = false;     // Glyph drawn in the accent colour (assistant hand-off).
+    bool has_glyph_color = false;  // Per-item glyph colour (overrides accent/foreground).
+    D2D1_COLOR_F glyph_color{};
     bool shortcut_inline = false; // Search paths follow a shared, compact filename column.
     int trailing_command = 0;     // Optional hover-revealed close action at the right edge.
     std::wstring tooltip;

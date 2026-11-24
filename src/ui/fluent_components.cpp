@@ -1588,7 +1588,8 @@ void Painter::DrawMenuItem(const MenuItemSpec& spec) {
                                          content.left + icon_width, content.bottom);
     auto draw_glyph = [&]() {
         const D2D1_COLOR_F glyph_color =
-            spec.accent_glyph && spec.state.enabled ? theme_->accent : foreground;
+            spec.has_glyph_color && spec.state.enabled ? spec.glyph_color
+            : spec.accent_glyph && spec.state.enabled ? theme_->accent : foreground;
         const float glyph_scale = std::clamp(spec.glyph_scale, 0.6f, 1.2f);
         IDWriteTextFormat* iconFormat = MenuIconFormat();
         if (std::abs(glyph_scale - 1.0f) < 0.001f || spec.glyph.empty()) {

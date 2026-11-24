@@ -2064,6 +2064,12 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         s->core.started = true;
         // M7c: a color for it; with a second window every window shows its name.
         SyncWindowIdentities(*s);
+        // Native packages register their menu commands during plugin entry.
+        // Loading the enabled ones here makes those commands available from the
+        // first right-click instead of after the command palette has been opened.
+        if (init_core && !s->isolatedTest && !s->shot.active && !s->menushot) {
+            pulse::extensions::native::PrepareCommandPackages(*s);
+        }
         return 0;
     }
 

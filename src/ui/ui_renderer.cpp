@@ -2762,34 +2762,38 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     }
 
     }
-    // Window controls, right-aligned in Win11 order: min, max/restore, close.
+    // Window controls, right-aligned: macOS-style traffic lights.
+    // Order stays min / max-restore / close (left to right); each control is a
+    // coloured dot that reveals its original symbol only while hovered.
     const float ctrlY = y;
     const float ctrlH = h;
+    const float dotD = 13.0f * scale_;
+    const float dotR = dotD * 0.5f;
+    auto drawTrafficLight = [&](const D2D1_RECT_F& rc, const D2D1_COLOR_F& fill, bool hovered,
+                                const std::wstring& glyph, const std::wstring& fallback) {
+        const float cxp = (rc.left + rc.right) * 0.5f;
+        const float cyp = (rc.top + rc.bottom) * 0.5f;
+        MakeBrush(dc, fill, brDanger_);
+        FillRoundedRect(dc, brDanger_.get(), cxp - dotR, cyp - dotR, dotD, dotD, dotR);
+        if (hovered) {
+            DrawIconText(cxp - dotR, cyp - dotR, dotD, dotD, glyph, fallback,
+                         HexColor(0x000000, 0.62f), 0.40f);
+        }
+    };
     float cx = right;
     cx -= ctrlW;
     D2D1_RECT_F closeRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Close)) {
-        MakeBrush(dc, theme.danger, brDanger_);
-        FillRect(dc, brDanger_.get(), closeRc.left, closeRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(closeRc.left, closeRc.top, ctrlW, ctrlH, kIconClose, L"x",
-        IsHovered(vm, HitTestResult::Close) ? HexColor(0xFFFFFF) : theme.text, 0.66f);
+    drawTrafficLight(closeRc, HexColor(0xFF5F57), IsHovered(vm, HitTestResult::Close),
+                     kIconClose, L"x");
     cx -= ctrlW;
     D2D1_RECT_F maxRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Maximize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), maxRc.left, maxRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(maxRc.left, maxRc.top, ctrlW, ctrlH,
-        vm.maximized ? kIconRestore : kIconMaximize, vm.maximized ? L"[]" : L"\u25A1",
-        theme.text, 0.66f);
+    drawTrafficLight(maxRc, HexColor(0xFEBC2E), IsHovered(vm, HitTestResult::Maximize),
+                     vm.maximized ? kIconRestore : kIconMaximize,
+                     vm.maximized ? L"[]" : L"\u25A1");
     cx -= ctrlW;
     D2D1_RECT_F minRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Minimize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), minRc.left, minRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(minRc.left, minRc.top, ctrlW, ctrlH, kIconMinimize, L"_", theme.text, 0.66f);
+    drawTrafficLight(minRc, HexColor(0x28C840), IsHovered(vm, HitTestResult::Minimize),
+                     kIconMinimize, L"_");
 }
 
 void MainRenderer::DrawTeachBubble(const WindowViewModel& vm, const D2D1_RECT_F& rect,

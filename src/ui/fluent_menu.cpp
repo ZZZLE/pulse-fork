@@ -1037,6 +1037,8 @@ bool FluentMenu::RenderSurface(const FluentMenuModel& model, int hover_row, int 
             spec.glyph = it->glyph;
             spec.glyph_scale = it->glyph_scale;
             spec.accent_glyph = it->accent_glyph;
+            spec.has_glyph_color = it->has_glyph_color;
+            spec.glyph_color = it->glyph_color;
             spec.shortcut = it->shortcut;
             spec.shortcut_inline = it->shortcut_inline;
             spec.inline_label_width = model.InlineLabelWidthPx();

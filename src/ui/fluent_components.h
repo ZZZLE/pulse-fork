@@ -129,6 +129,8 @@ struct MenuItemSpec {
     D2D1_COLOR_F swatch_color{};
     float glyph_scale = 1.0f;
     bool accent_glyph = false;     // glyph in the accent colour (assistant hand-off)
+    bool has_glyph_color = false;  // per-item glyph colour (overrides accent/foreground)
+    D2D1_COLOR_F glyph_color{};
     bool shortcut_inline = false;
     float inline_label_width = 0.0f;
     // Explorer-style app icon (premultiplied, same device as the painter's
