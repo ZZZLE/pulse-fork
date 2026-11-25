@@ -71,6 +71,7 @@ std::vector<ui::FluentMenuItem> TrayMenuItems(AppState &s) {
     // Merge spans all monitors, unlike arrangement's default current monitor.
     items.back().enabled = WindowArrangementCandidates(s, true, {}, true).size() >= 2;
     items.back().separator_after = true;
+    add(5, I::SettingsRestartNow, L"\xE72C");
     add(2, I::TrayExit, L"\xE8BB");
     return items;
 }

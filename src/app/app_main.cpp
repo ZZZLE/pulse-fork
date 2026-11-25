@@ -2234,6 +2234,15 @@ LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    case WM_RESTART_PULSE:
+        // Tray 「立即重启 Pulse」: start a waiting instance, then exit this one.
+        if (s) {
+            RestartPulse(*s);
+        } else {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+
     case WM_EXIT_PULSE:
         // Palette "Exit Pulse" (#57): the tray menu's full exit, reachable
         // when the icon is hidden. Posted so the palette unwinds first.
