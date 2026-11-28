@@ -291,12 +291,13 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             r.region = kRegions[static_cast<size_t>(std::clamp(slot.kind, 0, kTitleButtonKinds - 1))];
             return r;
         }
-        float ctrlX = rect.right - ctrlW;
+        // Traffic lights, Windows order from the left: minimize, maximize, close.
+        float ctrlX = rect.right - ctrlW * 3.0f;
+        if (x >= ctrlX && x < ctrlX + ctrlW) { r.region = HitTestResult::Minimize; return r; }
+        ctrlX += ctrlW;
+        if (x >= ctrlX && x < ctrlX + ctrlW) { r.region = HitTestResult::Maximize; return r; }
+        ctrlX += ctrlW;
         if (x >= ctrlX) { r.region = HitTestResult::Close; return r; }
-        ctrlX -= ctrlW;
-        if (x >= ctrlX) { r.region = HitTestResult::Maximize; return r; }
-        ctrlX -= ctrlW;
-        if (x >= ctrlX) { r.region = HitTestResult::Minimize; return r; }
         return r;
     }
 

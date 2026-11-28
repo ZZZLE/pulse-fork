@@ -110,6 +110,9 @@ public:
         return dc_.get();
     }
     IDWriteFactory2* DwriteFactory() const { return dwriteFactory_.get(); }
+    // Path geometry (solid arrowheads) is created from the factory, not the
+    // device context.
+    ID2D1Factory1* D2DFactory() const { return d2dFactory_.get(); }
     HWND Hwnd() const { return hwnd_; }
     bool AdapterDescription(DXGI_ADAPTER_DESC& description) const {
         ComPtr<IDXGIAdapter> adapter;

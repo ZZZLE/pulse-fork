@@ -1466,6 +1466,82 @@ void Painter::DrawTitleBarButton(const D2D1_RECT_F& bounds, TitleBarButtonRole r
     if (!theme_ || !dc_) {
         return;
     }
+    // Traffic lights: dialogs (picker, save, rename, confirm, ...) get the same
+    // macOS dots as the main window instead of a caption glyph. Roles map to
+    // Windows order: minimize yellow, maximize/restore green, close red.
+    if (role != TitleBarButtonRole::Custom) {
+        const float w = bounds.right - bounds.left;
+        const float h = bounds.bottom - bounds.top;
+        if (w <= 0.0f || h <= 0.0f) return;
+        const float cx = (bounds.left + bounds.right) * 0.5f;
+        const float cy = (bounds.top + bounds.bottom) * 0.5f;
+        // Same size as the main window's dots (7.2 DIP radius), not a share of
+        // the cell: the dialog's close cell is larger, which made the dot huge.
+        const float r = Px(7.2f);
+        D2D1_COLOR_F fill = HexColor(0xFFD60A);                       // maximize / restore: yellow
+        if (role == TitleBarButtonRole::Close) fill = HexColor(0xFF453A);
+        else if (role == TitleBarButtonRole::Minimize) fill = HexColor(0x30D158);
+        if (!state.enabled) {
+            fill.a *= 0.45f;
+        } else if (state.pressed) {
+            fill.r = (std::min)(1.0f, fill.r * 0.88f);
+            fill.g = (std::min)(1.0f, fill.g * 0.88f);
+            fill.b = (std::min)(1.0f, fill.b * 0.88f);
+        }
+        dc_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), r, r), ScratchBrush(fill));
+        if (state.enabled && (state.hovered || state.pressed)) {
+            // A darker shade of the dot, matching the main window's glyphs.
+            const D2D1_COLOR_F pen_color = role == TitleBarButtonRole::Close ? HexColor(0x99160F)
+                                            : role == TitleBarButtonRole::Minimize ? HexColor(0x0B6E2A)
+                                                                                   : HexColor(0x8A6D00);
+            ID2D1SolidColorBrush* pen = ScratchBrush(pen_color);
+            if (role == TitleBarButtonRole::Close) {
+                // Short and thick, like the main window's.
+                const float sym = r * 0.36f;
+                const float line = (std::max)(1.0f, Px(1.8f));
+                dc_->DrawLine(D2D1::Point2F(cx - sym, cy - sym), D2D1::Point2F(cx + sym, cy + sym), pen, line);
+                dc_->DrawLine(D2D1::Point2F(cx + sym, cy - sym), D2D1::Point2F(cx - sym, cy + sym), pen, line);
+            } else if (role == TitleBarButtonRole::Minimize) {
+                const float sym = r * 0.44f;
+                const float line = (std::max)(1.0f, Px(1.6f));
+                dc_->DrawLine(D2D1::Point2F(cx - sym, cy), D2D1::Point2F(cx + sym, cy), pen, line);
+            } else {
+                // Solid triangular heads side by side; see the main window's
+                // note: diagonal heads overlapped near the centre.
+                const float len = r * 0.33f;
+                const float halfw = r * 0.33f;
+                const bool collapse = role == TitleBarButtonRole::Restore;
+                const auto tri = [&](float tx, float ty, float ux, float uy) {
+                    ID2D1Factory1* factory = compositor_ ? compositor_->D2DFactory() : nullptr;
+                    if (!factory) return;
+                    ID2D1PathGeometry* geo = nullptr;
+                    if (FAILED(factory->CreatePathGeometry(&geo)) || !geo) return;
+                    ID2D1GeometrySink* sink = nullptr;
+                    if (FAILED(geo->Open(&sink)) || !sink) { geo->Release(); return; }
+                    const float bx = tx - ux * len, by = ty - uy * len;
+                    const float px = -uy * halfw, py = ux * halfw;
+                    sink->BeginFigure(D2D1::Point2F(tx, ty), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(bx + px, by + py));
+                    sink->AddLine(D2D1::Point2F(bx - px, by - py));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                    dc_->FillGeometry(geo, pen);
+                    geo->Release();
+                };
+                if (collapse) {
+                    const float off = r * 0.17f;
+                    tri(cx - off, cy, 1.0f, 0.0f);
+                    tri(cx + off, cy, -1.0f, 0.0f);
+                } else {
+                    const float off = r * 0.47f;
+                    tri(cx - off, cy, -1.0f, 0.0f);
+                    tri(cx + off, cy, 1.0f, 0.0f);
+                }
+            }
+        }
+        return;
+    }
     D2D1_COLOR_F fill{};
     D2D1_COLOR_F foreground = state.enabled ? theme_->text : theme_->text_disabled;
     bool draw_fill = false;

@@ -3076,34 +3076,78 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
         }
     }
     }
-    // Window controls, right-aligned in Win11 order: min, max/restore, close.
-    const float ctrlY = y;
-    const float ctrlH = h;
-    float cx = right;
-    cx -= ctrlW;
-    D2D1_RECT_F closeRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Close)) {
-        MakeBrush(dc, vm.button_pressed ? theme.danger_hover : theme.danger, brDanger_);
-        FillRect(dc, brDanger_.get(), closeRc.left, closeRc.top, ctrlW, ctrlH);
+    // Traffic lights in Windows order left to right: minimize (green), maximize
+    // or restore (yellow), close (red). Brighter and more saturated than the
+    // macOS defaults, glyphs drawn in a darker shade of each dot. Hovering
+    // reveals the glyph; the yellow one shows expand or collapse to match.
+    {
+        const float dotR = 7.2f * scale_;
+        const float cy = y + h * 0.5f;
+        const auto dot = [&](int cell, HitTestResult::Region region, D2D1_COLOR_F fill, D2D1_COLOR_F hot,
+                             int glyph) {
+            const float cx = right - (3.0f - static_cast<float>(cell)) * ctrlW + ctrlW * 0.5f;
+            const bool hovered = IsHovered(vm, region);
+            MakeBrush(dc, hovered ? hot : fill, brAccent_);
+            dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), dotR, dotR), brAccent_.get());
+            if (!hovered) return;
+            const D2D1_COLOR_F pen_color = glyph == 0 ? D2D1::ColorF(0x99160F)      // close: dark red
+                                           : glyph == 1 ? D2D1::ColorF(0x0B6E2A)    // minimize: dark green
+                                                        : D2D1::ColorF(0x8A6D00);   // maximize: dark ochre
+            MakeBrush(dc, pen_color, brStrokeDivider_);
+            ID2D1SolidColorBrush* pen = brStrokeDivider_.get();
+            if (glyph == 0) {
+                // Close: a short, thick x.
+                const float sym = 2.6f * scale_, w = 1.8f * scale_;
+                dc->DrawLine(D2D1::Point2F(cx - sym, cy - sym), D2D1::Point2F(cx + sym, cy + sym), pen, w);
+                dc->DrawLine(D2D1::Point2F(cx + sym, cy - sym), D2D1::Point2F(cx - sym, cy + sym), pen, w);
+            } else if (glyph == 1) {
+                // Minimize: a minus.
+                const float sym = 3.2f * scale_, w = 1.6f * scale_;
+                dc->DrawLine(D2D1::Point2F(cx - sym, cy), D2D1::Point2F(cx + sym, cy), pen, w);
+            } else {
+                // Solid triangular heads side by side (not on the diagonal):
+                // diagonal heads always overlapped near the centre because each
+                // one reaches back toward it. Horizontal ones stay apart.
+                // Maximize points outward, restore points inward.
+                const float len = 2.4f * scale_;    // along x
+                const float halfw = 2.4f * scale_;  // half height (flattened)
+                const auto tri = [&](float tx, float ty, float ux, float uy) {
+                    ID2D1Factory1* factory = compositor_ ? compositor_->D2DFactory() : nullptr;
+                    if (!factory) return;
+                    ID2D1PathGeometry* geo = nullptr;
+                    if (FAILED(factory->CreatePathGeometry(&geo)) || !geo) return;
+                    ID2D1GeometrySink* sink = nullptr;
+                    if (FAILED(geo->Open(&sink)) || !sink) { geo->Release(); return; }
+                    const float bx = tx - ux * len, by = ty - uy * len;
+                    const float px = -uy * halfw, py = ux * halfw;
+                    sink->BeginFigure(D2D1::Point2F(tx, ty), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(bx + px, by + py));
+                    sink->AddLine(D2D1::Point2F(bx - px, by - py));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                    dc->FillGeometry(geo, pen);
+                    geo->Release();
+                };
+                if (vm.maximized) {
+                    // Restore: tips point at the centre and sit close in; the
+                    // bases reach outward, so the two never cross.
+                    const float off = 1.2f * scale_;
+                    tri(cx - off, cy, 1.0f, 0.0f);
+                    tri(cx + off, cy, -1.0f, 0.0f);
+                } else {
+                    // Maximize: tips point outward and further out, which opens
+                    // the gap between the two bases.
+                    const float off = 3.4f * scale_;
+                    tri(cx - off, cy, -1.0f, 0.0f);
+                    tri(cx + off, cy, 1.0f, 0.0f);
+                }
+            }
+        };
+        dot(0, HitTestResult::Minimize, D2D1::ColorF(0x30D158), D2D1::ColorF(0x4FE077), 1);
+        dot(1, HitTestResult::Maximize, D2D1::ColorF(0xFFD60A), D2D1::ColorF(0xFFE14F), 2);
+        dot(2, HitTestResult::Close, D2D1::ColorF(0xFF453A), D2D1::ColorF(0xFF6F66), 0);
     }
-    DrawIconText(closeRc.left, closeRc.top, ctrlW, ctrlH, command_icons::kGlyphCapClose, L"x",
-        IsHovered(vm, HitTestResult::Close) ? HexColor(0xFFFFFF) : theme.text);
-    cx -= ctrlW;
-    D2D1_RECT_F maxRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Maximize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), maxRc.left, maxRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(maxRc.left, maxRc.top, ctrlW, ctrlH,
-        vm.maximized ? command_icons::kGlyphCapRestore : command_icons::kGlyphCapMaximize,
-        vm.maximized ? L"[]" : L"\u25A1", theme.text);
-    cx -= ctrlW;
-    D2D1_RECT_F minRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Minimize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), minRc.left, minRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(minRc.left, minRc.top, ctrlW, ctrlH, command_icons::kGlyphCapMinimize, L"_", theme.text);
 }
 
 void MainRenderer::DrawTeachBubble(const WindowViewModel& vm, const D2D1_RECT_F& rect,

@@ -3741,3 +3741,19 @@ add_executable(pulse_picker_details_tree_test EXCLUDE_FROM_ALL
     src/bench/picker_details_tree_test.cpp src/ui/folder_picker_model.cpp)
 
 include(cmake/CalcSearchTests.cmake)
+
+# OpsManager::OpenWithApp reaches the Electron CLI bridge (app_cli_open.cpp), so
+# every target that compiles ops_manager.cpp must compile it too — including the
+# in-process picker DLL, which reuses OpsManager without the app's own sources.
+get_property(_ops_manager_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_ops_target IN LISTS _ops_manager_targets)
+    get_target_property(_ops_sources ${_ops_target} SOURCES)
+    if(NOT _ops_sources)
+        continue()
+    endif()
+    string(JOIN ";" _ops_source_text ${_ops_sources})
+    if(_ops_source_text MATCHES "(^|;)src/ops/ops_manager\\.cpp" AND
+       NOT _ops_source_text MATCHES "app_cli_open\\.cpp")
+        target_sources(${_ops_target} PRIVATE src/ops/app_cli_open.cpp)
+    endif()
+endforeach()

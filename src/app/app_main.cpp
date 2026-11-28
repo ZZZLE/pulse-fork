@@ -5732,8 +5732,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     // kMainWindowStyle (window_factory.h) is shared with later windows.
     static_assert((kMainWindowStyle & WS_CAPTION) == WS_CAPTION &&
-                  (kMainWindowStyle & WS_SYSMENU) == 0,
-                  "keep the system animations without DWM's duplicate caption buttons");
+                  (kMainWindowStyle & WS_SYSMENU) == WS_SYSMENU,
+                  "keep the system animations, and let DWM draw the caption buttons");
     // Hidden process window (host_window.h), created before the main window
     // so WM_CREATE can point services at it. It owns the single-instance
     // endpoint (Pulse windows do not accept WM_COPYDATA) and forwards the

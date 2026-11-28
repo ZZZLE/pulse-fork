@@ -18,9 +18,11 @@ namespace pulse {
 
 struct AppState;
 
-// Style of every Pulse main window (see WinMain for why WS_CAPTION without
-// WS_SYSMENU).
-constexpr DWORD kMainWindowStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+// Style of every Pulse main window (see WinMain for why WS_CAPTION and
+// WS_SYSMENU together). Pulse draws no min / max / close of its own: the right
+// 46x3 DIP strip is reserved for the ones DWM draws, so they follow the system
+// caption theme (traffic lights, high contrast) and its DPI.
+constexpr DWORD kMainWindowStyle = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
 
 struct WindowInit {
     std::wstring path;  // folder of the first tab ("" = This PC)
