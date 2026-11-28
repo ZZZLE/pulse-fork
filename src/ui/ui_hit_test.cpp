@@ -1101,6 +1101,12 @@ HitTestResult MainRenderer::HitTest(const WindowViewModel& vm, const D2D1_RECT_F
             }
             return r;
         }
+        if (toolbar.open_app.right>toolbar.open_app.left && ContainsPt(toolbar.open_app,x,y)) {
+            r.region=ContainsPt(ToolbarOpenChevronRect(toolbar.open_app,scale_),x,y)
+                ? HitTestResult::ToolbarOpenAppMenu : HitTestResult::ToolbarOpenApp;
+            r.control_bounds=toolbar.open_app;
+            return r;
+        }
         if (toolbar.sort.right>toolbar.sort.left && ContainsPt(toolbar.sort,x,y)) {r.region=HitTestResult::ToolbarSort; return r;}
         if (toolbar.group.right>toolbar.group.left && ContainsPt(toolbar.group,x,y)) {
             const bool chip=toolbar_group_>0 && toolbar.group.right-toolbar.group.left>=60*scale_;

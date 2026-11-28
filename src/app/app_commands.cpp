@@ -5021,6 +5021,17 @@ void ShowToolbarCustomize(AppState& s, int page) {
         spec.selection.push_back(std::move(tile));
         if (!kept[i]) spec.selection_order.push_back(i);
     }
+    // 选中时的「打开」按钮: a switch at the head of the selection page (its own
+    // tile index, past the actions: on_selection reads it apart).
+    {
+        ui::ToolbarPickerTile tile;
+        tile.glyph = L"\xE8E5";
+        tile.label = l10n::Get(l10n::StringId::Open);
+        tile.keywords = L"toolbar_open_button open 打开按钮";
+        tile.checked = s.appPrefs.toolbar_open_button;
+        spec.selection.push_back(std::move(tile));
+        spec.selection_order.insert(spec.selection_order.begin(), app::kSelectionActionCount);
+    }
     spec.apps_pinned = s.appPrefs.toolbar_apps.size();
     spec.load_apps = [&s](ui::ToolbarCustomizeSpec& later) {
         FillToolbarAppRows(s, later);
@@ -5070,11 +5081,21 @@ void ShowToolbarCustomize(AppState& s, int page) {
     };
     spec.on_selection = [&s, save](const std::vector<size_t>& shown) {
         std::vector<std::wstring> actions;
-        for (size_t index : shown)
+        bool open_button = false;
+        for (size_t index : shown) {
             if (index < app::kSelectionActionCount) actions.emplace_back(app::kSelectionActionIds[index]);
-        if (actions == s.appPrefs.toolbar_selection) return;
-        s.appPrefs.toolbar_selection = std::move(actions);
-        save();
+            else if (index == app::kSelectionActionCount) open_button = true;   // 打开按钮
+        }
+        bool changed = false;
+        if (actions != s.appPrefs.toolbar_selection) {
+            s.appPrefs.toolbar_selection = std::move(actions);
+            changed = true;
+        }
+        if (open_button != s.appPrefs.toolbar_open_button) {
+            s.appPrefs.toolbar_open_button = open_button;
+            changed = true;
+        }
+        if (changed) save();
     };
     spec.on_switch = [&s](size_t index) {
         FlipToolbarTool(s, index);
@@ -5114,6 +5135,9 @@ void ShowToolbarCustomize(AppState& s, int page) {
         }
         for (size_t i = 0; i < kToolbarViewCount && app::kToolbarToolCount + i < now.pins.size(); ++i)
             now.pins[app::kToolbarToolCount + i].checked = ToolbarViewShown(s, i);
+        // The 打开按钮 switch is the selection page's first tile (past the actions).
+        if (app::kSelectionActionCount < now.selection.size())
+            now.selection[app::kSelectionActionCount].checked = s.appPrefs.toolbar_open_button;
         now.apps_pinned = s.appPrefs.toolbar_apps.size();
         std::vector<char> placed(now.apps.size(), 0);
         for (const auto& path : s.appPrefs.toolbar_apps)

@@ -3592,6 +3592,16 @@ ui::WindowViewModel BuildVm(AppState& s, bool probe_details) {
     if (vm.pane.selected_count > 0 && !drop_mode) vm.selection_actions = SelectionChipActions(s);
     s.renderer.SetToolbarSelection(drop_mode ? 0 : vm.pane.selected_count,
                                    static_cast<int>(vm.selection_actions.size()));
+    {
+        // 选中时的「打开」按钮: the program for the selection's type (the one the
+        // user picked, else the type's default). Only when the selection holds a
+        // file — folders alone get no button at all.
+        const ToolbarOpenTarget open_target = ToolbarOpenTargetFor(s);
+        vm.toolbar_open_name = open_target.name;
+        vm.toolbar_open_icon = open_target.icon;
+        s.renderer.SetToolbarOpenButton(s.appPrefs.toolbar_open_button && open_target.has_file,
+                                        open_target.name);
+    }
     if (!drop_mode) vm.toolbar_pins = ToolbarPinActions(s);
     vm.toolbar_apps = ToolbarAppPins(s);
     vm.toolbar_drop_mode = drop_mode;

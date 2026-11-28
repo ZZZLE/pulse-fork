@@ -35,6 +35,7 @@ struct ToolbarLayout {
     D2D1_RECT_F address{}, search{}, create{};
     D2D1_RECT_F sort{}, filter{}, overflow{};
     D2D1_RECT_F group{};   // "Group" button / active chip (empty when not offered)
+    D2D1_RECT_F open_app{}; // selection open button (left of the view labels; empty when off)
     std::array<D2D1_RECT_F, 8> commands{};
     std::array<D2D1_RECT_F, kToolbarPinSlots> pins{};   // pinned commands, then pinned apps
     D2D1_RECT_F pin_label{};   // drop mode only (ToolbarPinOptions::label_width)
@@ -52,7 +53,7 @@ inline float SelectionChipSpan(float scale, float label_width, int n);
 // edited, borrowing from the address bar but leaving it at least 120 DIP.
 inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, float margin, float create_width,
                                       float left, float filter_expand = 0.0f, float search_min_dip = 0.0f,
-                                      float group_width = 0.0f, float sort_width = 0.0f,
+                                      float group_width = 0.0f, float sort_width = 0.0f, float open_width = 0.0f,
                                       float filter_width = 0.0f, int pin_count = 0,
                                       float selection_span = 0.0f, const ToolbarPinOptions& pin_options = {},
                                       bool can_forward = true) {
@@ -163,9 +164,10 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
     const float room = view_end - left_end - (overflow ? 0.0f : chip_span);
     // The shown buttons with 6 DIP between them (all three: sort+6+filter+6+group).
     auto block_of = [&](float filter) {
-        const int n = (sort_shown ? 1 : 0) + (filter_shown ? 1 : 0) + (group_w > 0.0f ? 1 : 0);
-        return (sort_shown ? sort_w : 0.0f) + (filter_shown ? filter : 0.0f) + (group_w > 0.0f ? group_w : 0.0f) +
-               (n > 1 ? static_cast<float>(n-1)*6*scale : 0.0f);
+        return open_width + (sort_shown ? sort_w : 0.0f) + (filter_shown ? filter : 0.0f) +
+               (group_w > 0.0f ? group_w : 0.0f) +
+               (static_cast<float>((sort_shown ? 1 : 0) + (filter_shown ? 1 : 0) + (group_w > 0.0f ? 1 : 0) +
+                                  (open_width > 0.0f ? 1 : 0) - 1) * 6 * scale);
     };
     // Priority collapse when the labels do not fit: icon-only sort / filter
     // first, then a narrower group chip (never below its icon).
@@ -198,6 +200,12 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
         x += w;
         shown = shown || w > 0.0f;
     };
+    // Selection open button: leftmost of the right cluster, before the view labels.
+    if (open_width > 0.0f) {
+        out.open_app = {x, top+50*scale, x+open_width, top+82*scale};
+        x += open_width + 6*scale;
+        shown = true;
+    }
     for (int index : pin_options.view_order) place(index);
     for (int index = 0; index < 3; ++index) place(index);
     for(int i=0;i<3;++i) if(left_view[i]) *rects[i]=left_rects[i];
@@ -263,7 +271,7 @@ inline ToolbarSelectionChip MakeToolbarSelectionChip(const ToolbarLayout& l, flo
     for (const D2D1_RECT_F& pin : l.pins) if (pin.right > pin.left) anchor = pin;
     // A moved view on the left participates in the same occupied span.
     float limit = l.overflow.left - 10*scale;
-    for(const auto& view : {l.sort,l.filter,l.group}) {
+    for(const auto& view : {l.sort,l.filter,l.group,l.open_app}) {
         if(view.right<=view.left)continue;
         if(view.left>=anchor.right)limit=std::min(limit,view.left-10*scale);
         else if(view.right>anchor.right)anchor=view;
@@ -295,5 +303,19 @@ inline ToolbarSelectionChip MakeToolbarSelectionChip(const ToolbarLayout& l, flo
 // Trailing "x" of the active group chip (removes grouping).
 inline D2D1_RECT_F ToolbarGroupClearRect(const D2D1_RECT_F& chip, float scale) {
     return {chip.right-28*scale,chip.top+5*scale,chip.right-6*scale,chip.bottom-5*scale};
+}
+
+// 选中时的「打开」按钮: its ⌄ segment (the programs for the type). Left of it the
+// whole tile opens the selection, so the chevron keeps its own 20 DIP.
+constexpr float kToolbarOpenChevronDip = 20.0f;
+inline D2D1_RECT_F ToolbarOpenChevronRect(const D2D1_RECT_F& button, float scale) {
+    if (button.right <= button.left) return {};
+    return {std::max(button.left, button.right-kToolbarOpenChevronDip*scale), button.top,
+            button.right, button.bottom};
+}
+// Tile width: 8 DIP lead, the 16 DIP icon, 6, the name, 4 and the chevron, the
+// 8 DIP tail. `text_width` is the measured (or ellipsised) name.
+inline float ToolbarOpenTileWidth(float scale, float text_width) {
+    return (8.0f + 16.0f + 6.0f + 4.0f + kToolbarOpenChevronDip + 8.0f) * scale + text_width;
 }
 }

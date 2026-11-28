@@ -101,8 +101,11 @@ ManifestResult ParseManifest(std::string_view utf8) {
     for (const auto* field : {"runtime", "commands", "toolbar", "palette", "workflows", "panel"}) {
         if (root.find(field)) return Failure(std::string(field) + " is no longer supported; use a native C++ DLL package");
     }
-    if (!HasOnlyFields(root, {"apiVersion", "id", "name", "resources", "native"})) {
-        return Failure("Manifest must be an object containing only apiVersion, id, name, resources and native");
+    // `contributes` is declarative metadata emitted by published packages. This
+    // build has no consumer for it, but rejecting it invalidates otherwise valid
+    // archives, so it is tolerated and ignored.
+    if (!HasOnlyFields(root, {"apiVersion", "id", "name", "resources", "native", "contributes"})) {
+        return Failure("Manifest must be an object containing only apiVersion, id, name, resources, native and contributes");
     }
     const auto* version = root.find("apiVersion");
     int64_t api_version = 0;

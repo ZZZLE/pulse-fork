@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" PULSE_VERSION LIMIT_COUNT 1)
 project(Pulse VERSION ${PULSE_VERSION} LANGUAGES C CXX)
 
@@ -475,7 +475,7 @@ add_executable(pulse_file_picker_operations_test
     src/bench/file_picker_operations_test.cpp
     src/ui/folder_picker_operations.cpp src/app/new_item_name.cpp ${PULSE_PERMISSION_UI_SOURCES}
     src/ops/ops_manager.cpp src/ops/external_tasks.cpp src/ops/duplicate_cleanup_guard.cpp
-    src/ops/file_lock_owner.cpp src/ipc/shell_client.cpp)
+    src/ops/file_lock_owner.cpp src/ops/app_cli_open.cpp src/ipc/shell_client.cpp)
 target_link_libraries(pulse_file_picker_operations_test PRIVATE
     d3d11 d2d1 dwrite dxgi dcomp dwmapi shcore ole32 windowscodecs comctl32 uxtheme
     gdiplus shell32 uuid bcrypt pulse_localization)
@@ -843,6 +843,7 @@ set(PULSE_ELEVATED_HOST_SOURCES
     src/ops/ops_manager.cpp src/ops/external_tasks.cpp
     src/ops/duplicate_cleanup_guard.cpp
     src/ops/file_lock_owner.cpp
+    src/ops/app_cli_open.cpp
     src/ipc/shell_client.cpp)
 add_executable(pulse_hotkey_broker WIN32 src/hotkey_broker/main.cpp src/ipc/elevated_transfer_transport.cpp)
 target_link_libraries(pulse_hotkey_broker PRIVATE pulse_runtime_log ole32 oleaut32 shell32 uuid advapi32 bcrypt)
@@ -871,7 +872,7 @@ add_executable(pulse_elevated_session_test src/bench/elevated_session_test.cpp
 target_compile_definitions(pulse_elevated_session_test PRIVATE PULSE_ELEVATED_TEST_CLIENT=1)
 target_sources(pulse_elevated_session_test PRIVATE src/bench/review_transfer_test.cpp
     src/ops/ops_manager.cpp src/ops/external_tasks.cpp src/ops/duplicate_cleanup_guard.cpp
-    src/ops/file_lock_owner.cpp src/ipc/shell_client.cpp)
+    src/ops/file_lock_owner.cpp src/ops/app_cli_open.cpp src/ipc/shell_client.cpp)
 target_link_libraries(pulse_elevated_session_test PRIVATE ole32 shell32 advapi32 bcrypt
     uuid rstrtmgr pulse_localization)
 add_dependencies(pulse_elevated_session_test pulse_elevated_test_host)

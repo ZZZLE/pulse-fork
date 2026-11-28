@@ -85,6 +85,42 @@ inline bool AddToolbarAppPath(std::vector<std::wstring>& apps, const std::wstrin
     return true;
 }
 
+// ---- 选中时的「打开」按钮 (AppPrefs::toolbar_open_apps) ----------------------
+//
+// The toolbar's open button starts a program for the selected files. Which one
+// is remembered per file type, Pulse-only (the Windows association is never
+// touched): an entry is "ext=exe". No entry: the type's system default.
+
+inline std::wstring ToolbarOpenAppFor(const std::vector<std::wstring>& entries, const std::wstring& ext) {
+    const std::wstring key = ToolbarLower(ext);
+    if (key.empty()) return {};
+    for (const auto& entry : entries) {
+        const size_t eq = entry.find(L'=');
+        if (eq == std::wstring::npos || eq == 0) continue;
+        if (ToolbarLower(entry.substr(0, eq)) == key) return entry.substr(eq + 1);
+    }
+    return {};
+}
+
+// Sets (`exe` non-empty) or clears the program of `ext`. Returns whether the
+// list changed.
+inline bool SetToolbarOpenApp(std::vector<std::wstring>& entries, const std::wstring& ext,
+                              const std::wstring& exe) {
+    const std::wstring key = ToolbarLower(ext);
+    if (key.empty()) return false;
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        const size_t eq = it->find(L'=');
+        if (eq == std::wstring::npos || eq == 0 || ToolbarLower(it->substr(0, eq)) != key) continue;
+        if (exe.empty()) { entries.erase(it); return true; }
+        if (it->substr(eq + 1) == exe) return false;
+        *it = key + L"=" + exe;
+        return true;
+    }
+    if (exe.empty()) return false;
+    entries.push_back(key + L"=" + exe);
+    return true;
+}
+
 // How a pinned app relates to a set of items (the selection or a drag).
 enum class AppFit : int { Neutral = 0, All = 1, Some = 2, None = 3 };
 
@@ -125,6 +161,21 @@ int ToolbarAppOpens(const std::wstring& exe, const std::wstring& ext, HWND notif
 // Same, reading the type's programs now when they are not cached yet (a click
 // or a drop: the user is waiting for the result anyway).
 bool ToolbarAppOpensNow(const std::wstring& exe, const std::wstring& ext);
+
+// The type's default program (打开方式's "always" program for ".txt"): what the
+// toolbar's open button names and starts when the user has not picked one.
+struct ToolbarDefaultApp {
+    std::wstring exe;    // the program; "" when the type has none (see `name`)
+    std::wstring name;   // display name (a Store handler may have no exe)
+    common::MenuIconRef icon;
+    bool ready = false;  // false: still being read
+};
+// Cached; the first call queues the lookup on `work` and returns an empty
+// (not ready) answer, `notify` is repainted when the real one lands.
+ToolbarDefaultApp ToolbarDefaultAppFor(const std::wstring& ext, HWND notify,
+                                       const ToolbarAppWork& work);
+// Same, read now (opening the button's dropdown or a click: the user waits).
+ToolbarDefaultApp DescribeToolbarDefaultAppNow(const std::wstring& ext);
 
 // Recommended programs (打开方式) for the given types, most common first,
 // skipping `exclude` (already pinned). Synchronous: COM + registry, so call it

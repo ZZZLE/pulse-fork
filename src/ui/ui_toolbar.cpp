@@ -1022,6 +1022,48 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             painter_.DrawText(group_label,text_rc,compositor_->TextFormat(),theme.accent);
         }
     }
+    // 选中时的「打开」按钮 (leftmost of the right cluster): the program's icon,
+    // its name and a ⌄ for the other programs. A deeper tinted fill plus an
+    // accent border keep it apart from the plain Sort / Filter / Group buttons.
+    if (layout.open_app.right > layout.open_app.left) {
+        const D2D1_RECT_F b=layout.open_app;
+        const float radius=theme.radius_control*scale_;
+        const bool menu_hot=!plates && IsHovered(vm,HitTestResult::ToolbarOpenAppMenu);
+        const bool hot=!plates && IsHovered(vm,HitTestResult::ToolbarOpenApp);
+        D2D1_COLOR_F fill=theme.accent;
+        fill.a*= hot ? 0.42f : menu_hot ? 0.36f : 0.26f;
+        painter_.FillRoundedRect(b,radius,fill);
+        painter_.StrokeRoundedRect(b,radius,theme.accent,1.2f*scale_);
+        const float cy=(b.top+b.bottom)*0.5f;
+        const float icon=16*scale_;
+        const float icon_left=b.left+8*scale_;
+        if (ID2D1Bitmap* bitmap=AppIconBitmap(vm.toolbar_open_icon)) {
+            dc->DrawBitmap(bitmap,D2D1::RectF(icon_left,cy-icon*0.5f,icon_left+icon,cy+icon*0.5f),1.0f,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        } else {
+            // No program yet (still read, or the type has none): a bare 打开 icon.
+            DrawIconText(icon_left,b.top,icon,b.bottom-b.top,L"\xE8E5",L"",theme.accent);
+        }
+        const D2D1_RECT_F chevron=ToolbarOpenChevronRect(b,scale_);
+        if (menu_hot && chevron.right > chevron.left) {
+            D2D1_COLOR_F hot_fill=theme.accent;
+            hot_fill.a*=0.24f;
+            painter_.FillRoundedRect(D2D1::RectF(chevron.left,chevron.top+2*scale_,chevron.right-2*scale_,
+                chevron.bottom-2*scale_),4*scale_,hot_fill);
+        }
+        if (!vm.toolbar_open_name.empty()) {
+            const D2D1_RECT_F text_rc=D2D1::RectF(icon_left+icon+6*scale_,b.top,chevron.left-4*scale_,b.bottom);
+            if (text_rc.right > text_rc.left) {
+                std::wstring open_label=vm.toolbar_open_name;
+                if (IDWriteFactory2* f=compositor_->DwriteFactory())
+                    open_label=FitEndEllipsis(open_label,text_rc.right-text_rc.left,
+                        [&](const std::wstring& t){ return MeasureTextWidth(f,compositor_->SmallFormat(),t); });
+                painter_.DrawText(open_label,text_rc,compositor_->SmallFormat(),theme.accent);
+            }
+        }
+        DrawIconText(chevron.left,chevron.top,chevron.right-chevron.left,chevron.bottom-chevron.top,
+            L"\xE70D",L"",theme.accent,kIconSmall);
+    }
     // Selection context (prototype note 4): shows up after the file commands
     // while something is selected and folds away with the selection.
     const ToolbarSelectionChip sel=SelectionChipAt(layout,rect.right,vm.toolbar_drop_mode ? 0 : vm.pane.selected_count,

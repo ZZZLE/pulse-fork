@@ -62,6 +62,8 @@ struct FluentMenuItem {
     bool secondary = false;
     bool radio = false;            // selected single-choice item: filled dot, never a checkmark
     bool radio_group = false;      // reserve a leading selection-dot column (left of the icon)
+    // 当前生效的这一行：常驻的主题色底 + 描边（不走圆点，图标列被程序图标占着）。
+    bool marked = false;
     fluent::MenuPictogram pictogram = fluent::MenuPictogram::None;
     D2D1_COLOR_F swatch_color{};
     std::vector<FluentMenuSwatch> quick_swatches;
@@ -71,6 +73,8 @@ struct FluentMenuItem {
     std::vector<FluentMenuItem> children;
     float glyph_scale = 1.0f;      // Per-item visual scale inside the fixed icon slot.
     bool accent_glyph = false;     // Glyph drawn in the accent colour (assistant hand-off).
+    bool has_glyph_color = false;  // Per-item glyph colour (overrides accent/foreground).
+    D2D1_COLOR_F glyph_color{};
     bool shortcut_inline = false; // Search paths follow a shared, compact filename column.
     int trailing_command = 0;     // Optional hover-revealed close action at the right edge.
     std::wstring tooltip;
@@ -222,6 +226,9 @@ public:
     }
     void SetSelectAllOnOpen(bool select_all) { select_all_on_open_ = select_all; }
     void SetHoverFirstOnOpen(bool hover_first) { hover_first_on_open_ = hover_first; }
+    // The next popup opens with this row highlighted (the choice already made)
+    // instead of the first enabled row. Negative restores that default. One-shot.
+    void SetInitialHoverRow(int row) { initial_hover_row_ = row; }
     // Align the next TrackPopup to this screen rect (address bar). The filter
     // field covers the rect; results hang below. Cleared after the popup.
     void SetAnchorRect(RECT screen_rc) { anchor_rect_ = screen_rc; anchor_to_rect_ = true; }
@@ -375,6 +382,7 @@ private:
     std::vector<std::pair<wchar_t, int>> empty_filter_keys_;
     bool select_all_on_open_ = true;
     bool hover_first_on_open_ = true;
+    int initial_hover_row_ = -1;   // SetInitialHoverRow: one-shot, wins over hover_first
     bool filter_committed_ = false;
     bool filter_composing_ = false;
     bool forward_tab_key_ = false;

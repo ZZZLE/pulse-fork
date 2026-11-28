@@ -26,6 +26,7 @@
 #include "directory_metadata.h"
 #include "transfer_engine.h"
 #include "shell_command.h"
+#include "app_cli_open.h"
 #include "image_open_dispatch.h"
 #include "open_item_directory.h"
 #include "shortcut_launch.h"
@@ -1548,7 +1549,10 @@ void OpsManager::OpenWithApp(const std::wstring& app_exe, const std::wstring& fi
     QueueItem item;
     item.open_path = ParentOf(file);      // lpDirectory
     item.open_file = app_exe;
-    item.open_verb = L"open";
+    // Some editors (Photon Studio) ignore "<exe> <file>" — their second-instance
+    // handler drops the path unless an editor window already exists — but ship a
+    // CLI that opens reliably. Route those through it; everything else unchanged.
+    item.open_verb = AppHasBundledCli(app_exe) ? L"__appcli" : L"open";
     item.open_args = L"\"" + pulse::path::StripExtendedPathPrefix(file) + L"\"";
     EnqueueOpen(std::move(item));
 }
@@ -2774,6 +2778,20 @@ void OpsManager::OpenThread() {
                 MessageBoxW(dialog_owner, message.c_str(), L"Pulse", MB_OK | MB_ICONERROR);
             }
             continue;
+        }
+
+        if (_wcsicmp(item.open_verb.c_str(), L"__appcli") == 0) {
+            // The app's own CLI (Photon Studio): "<exe> <file>" does nothing there.
+            std::wstring file = item.open_args;
+            if (file.size() >= 2 && file.front() == L'"' && file.back() == L'"')
+                file.assign(file, 1, file.size() - 2);
+            const auto started = GetTickCount64();
+            const bool handed = TryOpenWithBundledCli(item.open_file, file);
+            diagnostics::runtime::Event("app_cli_open", {{"task", item.seq}, {"handed", handed},
+                {"elapsed_ms", GetTickCount64() - started}});
+            if (handed) continue;
+            // No answer from the CLI: fall back to the plain launch.
+            item.open_verb = L"open";
         }
 
         if (_wcsicmp(item.open_verb.c_str(), L"openas") == 0 ||

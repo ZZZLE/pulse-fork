@@ -167,6 +167,7 @@ TrayController::CallbackResult TrayController::HandleCallback(
         if (command == 3) PostMessageW(hwnd_, WM_NEW_WINDOW, 0, 0);
         if (command == 4) { RestoreWindow(); PostMessageW(hwnd_, WM_MERGE_ALL_WINDOWS, 0, 0); }
         if (command >= 10 && command < 16) PostMessageW(hwnd_, WM_ARRANGE_WINDOWS, command-10, 1);
+        if (command == 5) PostMessageW(hwnd_, WM_RESTART_PULSE, 0, 0);
         return command == 2 ? CallbackResult::ExitRequested : CallbackResult::Handled;
     }
     default:

@@ -23,7 +23,8 @@ struct Caches {
     std::mutex mutex;
     std::unordered_map<std::wstring, ToolbarAppInfo> apps;                 // lower path
     std::unordered_map<std::wstring, std::vector<std::wstring>> programs;  // lower ext
-    std::unordered_set<std::wstring> pending_apps, pending_exts;
+    std::unordered_map<std::wstring, ToolbarDefaultApp> defaults;          // lower ext
+    std::unordered_set<std::wstring> pending_apps, pending_exts, pending_defaults;
     // The name 打开方式 shows for a program (IAssocHandler::GetUIName): the
     // package name of a Store-installed desktop exe (记事本), which its version
     // resource does not carry. Learned while the handlers are read anyway.
@@ -97,6 +98,43 @@ std::vector<std::wstring> ReadPrograms(const std::wstring& ext) {
     return out;
 }
 
+// The type's default program (ASSOCSTR_EXECUTABLE), and the name Explorer
+// shows for it when the exe has no version resource (a Store app's package).
+// A type's own association may be a command template ("%1", what .exe answers:
+// the shell runs the file itself): that is no program to start, so it is not
+// reported as one.
+std::wstring ReadDefaultExe(const std::wstring& ext) {
+    wchar_t exe[MAX_PATH * 2]{};
+    DWORD cch = ARRAYSIZE(exe);
+    if (FAILED(AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, ext.c_str(),
+                                 nullptr, exe, &cch)))
+        return {};
+    const std::wstring value(exe);
+    if (value.empty() || value.find(L'%') != std::wstring::npos) return {};
+    if (value.find_first_of(L"\\/") == std::wstring::npos && value.find(L':') == std::wstring::npos)
+        return {};
+    return value;
+}
+
+std::wstring ReadDefaultName(const std::wstring& ext) {
+    wchar_t name[512]{};
+    DWORD cch = ARRAYSIZE(name);
+    if (SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME, ext.c_str(),
+                                    nullptr, name, &cch)) && name[0])
+        return name;
+    return {};
+}
+
+// A name with something readable in it (not a command template like "%1", not
+// punctuation only): what the toolbar's open button shows for a program.
+bool UsableAppName(const std::wstring& name) {
+    if (name.empty() || name.find(L'%') != std::wstring::npos) return false;
+    for (wchar_t c : name)
+        if (std::iswalnum(c)) return true;
+    return false;
+}
+
+
 void RunOnWorker(const ToolbarAppWork& work, std::function<void()> job, HWND notify) {
     work([job = std::move(job), notify] {
         const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -130,6 +168,52 @@ ToolbarAppInfo DescribeToolbarAppNow(const std::wstring& path) {
     std::lock_guard<std::mutex> lock(c.mutex);
     ApplyShownName(c, info);
     return info;
+}
+
+ToolbarDefaultApp DescribeToolbarDefaultAppNow(const std::wstring& ext) {
+    ToolbarDefaultApp out;
+    const std::wstring key = ToolbarLower(ext);
+    out.ready = true;
+    if (key.empty() || key == L".lnk") return out;
+    const std::wstring exe = ReadDefaultExe(key);
+    if (!exe.empty()) {
+        const ToolbarAppInfo info = DescribeToolbarAppNow(exe);
+        out.exe = info.exe.empty() ? exe : info.exe;
+        out.icon = info.icon;
+        if (UsableAppName(info.name)) out.name = info.name;
+    }
+    if (out.name.empty()) {
+        // A Store handler, or a program without a version resource: its name
+        // from the association data, else the program file's own stem.
+        const std::wstring friendly = ReadDefaultName(key);
+        if (UsableAppName(friendly)) out.name = friendly;
+    }
+    if (out.name.empty() && !out.exe.empty()) out.name = Stem(out.exe);
+    return out;
+}
+
+ToolbarDefaultApp ToolbarDefaultAppFor(const std::wstring& ext, HWND notify,
+                                       const ToolbarAppWork& work) {
+    const std::wstring key = ToolbarLower(ext);
+    if (key.empty() || key == L".lnk") {
+        ToolbarDefaultApp none;
+        none.ready = true;
+        return none;
+    }
+    Caches& c = Cache();
+    {
+        std::lock_guard<std::mutex> lock(c.mutex);
+        if (const auto found = c.defaults.find(key); found != c.defaults.end()) return found->second;
+        if (!c.pending_defaults.insert(key).second) return {};
+    }
+    RunOnWorker(work, [key] {
+        ToolbarDefaultApp info = DescribeToolbarDefaultAppNow(key);
+        Caches& cache = Cache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        cache.pending_defaults.erase(key);
+        cache.defaults[key] = std::move(info);
+    }, notify);
+    return {};
 }
 
 ToolbarAppInfo ToolbarApp(const std::wstring& path, HWND notify, const ToolbarAppWork& work) {

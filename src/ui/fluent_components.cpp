@@ -1552,6 +1552,17 @@ void Painter::DrawMenuItem(const MenuItemSpec& spec) {
         }
         FillRoundedRect(item, Px(5.0f), interaction);
     }
+    // 已选项: a persistent accent tint and outline, so "which program is set"
+    // reads without relying on the pointer (and without a dot: the icon column
+    // of these rows holds the program icon).
+    if (spec.marked && !high_contrast_) {
+        D2D1_COLOR_F tint = spec.state.enabled ? theme_->accent : theme_->text_disabled;
+        tint.a *= 0.14f;
+        FillRoundedRect(item, Px(5.0f), tint);
+        D2D1_COLOR_F outline = spec.state.enabled ? theme_->accent : theme_->text_disabled;
+        outline.a *= 0.55f;
+        StrokeRoundedRect(item, Px(5.0f), outline, Px(1.0f));
+    }
     D2D1_COLOR_F foreground = spec.state.enabled ? theme_->text
                                                   : dark_ ? RgbaF(0xFFFFFF, 0.40f)
                                                           : Rgba(0x000000, 112);
@@ -1588,7 +1599,8 @@ void Painter::DrawMenuItem(const MenuItemSpec& spec) {
                                          content.left + icon_width, content.bottom);
     auto draw_glyph = [&]() {
         const D2D1_COLOR_F glyph_color =
-            spec.accent_glyph && spec.state.enabled ? theme_->accent : foreground;
+            spec.has_glyph_color && spec.state.enabled ? spec.glyph_color
+            : spec.accent_glyph && spec.state.enabled ? theme_->accent : foreground;
         const float glyph_scale = std::clamp(spec.glyph_scale, 0.6f, 1.2f);
         IDWriteTextFormat* iconFormat = MenuIconFormat();
         if (std::abs(glyph_scale - 1.0f) < 0.001f || spec.glyph.empty()) {

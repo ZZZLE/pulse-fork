@@ -210,13 +210,26 @@ bool ReleaseValue(const Value& v, Release& out, std::array<int, 3>& version) {
         !Version(v.get_string("version"), version) || !Date(v.get_string("released")) ||
         !Match(v.get_string("minPulse"), R"([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,4})") ||
         !Integer(Member(v, "sdkPreview"), 1, 99, &sdk) || !Hash(v.get_string("manifestSha256")) ||
-        !Member(v, "resources").is_array() || Member(v, "resources").size() > 1 ||
+        !Member(v, "resources").is_array() || Member(v, "resources").size() > 15 ||
         !AssetValue(Member(v, "package"), 256 * 1024 * 1024 + 256 * 1024, ".pulse-ext", out.package) ||
         !AssetValue(Member(v, "signature"), 16384, ".sig.json", out.signature) ||
         !Localized(Member(v, "notes"), 600, out.notes)) return false;
+    // The catalog validator must accept the same resource set as
+    // schemas/extensions/manifest.schema.json (15 ids), otherwise one extension
+    // with more than settings.own invalidates the whole catalog.
+    static const std::set<std::string> kCatalogResources = {
+        "context.read", "files.readCurrentDirectory", "operations.own", "settings.own",
+        "audit.own", "files.renameCurrentDirectory", "files.readDirectory",
+        "files.watchDirectory", "files.open", "context.events",
+        "files.transferCurrentSelection", "files.deleteCurrentSelection",
+        "files.transferToDirectory", "files.transferFromDirectory",
+        "files.transferDirectoryTree"};
     for (const auto& resource : Member(v, "resources").items()) {
-        if (!resource.is_string() || resource.as_string() != "settings.own") return false;
-        out.resources.push_back(resource.as_string());
+        if (!resource.is_string()) return false;
+        const std::string id = resource.as_string();
+        if (kCatalogResources.find(id) == kCatalogResources.end()) return false;
+        if (std::find(out.resources.begin(), out.resources.end(), id) != out.resources.end()) return false;
+        out.resources.push_back(id);
     }
     out.version = v.get_string("version"); out.released = v.get_string("released");
     out.min_pulse = v.get_string("minPulse"); out.manifest_sha256 = v.get_string("manifestSha256");

@@ -1037,6 +1037,8 @@ bool FluentMenu::RenderSurface(const FluentMenuModel& model, int hover_row, int 
             spec.glyph = it->glyph;
             spec.glyph_scale = it->glyph_scale;
             spec.accent_glyph = it->accent_glyph;
+            spec.has_glyph_color = it->has_glyph_color;
+            spec.glyph_color = it->glyph_color;
             spec.shortcut = it->shortcut;
             spec.shortcut_inline = it->shortcut_inline;
             spec.inline_label_width = model.InlineLabelWidthPx();
@@ -1054,6 +1056,7 @@ bool FluentMenu::RenderSurface(const FluentMenuModel& model, int hover_row, int 
             spec.mixed = it->mixed;
             spec.radio = it->radio;
             spec.radio_group = it->radio_group;
+            spec.marked = it->marked;
             spec.pictogram = it->pictogram;
             spec.swatch_color = it->swatch_color;
             if (it->icon) spec.icon_bitmap = IconBitmapFor(it->icon, dc);
@@ -2463,7 +2466,11 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
         : dropdown_ ? static_cast<float>(dropdown_rect_.right - dropdown_rect_.left) : 0.0f;
     model_.SetItems(std::move(items));
     model_.Layout(compositor_->DwriteFactory(), scale_, minW);
-    hover_row_ = hover_first_on_open_ ? model_.FirstEnabled() : -1;
+    // A menu that opens on a choice already made (the toolbar's open button)
+    // highlights it, not the first row.
+    const FluentMenuItem* preset_row = initial_hover_row_ >= 0 ? model_.At(initial_hover_row_) : nullptr;
+    hover_row_ = preset_row && preset_row->enabled ? initial_hover_row_
+        : hover_first_on_open_ ? model_.FirstEnabled() : -1;
     hover_swatch_ = -1;
     result_ = 0;
     animating_out_ = false;
@@ -2515,6 +2522,7 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
         anchor_to_rect_ = false;
         dropdown_ = false;
         hover_first_on_open_ = true;
+        initial_hover_row_ = -1;
         select_all_on_open_ = true;
         return 0;
     }
@@ -2574,6 +2582,7 @@ int FluentMenu::TrackPopup(POINT screen_pt, std::vector<FluentMenuItem> items,
     anchor_to_rect_ = false;
     dropdown_ = false;
     hover_first_on_open_ = true;
+    initial_hover_row_ = -1;
     select_all_on_open_ = true;
     // Queue only after the modal loop has unwound, avoiding nested tab changes.
     if (forward_tab_key_ && owner_) PostMessageW(owner_, WM_KEYDOWN, VK_TAB, 0);

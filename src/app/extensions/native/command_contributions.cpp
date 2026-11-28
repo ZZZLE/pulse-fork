@@ -13,9 +13,17 @@ std::wstring Wide(const std::string& value) {
 }
 ui::FluentMenuItem Row(const CommandInfo& info) {
     ui::FluentMenuItem row;
-    row.command = info.token; row.text = Wide(info.title); row.tooltip = Wide(info.identity);
+    row.command = info.token; row.text = Wide(info.title);
+    // No tooltip: the identity (native:<package>:<command>) is internal, and a
+    // tooltip equal to the label made the customize-toolbar menu render a
+    // stray separator next to the text.
     row.enabled = info.enabled;
     row.glyph = info.icon == PULSE_COMMAND_ICON_ARCHIVE ? L"\xE8B7" : info.icon == PULSE_COMMAND_ICON_EXTRACT ? L"\xE896" : L"\xE8A5";
+    // Archive/extract commands carry the dopamine brick-red accent.
+    if (info.icon == PULSE_COMMAND_ICON_ARCHIVE || info.icon == PULSE_COMMAND_ICON_EXTRACT) {
+        row.has_glyph_color = true;
+        row.glyph_color = D2D1::ColorF(0xC8553D);
+    }
     if (info.key) {
         if (info.modifiers & PULSE_COMMAND_CTRL) row.shortcut += L"Ctrl+";
         if (info.modifiers & PULSE_COMMAND_SHIFT) row.shortcut += L"Shift+";

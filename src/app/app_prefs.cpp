@@ -405,6 +405,17 @@ std::wstring AppPrefs::ToJson() const {
     out += toolbar_show_filter ? L"true" : L"false";
     out += L",\n  \"toolbar_show_group\":";
     out += toolbar_show_group ? L"true" : L"false";
+
+    out += L",\n  \"toolbar_open_button\":";
+    out += toolbar_open_button ? L"true" : L"false";
+    out += L",\n  \"toolbar_open_apps\":[";
+    for (size_t i = 0; i < toolbar_open_apps.size(); ++i) {
+        std::wstring escaped_open_app;
+        pulse::json::Escape(toolbar_open_apps[i], escaped_open_app);
+        if (i) out += L",";
+        out += L"\"" + escaped_open_app + L"\"";
+    }
+    out += L"]";
     out += L",\n  \"toolbar_view_order\":[";
     const auto view_order = app::NormalizeToolbarViewOrder(toolbar_view_order);
     for (size_t i = 0; i < view_order.size(); ++i) {
@@ -713,6 +724,8 @@ bool AppPrefs::FromJson(const std::wstring& json) {
     toolbar_show_sort = pulse::json::ExtractBool(json, L"toolbar_show_sort", true);
     toolbar_show_filter = pulse::json::ExtractBool(json, L"toolbar_show_filter", true);
     toolbar_show_group = pulse::json::ExtractBool(json, L"toolbar_show_group", true);
+    toolbar_open_button = pulse::json::ExtractBool(json, L"toolbar_open_button", true);
+    toolbar_open_apps = pulse::json::ExtractStringArray(json, L"toolbar_open_apps");
     toolbar_view_order = app::NormalizeToolbarViewOrder(pulse::json::ExtractStringArray(json, L"toolbar_view_order"));
     toolbar_selection = json.find(L"\"toolbar_selection\"") != std::wstring::npos
         ? app::NormalizeToolbarSelection(pulse::json::ExtractStringArray(json, L"toolbar_selection"))

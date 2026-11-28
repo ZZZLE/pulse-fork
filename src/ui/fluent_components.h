@@ -125,10 +125,15 @@ struct MenuItemSpec {
     bool secondary = false;
     bool radio = false;
     bool radio_group = false;      // reserve a leading selection-dot column
+    // 这一行就是当前生效的选择：常驻的主题色底 + 描边。给那些图标列被程序图标
+    // 占住、画不出圆点的单选菜单用（工具栏的「打开」按钮）。
+    bool marked = false;
     MenuPictogram pictogram = MenuPictogram::None;
     D2D1_COLOR_F swatch_color{};
     float glyph_scale = 1.0f;
     bool accent_glyph = false;     // glyph in the accent colour (assistant hand-off)
+    bool has_glyph_color = false;  // per-item glyph colour (overrides accent/foreground)
+    D2D1_COLOR_F glyph_color{};
     bool shortcut_inline = false;
     float inline_label_width = 0.0f;
     // Explorer-style app icon (premultiplied, same device as the painter's

@@ -197,6 +197,22 @@ void DropOnToolbarApp(AppState& s, size_t app, const std::vector<std::wstring>& 
 // Adds a program (.exe or a shortcut to one) to the pins and saves.
 bool PinToolbarApp(AppState& s, const std::wstring& path);
 std::wstring ToolbarAppTooltip(AppState& s, size_t app);
+// 选中时的「打开」按钮 (AppPrefs::toolbar_open_button): the program it shows for
+// the selection — the type's remembered one, else the type's default.
+struct ToolbarOpenTarget {
+    std::wstring ext;                // the selection's file type ("" = no type / none)
+    bool has_file = false;           // at least one selected item is a file, not a folder
+    std::wstring exe;                // the program; "" = the type's default
+    std::wstring name;               // display name ("" = the bare placeholder)
+    common::MenuIconRef icon;
+};
+ToolbarOpenTarget ToolbarOpenTargetFor(AppState& s);
+// Click: opens the selected files with that program (the system default when
+// none is remembered).
+void OpenSelectionFromToolbar(AppState& s);
+// The ⌄: the type's default program plus the programs Explorer offers for it;
+// picking one remembers it for that type (Pulse-only, never Windows' setting).
+void ShowToolbarOpenMenu(AppState& s, POINT screen);
 // Drag over the window: drop mode on/off for these sources (before BuildVm),
 // then the drop on an app or on the label (after the hit test). Returns true
 // when the toolbar took the point; `effect` is the DROPEFFECT to report.

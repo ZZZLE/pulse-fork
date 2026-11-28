@@ -3114,6 +3114,20 @@ LRESULT HandleLButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARA
             for (int slot = 0; slot < static_cast<int>(vm.pane_slots.size()); ++slot)
                 if (app::Pane* pane = PaneAtSlot(*s, slot)) pane->size_slider_open = false;
         }
+        if (hit.region == ui::HitTestResult::ToolbarOpenApp ||
+            hit.region == ui::HitTestResult::ToolbarOpenAppMenu) {
+            // 选中时的「打开」按钮: the tile opens the selection, the ⌄ picks the
+            // program for its type. Its own branch: the else-if chain below is
+            // at MSVC's nesting limit (C1061).
+            if (hit.region == ui::HitTestResult::ToolbarOpenAppMenu) {
+                POINT screen{ mx, my };
+                ClientToScreen(hwnd, &screen);
+                ShowToolbarOpenMenu(*s, screen);
+            } else {
+                OpenSelectionFromToolbar(*s);
+            }
+            return 0;
+        }
         if (hit.region==ui::HitTestResult::ToolbarSort || hit.region==ui::HitTestResult::ToolbarGroup ||
             (hit.region==ui::HitTestResult::FilterBox && s->pane && s->pane->filter_expand<=0)) {
             BeginToolbarViewDrag(*s,hit.region==ui::HitTestResult::ToolbarSort?0:hit.region==ui::HitTestResult::FilterBox?1:2,POINT{mx,my});

@@ -1236,7 +1236,7 @@ void SendCtxItems(uint32_t session_id, const std::vector<CtxItemOut>& items,
 }
 
 UINT QueryContextMenuFlags(const CtxSessionData& d) {
-    UINT flags = CMF_NORMAL;
+    UINT flags = CMF_NORMAL | CMF_EXPLORE;  // Explorer always sets it in a folder view
     if (d.extended) flags |= CMF_EXTENDEDVERBS;
     if (!d.background) {
         // An item menu, as Explorer's view asks for it. Some extensions only
@@ -1255,6 +1255,108 @@ UINT QueryContextMenuFlags(const CtxSessionData& d) {
         if (all_dirs) flags |= CMF_EXPLORE;
     }
     return flags;
+}
+
+// Huorong's HRShredShell (directory context) returns its verbs as flat rows,
+// while its PackagedCom sibling groups the same verbs under a flyout for file
+// selections. Fold the flat rows into one flyout so the folder menu matches
+// what Explorer shows for files.
+// Huorong brand shield, taken from its own executable. The directory-context
+// handler (HRShredShell) only exposes per-verb bitmaps, so the folded flyout
+// heading would otherwise reuse the "unlock" glyph instead of the logo.
+pulse::common::MenuIconRef HuorongBrandIcon() {
+    static pulse::common::MenuIconRef cached;
+    static bool tried = false;
+    if (tried) return cached;
+    tried = true;
+    const wchar_t* candidates[] = {
+        L"C:\\Program Files\\Huorong\\Sysdiag\\bin\\HipsMain.exe",
+        L"C:\\Program Files (x86)\\Huorong\\Sysdiag\\bin\\HipsMain.exe",
+    };
+    for (const wchar_t* path : candidates) {
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+        HICON icon = nullptr;
+        if (FAILED(SHDefExtractIconW(path, 0, 0, &icon, nullptr, MAKELONG(32, 0))) || !icon) continue;
+        ICONINFO info{};
+        if (!GetIconInfo(icon, &info)) { DestroyIcon(icon); continue; }
+        BITMAP bitmap{};
+        if (!GetObject(info.hbmColor, sizeof(bitmap), &bitmap) || bitmap.bmWidth <= 0 ||
+            bitmap.bmHeight <= 0 || bitmap.bmWidth > 64 || bitmap.bmHeight > 64) {
+            if (info.hbmColor) DeleteObject(info.hbmColor);
+            if (info.hbmMask) DeleteObject(info.hbmMask);
+            DestroyIcon(icon);
+            continue;
+        }
+        BITMAPINFO header{};
+        header.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        header.bmiHeader.biWidth = bitmap.bmWidth;
+        header.bmiHeader.biHeight = -bitmap.bmHeight;
+        header.bmiHeader.biPlanes = 1;
+        header.bmiHeader.biBitCount = 32;
+        header.bmiHeader.biCompression = BI_RGB;
+        std::vector<uint8_t> pixels(static_cast<size_t>(bitmap.bmWidth) * bitmap.bmHeight * 4u);
+        HDC dc = CreateCompatibleDC(nullptr);
+        const int copied = GetDIBits(dc, info.hbmColor, 0, static_cast<UINT>(bitmap.bmHeight),
+                                     pixels.data(), &header, DIB_RGB_COLORS);
+        DeleteDC(dc);
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+        DestroyIcon(icon);
+        if (!copied) continue;
+        bool any_alpha = false;
+        for (size_t i = 3; i < pixels.size(); i += 4) if (pixels[i] != 0) { any_alpha = true; break; }
+        if (!any_alpha) continue;
+        // Premultiply for the mask-less path; D2D expects premultiplied BGRA.
+        for (size_t i = 0; i + 3 < pixels.size(); i += 4) {
+            const uint32_t alpha = pixels[i + 3];
+            if (alpha == 0 || alpha == 255) continue;
+            for (size_t c = 0; c < 3; ++c)
+                pixels[i + c] = static_cast<uint8_t>((pixels[i + c] * alpha + 127u) / 255u);
+        }
+        auto out = std::make_shared<pulse::common::MenuIconPixels>();
+        out->width = static_cast<uint32_t>(bitmap.bmWidth);
+        out->height = static_cast<uint32_t>(bitmap.bmHeight);
+        out->bgra = std::move(pixels);
+        if (out->Valid()) cached = std::move(out);
+        break;
+    }
+    return cached;
+}
+
+void FoldHuorongRows(std::vector<CtxItemOut>& items) {
+    constexpr const wchar_t* kShredClsid = L"{9f012318-caa5-402c-9bf6-28eb36f61496}";
+    std::vector<size_t> hits;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const auto& item = items[i];
+        if (item.child || item.has_children) continue;
+        if (_wcsicmp(item.clsid.c_str(), kShredClsid) != 0) continue;
+        hits.push_back(i);
+    }
+    if (hits.size() < 2) return;
+    std::wstring prefix = items[hits.front()].text;
+    for (size_t k = 1; k < hits.size(); ++k) {
+        const auto& text = items[hits[k]].text;
+        size_t n = 0;
+        while (n < prefix.size() && n < text.size() && prefix[n] == text[n]) ++n;
+        prefix.resize(n);
+    }
+    while (!prefix.empty() && (prefix.back() == L' ' || prefix.back() == L'\t')) prefix.pop_back();
+    if (prefix.size() < 3) prefix = L"火绒安全软件";
+    const size_t first = hits.front();
+    CtxItemOut header;
+    header.id = 0;
+    header.enabled = true;
+    header.has_children = true;
+    header.text = prefix;
+    header.clsid = items[first].clsid;
+    header.handler = items[first].handler;
+    // Prefer Huorong's own logo over the individual verb bitmap.
+    header.icon = HuorongBrandIcon();
+    items.insert(items.begin() + first, std::move(header));
+    for (const size_t index : hits) {
+        items[index + 1].child = true;
+        items[index + 1].depth = 1;
+    }
 }
 
 // Walks the populated HMENU via the same nested-flyout rules as per-handler
@@ -1991,6 +2093,7 @@ DWORD CtxSessionThreadImpl(LPVOID param, const CtxSessionApi& api = {}) {
                 std::to_wstring(item.enabled) + L" child=" + std::to_wstring(item.child) +
                 L" verb=" + DiagnosticText(item.verb) + L" text=" + DiagnosticText(item.text));
     }
+    FoldHuorongRows(items);
     SendCtxItems(sid, items, 0, collect_hung(), statuses);
 
     auto dispatch_invoke = [&](std::unique_ptr<CtxInvokeMsg> inv) {

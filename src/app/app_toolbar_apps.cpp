@@ -466,4 +466,123 @@ bool ApplyToolbarAppRows(AppState& s, const std::vector<ui::ToolbarPickerTile>& 
     return true;
 }
 
+// ---- 选中时的「打开」按钮 ---------------------------------------------------
+
+ToolbarOpenTarget ToolbarOpenTargetFor(AppState& s) {
+    ToolbarOpenTarget out;
+    const app::Tab* tab = ActiveTab(s);
+    if (!tab || IsRecycleTab(tab) || tab->SelectedCount() == 0) return out;
+    // The first selected file decides (folders and shortcuts have no type of
+    // their own); a selection of folders only shows no button at all.
+    std::wstring ext;
+    for (int index : tab->SelectedIndices()) {
+        if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
+        const auto& entry = tab->EntryAt(index);
+        if (entry.is_dir) continue;
+        // 选中里只要有文件就出现按钮；有扩展名的那个决定用哪个程序。
+        out.has_file = true;
+        const std::wstring type = app::ToolbarFileExt(entry.name);
+        if (!type.empty() && type != L".lnk") { ext = type; break; }
+    }
+    out.ext = ext;
+    if (!out.has_file) return out;
+    if (ext.empty()) return out;   // 有文件但没有类型：只有占位按钮
+    if (const std::wstring chosen = app::ToolbarOpenAppFor(s.appPrefs.toolbar_open_apps, ext);
+        !chosen.empty()) {
+        const app::ToolbarAppInfo info = app::ToolbarApp(chosen, s.hwnd, Work(s));
+        out.exe = chosen;
+        out.name = info.name.empty() ? app::ToolbarFileName(chosen) : info.name;
+        out.icon = info.icon;
+        return out;
+    }
+    const app::ToolbarDefaultApp fallback = app::ToolbarDefaultAppFor(ext, s.hwnd, Work(s));
+    out.exe = fallback.exe;
+    out.name = fallback.name;
+    out.icon = fallback.icon;
+    return out;
+}
+
+void OpenSelectionFromToolbar(AppState& s) {
+    const app::Tab* tab = ActiveTab(s);
+    if (!tab || IsRecycleTab(tab)) return;
+    std::vector<std::wstring> files;
+    for (int index : tab->SelectedIndices()) {
+        if (index < 0 || index >= static_cast<int>(tab->EntryCount())) continue;
+        if (tab->EntryAt(index).is_dir) continue;
+        std::wstring path = EntryFullPath(*tab, index);
+        if (!path.empty()) files.push_back(std::move(path));
+    }
+    if (files.empty()) return;
+    const ToolbarOpenTarget target = ToolbarOpenTargetFor(s);
+    // Nothing remembered (or the default is still being read): the shell's own
+    // open does exactly what a double-click does.
+    const std::wstring exe = target.exe;
+    for (const auto& file : files) {
+        if (exe.empty()) s.ops.OpenWith(file);
+        else s.ops.OpenWithApp(exe, file);
+    }
+}
+
+void ShowToolbarOpenMenu(AppState& s, POINT screen) {
+    if (!EnsureMenu(s)) return;
+    const ToolbarOpenTarget target = ToolbarOpenTargetFor(s);
+    if (target.ext.empty()) return;
+    const std::wstring ext = target.ext;
+    const std::wstring chosen = app::ToolbarOpenAppFor(s.appPrefs.toolbar_open_apps, ext);
+    const app::ToolbarDefaultApp fallback = app::DescribeToolbarDefaultAppNow(ext);
+    constexpr int kDefaultCommand = 36000;
+    constexpr int kRememberedCommand = 36064;
+    std::vector<ui::FluentMenuItem> items;
+    ui::FluentMenuItem def;
+    def.command = kDefaultCommand;
+    def.text = Text(l10n::StringId::OpenInDefaultApp);
+    if (!fallback.name.empty()) def.text += L" · " + fallback.name;
+    def.badge_text = ext;
+    def.icon = fallback.icon;
+    // 当前生效的那一项用底色 + 描边标出来（图标列被程序图标占着，圆点画不出来）。
+    def.marked = chosen.empty();
+    def.separator_after = true;
+    items.push_back(std::move(def));
+    const auto suggestions = app::SuggestToolbarApps({ext}, {}, 8);
+    std::vector<std::wstring> listed;
+    for (size_t i = 0; i < suggestions.size() && i < 8; ++i) {
+        ui::FluentMenuItem row;
+        row.command = kDefaultCommand + 1 + static_cast<int>(i);
+        row.text = suggestions[i].name;
+        row.icon = suggestions[i].icon;
+        row.marked = !chosen.empty() && app::ProgramListHas({chosen}, suggestions[i].exe);
+        listed.push_back(suggestions[i].exe);
+        items.push_back(std::move(row));
+    }
+    // A remembered program Explorer does not offer for the type still gets a row.
+    if (!chosen.empty() && !app::ProgramListHas(listed, chosen)) {
+        ui::FluentMenuItem row;
+        row.command = kRememberedCommand;
+        row.text = target.name.empty() ? app::ToolbarFileName(chosen) : target.name;
+        row.icon = target.icon;
+        row.marked = true;
+        items.push_back(std::move(row));
+    }
+    // 光标落在当前选中的那一项上（默认项或记住的程序），不是第一行。
+    if (s.menu) {
+        for (int i = 0; i < static_cast<int>(items.size()); ++i)
+            if (items[static_cast<size_t>(i)].marked) {
+                s.menu->SetInitialHoverRow(i);
+                break;
+            }
+    }
+    const int cmd = s.menu->TrackPopup(screen, std::move(items));
+    bool changed = false;
+    if (cmd == kDefaultCommand)
+        changed = app::SetToolbarOpenApp(s.appPrefs.toolbar_open_apps, ext, std::wstring());
+    else if (cmd > kDefaultCommand && cmd <= kDefaultCommand + 8) {
+        const size_t i = static_cast<size_t>(cmd - kDefaultCommand - 1);
+        if (i < suggestions.size())
+            changed = app::SetToolbarOpenApp(s.appPrefs.toolbar_open_apps, ext, suggestions[i].exe);
+    }
+    if (!changed) return;
+    if (!s.isolatedTest) s.appPrefs.Save();
+    InvalidateRect(s.hwnd, nullptr, FALSE);
+}
+
 }  // namespace pulse

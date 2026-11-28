@@ -229,6 +229,12 @@ struct AppPrefs {
     bool toolbar_show_sort = true;
     bool toolbar_show_filter = true;
     bool toolbar_show_group = true;
+    // Open button left of the view labels: opens the selection with the
+    // chosen program (or the type default). Pulse-only: Windows is untouched.
+    bool toolbar_open_button = true;
+    // The program the open button starts, per file type: entries are "ext=exe"
+    // (".txt=C:\Windows\notepad.exe"). No entry: the type's default program.
+    std::vector<std::wstring> toolbar_open_apps;
     std::vector<std::wstring> toolbar_view_order = NormalizeToolbarViewOrder({});
     // Actions the selection chip may show, in chip order, by id
     // (toolbar_selection.h). Without the json key: all, default order.

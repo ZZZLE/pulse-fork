@@ -193,6 +193,13 @@ public:
     void SetToolbarGroup(int group_by) { toolbar_group_ = group_by; }
     // 自定义工具栏 → 排序与筛选: which of 排序 / 筛选 / 分组 the toolbar shows
     // (the caller already forces an active filter or grouping on).
+    // Selection open button (left of the view labels): on/off plus the program
+    // the app found for the selection ("" = the bare 打开 placeholder). The
+    // width is measured from the name, so painting and hit testing agree.
+    void SetToolbarOpenButton(bool show, std::wstring label) {
+        toolbar_open_button_ = show;
+        if (toolbar_open_label_ != label) toolbar_open_label_.swap(label);
+    }
     void SetToolbarView(bool sort, bool filter, bool group, std::array<int, 3> order = {0, 1, 2}) {
         toolbar_show_sort_ = sort;
         toolbar_show_filter_ = filter;
@@ -234,6 +241,8 @@ public:
     // Ctrl+Shift+O window overview, under the switcher (app/window_overview_ui.cpp, M7e).
     WindowOverviewView& WindowOverview() { return window_overview_; }
     float ToolbarGroupWidth(float w) const;
+    // 选中时的「打开」按钮: 0 when hidden (no selection, embedded, a pin drag).
+    float ToolbarOpenButtonWidth() const;
     std::wstring ToolbarGroupLabel() const;   // "Group: Date" text of the active chip
     float SearchBarMinWidth() const { return search_min_dip_; }
     D2D1_RECT_F SidebarToggleRect(float w) const;
@@ -1124,6 +1133,9 @@ private:
     std::array<int, 3> toolbar_view_order_{0, 1, 2};
     bool toolbar_show_filter_ = true;
     bool toolbar_show_group_ = true;
+    bool toolbar_open_button_ = false;  // selection open button (app decides)
+    std::wstring toolbar_open_label_;   // program name it shows ("" = placeholder)
+    mutable float toolbar_open_width_ = 0.0f;   // measured name width (0 = not measured)
     int new_primary_ = 0;
     bool new_last_text_ = false;
     int pin_count_ = 0;

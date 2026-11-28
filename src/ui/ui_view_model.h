@@ -1131,6 +1131,11 @@ struct WindowViewModel {
         int fit = 0;
     };
     std::vector<ToolbarAppPin> toolbar_apps;
+    // 选中时的「打开」按钮 (layout.open_app): the program it starts — the type's
+    // remembered one, or the type's default. `toolbar_open_name` empty keeps
+    // the button at its placeholder (a bare 打开 icon).
+    std::wstring toolbar_open_name;
+    common::MenuIconRef toolbar_open_icon;
     // A file drag is over the window: the selection chip and the pinned
     // commands give way, the apps (drop targets) stay (prototype note 6).
     bool toolbar_drop_mode = false;
@@ -1568,6 +1573,8 @@ struct HitTestResult {
         PaneSizeButton,     // narrow pane: opens that slider over the title (index = pane)
         PaneWall,           // main window panes: the view segment's photo wall button (index = pane)
         ToolbarSort,
+        ToolbarOpenApp,     // 选中时的「打开」按钮: opens the selection
+        ToolbarOpenAppMenu, // its ⌄: the programs for the selection's type
         ToolbarMore,
         ToolbarSelAction,   // selection chip: quick actions, kSelChipMore, kSelChipClear, -1 chip body
         ToolbarPin,         // pinned command or app (自定义工具栏): index into layout.pins

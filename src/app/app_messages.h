@@ -47,6 +47,7 @@ constexpr UINT WM_BITLOCKER_UNLOCK = WM_APP + 75;  // app::BitLockerUnlockResult
 constexpr UINT WM_RELEASE_WINDOW_STATES = WM_APP + 76;  // host: free retired window states (window_factory.h)
 constexpr UINT WM_ARRANGE_WINDOWS = WM_APP + 129;
 constexpr UINT WM_MERGE_ALL_WINDOWS = WM_APP + 130;
+constexpr UINT WM_RESTART_PULSE = WM_APP + 131;  // tray 「立即重启 Pulse」
 constexpr UINT WM_NEW_WINDOW = WM_APP + 77;  // open another window at this window's folder (M4a)
 constexpr UINT WM_REOPEN_CLOSED_WINDOW = WM_APP + 78;  // reopen the last closed window (M4c toast, Ctrl+Shift+T)
 constexpr UINT WM_OPEN_SESSION_WINDOWS = WM_APP + 79;  // first window shown: open the session's other windows (M4d)

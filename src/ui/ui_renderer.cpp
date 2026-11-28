@@ -355,6 +355,22 @@ float MainRenderer::ToolbarGroupWidth(float w) const {
                                l10n::StringId::ToolbarGroup, L"\xF168", true, scale_, 108.0f);
 }
 
+float MainRenderer::ToolbarOpenButtonWidth() const {
+    // Only while something is selected (and nowhere near an embedded host or a
+    // pin drag, where the row belongs to the drop targets).
+    if (!toolbar_open_button_ || selection_count_ <= 0 || embedded_ || pin_drop_mode_) return 0.0f;
+    IDWriteFactory2* factory = compositor_ ? compositor_->DwriteFactory() : nullptr;
+    // An empty name is the bare 打开 placeholder: the icon and the chevron only.
+    if (toolbar_open_label_.empty()) return ToolbarOpenTileWidth(scale_, 0.0f);
+    float text = 60.0f * scale_;
+    if (factory && compositor_->SmallFormat())
+        text = std::ceil(MeasureTextWidth(factory, compositor_->SmallFormat(), toolbar_open_label_));
+    // A long program name is ellipsised instead of eating the whole row.
+    const float max_text = 120.0f * scale_;
+    if (text > max_text) text = max_text;
+    return ToolbarOpenTileWidth(scale_, text);
+}
+
 ToolbarLayout MainRenderer::ToolbarLayoutAt(float w, float create_width, float filter_expand) const {
     const float left = EffectiveSidebarWidth(w);
     const float group_width = ToolbarGroupWidth(w);
@@ -366,6 +382,8 @@ ToolbarLayout MainRenderer::ToolbarLayoutAt(float w, float create_width, float f
         : ToolbarCommandWidth(painter_, format, l10n::StringId::ToolbarFilter, kIconFilter, false, scale_, 88.0f);
     const float selection_span = selection_count_ > 0 && !embedded_ && !pin_drop_mode_
         ? SelectionChipSpan(scale_, SelectionChipLabelWidth(w, selection_count_), selection_actions_) : 0.0f;
+    // 选中时的「打开」按钮: with a selection, its width measured from the name.
+    const float open_width = ToolbarOpenButtonWidth();
     ToolbarPinOptions pins;
     pins.view_slots = pin_view_slots_;
     pins.right_from = pin_right_from_;
@@ -376,18 +394,18 @@ ToolbarLayout MainRenderer::ToolbarLayoutAt(float w, float create_width, float f
     pins.label_width = pins.drop_mode ? ToolbarPinLabelWidth() : 0.0f;
     if (!vertical_tabs_)
         return MakeToolbarLayout(w, scale_, title_bar_height_, margin_, create_width, left, filter_expand,
-                                 search_hidden_ ? -1.0f : search_min_dip_, group_width, sort_width, filter_width, pin_count_,
+                                 search_hidden_ ? -1.0f : search_min_dip_, group_width, sort_width, open_width, filter_width, pin_count_,
                                  selection_span, pins, navigation_can_forward_);
     // Command row directly under the title bar; address row centered in it,
     // stopping short of the settings button.
     ToolbarLayout out = MakeToolbarLayout(w, scale_, title_bar_height_ - 46.0f * scale_, margin_,
-                                          create_width, left, filter_expand, 0.0f, group_width, sort_width,
+                                          create_width, left, filter_expand, 0.0f, group_width, sort_width, open_width,
                                           filter_width, pin_count_, selection_span, pins);
     const TitleChrome chrome = MakeTitleChrome(w, scale_, title_bar_height_);
     const float row_top = (title_bar_height_ - 36.0f * scale_) * 0.5f - 4.0f * scale_;
     const ToolbarLayout row = MakeToolbarLayout(chrome.windows_left - 4.0f * scale_, scale_, row_top,
                                                 margin_, create_width, left, 0.0f, search_hidden_ ? -1.0f : search_min_dip_,
-                                                0, 0, 0, 0, 0, {}, navigation_can_forward_);
+                                                0, 0, 0, 0, 0, 0, {}, navigation_can_forward_);
     out.navigation = row.navigation;
     out.address = row.address;
     out.search = row.search;
@@ -2762,34 +2780,38 @@ void MainRenderer::DrawTitleBar(const WindowViewModel& vm, const D2D1_RECT_F& re
     }
 
     }
-    // Window controls, right-aligned in Win11 order: min, max/restore, close.
+    // Window controls, right-aligned: macOS-style traffic lights.
+    // Order stays min / max-restore / close (left to right); each control is a
+    // coloured dot that reveals its original symbol only while hovered.
     const float ctrlY = y;
     const float ctrlH = h;
+    const float dotD = 13.0f * scale_;
+    const float dotR = dotD * 0.5f;
+    auto drawTrafficLight = [&](const D2D1_RECT_F& rc, const D2D1_COLOR_F& fill, bool hovered,
+                                const std::wstring& glyph, const std::wstring& fallback) {
+        const float cxp = (rc.left + rc.right) * 0.5f;
+        const float cyp = (rc.top + rc.bottom) * 0.5f;
+        MakeBrush(dc, fill, brDanger_);
+        FillRoundedRect(dc, brDanger_.get(), cxp - dotR, cyp - dotR, dotD, dotD, dotR);
+        if (hovered) {
+            DrawIconText(cxp - dotR, cyp - dotR, dotD, dotD, glyph, fallback,
+                         HexColor(0x000000, 0.62f), 0.40f);
+        }
+    };
     float cx = right;
     cx -= ctrlW;
     D2D1_RECT_F closeRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Close)) {
-        MakeBrush(dc, theme.danger, brDanger_);
-        FillRect(dc, brDanger_.get(), closeRc.left, closeRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(closeRc.left, closeRc.top, ctrlW, ctrlH, kIconClose, L"x",
-        IsHovered(vm, HitTestResult::Close) ? HexColor(0xFFFFFF) : theme.text, 0.66f);
+    drawTrafficLight(closeRc, HexColor(0xFF5F57), IsHovered(vm, HitTestResult::Close),
+                     kIconClose, L"x");
     cx -= ctrlW;
     D2D1_RECT_F maxRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Maximize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), maxRc.left, maxRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(maxRc.left, maxRc.top, ctrlW, ctrlH,
-        vm.maximized ? kIconRestore : kIconMaximize, vm.maximized ? L"[]" : L"\u25A1",
-        theme.text, 0.66f);
+    drawTrafficLight(maxRc, HexColor(0xFEBC2E), IsHovered(vm, HitTestResult::Maximize),
+                     vm.maximized ? kIconRestore : kIconMaximize,
+                     vm.maximized ? L"[]" : L"\u25A1");
     cx -= ctrlW;
     D2D1_RECT_F minRc = D2D1::RectF(cx, ctrlY, cx + ctrlW, ctrlY + ctrlH);
-    if (IsHovered(vm, HitTestResult::Minimize)) {
-        MakeBrush(dc, theme.fill_hover, brFillHover_);
-        FillRect(dc, brFillHover_.get(), minRc.left, minRc.top, ctrlW, ctrlH);
-    }
-    DrawIconText(minRc.left, minRc.top, ctrlW, ctrlH, kIconMinimize, L"_", theme.text, 0.66f);
+    drawTrafficLight(minRc, HexColor(0x28C840), IsHovered(vm, HitTestResult::Minimize),
+                     kIconMinimize, L"_");
 }
 
 void MainRenderer::DrawTeachBubble(const WindowViewModel& vm, const D2D1_RECT_F& rect,
