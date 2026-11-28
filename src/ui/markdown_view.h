@@ -26,6 +26,7 @@ class MarkdownView {
     friend struct PreviewBufferLifetimeTest;
     friend struct DetailsPreviewProbe;
     friend struct MarkdownScrollbarTest;
+    friend struct QuickPreviewAuditTest;
     friend struct ThumbnailCacheTestAccess;
 public:
     ~MarkdownView();
@@ -58,6 +59,7 @@ public:
     // while PlainText, find, selection and copy still span the whole book.
     int SectionCount() const noexcept { return static_cast<int>(sections_.size()); }
     int SectionIndex() const noexcept { return section_; }
+    bool CurrentSectionHasContent() const noexcept;
     // Shows a section scrolled to one of its blocks, or to its end.
     bool ShowSection(int index, int block = 0, bool at_end = false);
     // The contents sidebar and the next-chapter link. Click returns true when
@@ -80,6 +82,8 @@ public:
     bool Scroll(float wheel_steps);
     bool ScrollHorizontal(float wheel_steps);
     bool OverScrollbar(float x, float y) const;
+    bool ScrollbarHover(float x, float y);
+    bool Leave();
     bool ScrollbarMouseDown(float x, float y);
     bool ScrollbarMouseMove(float x, float y);
     void EndScrollbarDrag() noexcept { scrollbar_drag_ = 0; }
@@ -151,7 +155,8 @@ private:
         float travel = 0.0f, maximum = 0.0f;
     };
     ScrollbarGeometry Scrollbar(bool horizontal) const;
-    int scrollbar_drag_ = 0; // 1 vertical, 2 horizontal
+    int scrollbar_drag_ = 0;  // 1 vertical, 2 horizontal
+    int scrollbar_hover_ = 0; // 1 vertical, 2 horizontal
     float scrollbar_press_ = 0.0f, scrollbar_start_ = 0.0f;
 
     MarkdownImageMetadata image_metadata_;

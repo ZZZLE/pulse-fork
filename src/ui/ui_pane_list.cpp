@@ -24,9 +24,11 @@
 #include "wall_layout_source.h"
 #include "wall_layout_job.h"
 #include "file_name_breaks.h"
+#include "icon_name_layout.h"
 #include "../fs/cloud_state.h"
 #include "../app/cloud_sync_probe.h"
 #include "cloud_swap.h"
+#include "store_icons.h"
 #include <windowsx.h>
 #include <d2d1effects.h>
 #include <shlwapi.h>
@@ -41,6 +43,18 @@
 namespace pulse::ui {
 
 namespace {
+// Static holds need one deadline wake-up, not a stream of animation frames.
+// Window-owned timers disappear with the HWND; each pane has independent slots.
+void WakePaneAt(HWND hwnd, int pane, UINT_PTR channel, uint64_t deadline, uint64_t now) {
+    if (!hwnd || pane < 0) return;
+    const UINT_PTR id = 0x504100 + static_cast<UINT_PTR>(pane) * 4 + channel;
+    if (!deadline || deadline <= now) { KillTimer(hwnd, id); return; }
+    SetTimer(hwnd, id, static_cast<UINT>(std::clamp<uint64_t>(deadline - now, 10, USER_TIMER_MAXIMUM)),
+        [](HWND window, UINT, UINT_PTR timer, DWORD) {
+            KillTimer(window, timer);
+            InvalidateRect(window, nullptr, FALSE);
+        });
+}
 // Attribute wall time and Luma fallback deltas to the current row phase.
 class RowPerfScope {
 public:
@@ -141,9 +155,6 @@ static CloudSwapPose CloudSwapFor(const void* owner, const std::wstring& path, i
 
 
 namespace {
-// This PC tiles: the capacity bar grows in over this long, once per visit.
-constexpr float kCapacityRevealMs = 700.0f;
-
 // This PC tiles: the bar follows the text column, up to 360 DIP, and stops
 // short of the tile's edge (and the scrollbar next to the right column).
 float DriveTileBarWidth(const D2D1_RECT_F& name_rect, float scale) {
@@ -380,7 +391,7 @@ bool MainRenderer::DrawExcludeEmptySvg(const D2D1_RECT_F& bounds, float opacity)
 D2D1_RECT_F MainRenderer::PaneListRect(const D2D1_RECT_F& pane_bounds, float extra_top,
                                        ViewMode mode) const {
     D2D1_RECT_F list = pane_bounds;
-    list.top += pane_header_height_ + extra_top +
+    list.top += pane_header_height_ + EmbeddedPickerRecentHeight() + extra_top +
                 (ShowsColumnHeader(mode) ? column_header_height_ : 0.0f);
     if (list.top > list.bottom) list.top = list.bottom;
     return list;
@@ -410,8 +421,16 @@ bool ShowsSizeControl(const PaneViewModel& vm) noexcept {
 D2D1_RECT_F MainRenderer::PaneZoomChipRect(const PaneViewModel& pane, const D2D1_RECT_F& bounds) const {
     const float limit = PaneHeaderTitleRight(pane,bounds);
     const float width = (bounds.right-bounds.left > 600*scale_ ? 258.0f : 170.0f)*scale_;
-    const float titleWidth = compositor_ ? MeasureTextWidth(compositor_->DwriteFactory(),compositor_->HeaderFormat(),pane.header_text) : 60*scale_;
-    const float left = std::max(bounds.left+8*scale_,std::min(bounds.left+16*scale_+titleWidth,limit-width));
+    float titleRight = bounds.left + 68.0f * scale_;
+    if (compositor_) {
+        if (!embedded_) {
+            titleRight = LayoutSplitPaneHeader(pane, bounds, limit, pane_header_height_, true, scale_, compositor_).title_end + 8.0f * scale_;
+        } else {
+            const float titleWidth = MeasureTextWidth(compositor_->DwriteFactory(),compositor_->HeaderFormat(),pane.header_text);
+            titleRight = bounds.left + 16.0f * scale_ + titleWidth;
+        }
+    }
+    const float left = std::max(bounds.left+8*scale_,std::min(titleRight,limit-width));
     return D2D1::RectF(left,bounds.top+(pane_header_height_-26*scale_)*.5f,
         std::min(limit,left+width),bounds.top+(pane_header_height_+26*scale_)*.5f);
 }
@@ -526,7 +545,9 @@ void MainRenderer::DrawPaneSizeSlider(const PaneViewModel& pane, int pane_index,
         dc->PopAxisAlignedClip();
     }
     if (motion && dip > 0.0f && motion_now_ < motion->label_until) {
-        RequestMotionFrame();
+        const uint64_t fade_at = motion->label_until - 250;
+        if (motion_now_ >= fade_at) RequestMotionFrame();
+        WakePaneAt(notify_hwnd_, pane_index, 0, fade_at, motion_now_);
         const float a = std::clamp(static_cast<float>(motion->label_until - motion_now_) / 250.0f, 0.0f, 1.0f);
         const float cy = (label_at.top + label_at.bottom) * 0.5f;
         const float right = label_at.left - 6.0f * scale_;
@@ -748,7 +769,37 @@ MainRenderer::DetailsColumnLayout MainRenderer::MediaColumns(
     return out;
 }
 
+void MainRenderer::AppendExtensionColumns(DetailsColumnLayout& layout, const PaneViewModel& vm) const {
+    layout.extension_count = 0;
+    if (vm.extension_columns.empty() || vm.this_pc_columns || vm.column_strip.Active() || vm.is_search ||
+        layout.count < 1 || layout.kinds[0] != ColumnKind::Name)
+        return;
+    // Like media columns: only the name column's spare width, the name
+    // keeping its minimum; the last extension columns go first.
+    const float name_min = (vm.media_columns ? 200.0f : kDetailsMinNameDip) * scale_;
+    float name = layout.widths[0];
+    for (size_t i = 0; i < vm.extension_columns.size() && i < kMaxExtensionColumns &&
+                       layout.count < static_cast<int>(kMaxDetailsColumns); ++i) {
+        const float w = std::round(std::clamp(vm.extension_columns[i].width_dip, 48.0f, 480.0f) * scale_);
+        if (name - w < name_min) break;
+        name -= w;
+        layout.kinds[static_cast<size_t>(layout.count)] =
+            static_cast<ColumnKind>(static_cast<size_t>(ColumnKind::Extension0) + i);
+        layout.widths[static_cast<size_t>(layout.count)] = w;
+        ++layout.count;
+        ++layout.extension_count;
+    }
+    layout.widths[0] = name;
+}
+
 MainRenderer::DetailsColumnLayout MainRenderer::DetailsColumns(
+    const D2D1_RECT_F& pane_bounds, const PaneViewModel& vm) const {
+    DetailsColumnLayout layout = BaseDetailsColumns(pane_bounds, vm);
+    AppendExtensionColumns(layout, vm);
+    return layout;
+}
+
+MainRenderer::DetailsColumnLayout MainRenderer::BaseDetailsColumns(
     const D2D1_RECT_F& pane_bounds, const PaneViewModel& vm) const {
     if (vm.this_pc_columns && !vm.is_search && !vm.column_strip.Active())
         return ThisPcColumns(pane_bounds, vm);
@@ -1207,6 +1258,141 @@ MainRenderer::DetailsColumnLayout MainRenderer::DetailsColumns(
 namespace {
 int FolderIconNameLines(Compositor* compositor, const PaneViewModel& vm, float scale);
 const WallRows* PaneWallRows(const PaneViewModel& vm, float width, float scale, HWND owner);
+float IconNameLineDip() noexcept {
+    return kIconGridNameLineDip * std::max(1.0f, typography::UiFontScale());
+}
+}
+
+// ---- List view columns (File Explorer: each column as wide as its longest name) ----
+namespace {
+// Widths of a pane's names, per view row: an estimate from cached character
+// advances for every row, the exact layout width for the rows that decide a
+// column (its widest). Kept while the rows and the text inputs stay the same,
+// so a resize only rebuilds the column split.
+struct ListColumnsCache {
+    std::weak_ptr<const std::vector<fs::DirEntry>> snapshot;
+    std::weak_ptr<const PaneViewModel::FilterMap> order;
+    const void* entries = nullptr;     // vm.entries without a snapshot
+    bool has_snapshot = false, ordered = false;
+    size_t count = 0;
+    float scale = 0.0f;
+    uint64_t font = 0, alias = 0, extensions = 0;
+    std::vector<float> text_px;
+    std::vector<uint8_t> exact;        // 1: text_px measured exactly
+    // Layouts hold the columns for one paint or hit test; the previous split
+    // stays alive across one rebuild.
+    std::shared_ptr<const ListColumns> columns, previous;
+    ULONGLONG used = 0;
+};
+std::vector<ListColumnsCache>& ListColumnsCaches() {
+    static std::vector<ListColumnsCache> caches;
+    return caches;
+}
+struct NameAdvances {
+    const void* format = nullptr;
+    uint64_t font = 0;
+    std::vector<float> advance;        // per UTF-16 unit; < 0: not measured yet
+};
+float EstimateNameWidth(std::wstring_view name, NameAdvances& table, Compositor* compositor, IDWriteTextFormat* format) {
+    float width = 0.0f;
+    for (size_t i = 0; i < name.size(); ++i) {
+        wchar_t ch = name[i];
+        if (IS_HIGH_SURROGATE(ch) && i + 1 < name.size() && IS_LOW_SURROGATE(name[i + 1])) {
+            ch = L'\x4E2D';  // a full-width stand-in for a supplementary character
+            ++i;
+        }
+        float& advance = table.advance[static_cast<size_t>(ch)];
+        if (advance < 0.0f) {
+            // One line has a fixed overhead besides its glyphs: the step from one
+            // copy to four leaves the character's own advance.
+            const float one = typography::MeasureLine(compositor, format, std::wstring(1, ch));
+            const float four = typography::MeasureLine(compositor, format, std::wstring(4, ch));
+            advance = std::max(0.0f, (four - one) / 3.0f);
+        }
+        width += advance;
+    }
+    return width;
+}
+// The name as the List view draws it (alias rules included).
+std::wstring ListDisplayName(const ListEntryView& e) {
+    const std::wstring shown = ShownName(e);
+    if (e.alias.empty()) return shown;
+    return app::AliasStore::Instance().Display() == app::AliasDisplay::Both ? e.alias + L"\u2003\u2003" + shown : e.alias;
+}
+const ListColumns* PaneListColumns(Compositor* compositor, const PaneViewModel& vm, float height, float scale) {
+    if (vm.view_mode != ViewMode::List || vm.content_results || !compositor) return nullptr;
+    IDWriteTextFormat* format = compositor->FileNameFormat();
+    const size_t count = vm.EntryCount();
+    if (!format || count == 0) return nullptr;
+    const uint64_t font = typography::Generation();
+    const uint64_t alias = app::AliasStore::Instance().Revision();
+    const uint64_t extensions = KnownExtensionsRevision(vm.show_file_extensions);
+    static NameAdvances table;
+    if (table.format != format || table.font != font || table.advance.empty()) {
+        table.format = format; table.font = font; table.advance.assign(65536, -1.0f);
+    }
+    const auto same = [](const auto& weak, const auto& strong) {
+        return !weak.expired() && !weak.owner_before(strong) && !strong.owner_before(weak);
+    };
+    const bool ordered = vm.filter_map != nullptr;
+    auto& caches = ListColumnsCaches();
+    ListColumnsCache* hit = nullptr;
+    for (auto& c : caches) {
+        const bool source = vm.snapshot ? (c.has_snapshot && same(c.snapshot, vm.snapshot))
+                                        : (!c.has_snapshot && c.entries == vm.entries.data());
+        if (source && c.ordered == ordered && (!ordered || same(c.order, vm.filter_map)) && c.count == count) { hit = &c; break; }
+    }
+    if (hit && (hit->scale != scale || hit->font != font || hit->alias != alias || hit->extensions != extensions)) {
+        hit->text_px.clear();   // same rows, other text inputs: measure again
+        hit->columns.reset();
+    }
+    if (!hit) {
+        if (caches.size() >= 6) {
+            caches.erase(std::min_element(caches.begin(), caches.end(),
+                [](const ListColumnsCache& a, const ListColumnsCache& b) { return a.used < b.used; }));
+        }
+        caches.emplace_back();
+        hit = &caches.back();
+        hit->has_snapshot = vm.snapshot != nullptr;
+        if (vm.snapshot) hit->snapshot = vm.snapshot; else hit->entries = vm.entries.data();
+        hit->ordered = ordered;
+        if (ordered) hit->order = vm.filter_map;
+        hit->count = count;
+    }
+    hit->used = GetTickCount64();
+    if (hit->text_px.size() != count) {
+        hit->scale = scale; hit->font = font; hit->alias = alias; hit->extensions = extensions;
+        hit->text_px.assign(count, 0.0f);
+        hit->exact.assign(count, 0);
+        for (size_t row = 0; row < count; ++row) {
+            const int src = vm.SourceIndex(static_cast<int>(row));
+            if (src < 0) continue;
+            const auto at = static_cast<size_t>(src);
+            if (vm.snapshot) { if (at < vm.snapshot->size()) hit->text_px[row] = EstimateNameWidth((*vm.snapshot)[at].name, table, compositor, format); }
+            else if (at < vm.entries.size()) hit->text_px[row] = EstimateNameWidth(vm.entries[at].name, table, compositor, format);
+        }
+    }
+    const int rows = ListRowsPerColumn(height, scale);
+    if (hit->columns && hit->columns->rows_per_column == rows) return hit->columns.get();
+    // Each column is decided by its widest name: measure that one exactly (a
+    // hidden extension or an alias can make another row the widest instead).
+    const size_t per = static_cast<size_t>(rows);
+    for (size_t first = 0; first < count; first += per) {
+        const size_t end = std::min(count, first + per);
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            size_t widest = first;
+            for (size_t i = first + 1; i < end; ++i) if (hit->text_px[i] > hit->text_px[widest]) widest = i;
+            if (hit->exact[widest]) break;
+            hit->exact[widest] = 1;
+            const int src = vm.SourceIndex(static_cast<int>(widest));
+            if (src < 0) continue;
+            hit->text_px[widest] = typography::MeasureLine(compositor, format, ListDisplayName(MakeVisibleEntry(vm, static_cast<size_t>(src))));
+        }
+    }
+    hit->previous = std::move(hit->columns);
+    hit->columns = std::make_shared<const ListColumns>(BuildListColumns(hit->text_px, rows, scale));
+    return hit->columns.get();
+}
 }
 
 ViewLayoutParams MainRenderer::ListRowHeightDip(const PaneViewModel& vm, const D2D1_RECT_F& pane_bounds) const {
@@ -1214,11 +1400,17 @@ ViewLayoutParams MainRenderer::ListRowHeightDip(const PaneViewModel& vm, const D
     // ViewLayout of a pane comes through here, so paint, hit testing and
     // scrolling agree).
     if (IsZoomIconMode(vm.view_mode)) {
-        ViewLayoutParams params(IconGridNameBlockDip(FolderIconNameLines(compositor_, vm, scale_)), vm.icon_dip);
+        ViewLayoutParams params(IconGridNameBlockDip(FolderIconNameLines(compositor_, vm, scale_)),
+                               vm.icon_dip, IconNameLineDip());
         params.wall = PaneWallRows(vm, std::max(1.0f, pane_bounds.right - pane_bounds.left), scale_, notify_hwnd_);
         return params;
     }
     const float base = ListRowHeightDip(vm);
+    if (vm.view_mode == ViewMode::List) {
+        ViewLayoutParams params(base);
+        params.list_columns = PaneListColumns(compositor_, vm, pane_bounds.bottom - pane_bounds.top, scale_);
+        return params;
+    }
     if (vm.view_mode != ViewMode::Details || !vm.is_search || vm.content_results) return base;
     return DetailsColumns(pane_bounds, vm).two_line ? std::max(base, kDetailsTwoLineMinRowDip) : base;
 }
@@ -1239,11 +1431,12 @@ int MainRenderer::ManualColumnSlot(ColumnKind kind, bool search_view) noexcept {
 int MainRenderer::ColumnDropSlot(const DetailsColumnLayout& layout, int from, float x,
                                  float* line_x) noexcept {
     const int first = layout.FirstOrderable();
-    if (!layout.reorderable || from < first || from >= layout.count) return -1;
+    const int end = layout.OrderableEnd();   // extension columns stay where they are
+    if (!layout.reorderable || from < first || from >= end) return -1;
     int best = -1;
     float best_distance = 0.0f;
     float best_x = 0.0f;
-    for (int slot = first; slot <= layout.count; ++slot) {
+    for (int slot = first; slot <= end; ++slot) {
         const float edge = slot >= layout.count ? layout.right : layout.DividerX(slot - 1);
         const float distance = std::abs(x - edge);
         if (best < 0 || distance < best_distance) {
@@ -1260,13 +1453,14 @@ int MainRenderer::ColumnDropSlot(const DetailsColumnLayout& layout, int from, fl
 DetailsColumnOrder MainRenderer::ReorderedColumns(const DetailsColumnLayout& layout,
                                                   const DetailsColumnOrder& order, int from, int slot) noexcept {
     const int first = layout.FirstOrderable();
-    if (!layout.reorderable || from < first || from >= layout.count || slot < first || slot > layout.count ||
+    const int end = layout.OrderableEnd();
+    if (!layout.reorderable || from < first || from >= end || slot < first || slot > end ||
         slot == from || slot == from + 1)
         return NormalizeDetailsColumnOrder(order);
     const auto kind = static_cast<uint8_t>(layout.kinds[static_cast<size_t>(from)]);
-    if (slot < layout.count)
+    if (slot < end)
         return MoveDetailsColumn(order, kind, static_cast<uint8_t>(layout.kinds[static_cast<size_t>(slot)]), false);
-    return MoveDetailsColumn(order, kind, static_cast<uint8_t>(layout.kinds[static_cast<size_t>(layout.count - 1)]),
+    return MoveDetailsColumn(order, kind, static_cast<uint8_t>(layout.kinds[static_cast<size_t>(end - 1)]),
                              true);
 }
 
@@ -1469,7 +1663,8 @@ D2D1_RECT_F MainRenderer::NameCellRect(const D2D1_RECT_F& pane_bounds, int view_
     const D2D1_RECT_F list = PaneListRect(pane_bounds, extra_top, mode);
     if (mode != ViewMode::Details) {
         ViewLayout layout(mode, list, item_count, scroll_x, scroll_y, scale_,
-                          IsZoomIconMode(mode) ? row_height_px / scale_ : row_height_dip_);
+                          ViewLayoutParams(IsZoomIconMode(mode) ? row_height_px / scale_ : row_height_dip_,
+                                           0.0f, IconNameLineDip()));
         return layout.NameRect(view_row);
     }
     const float list_x = list.left;
@@ -1952,6 +2147,12 @@ bool MainRenderer::PointInItemGrip(const PaneViewModel& vm, const D2D1_RECT_F& f
             }
             default:
                 if (IsMediaColumn(kind)) { text = vm.media_cell ? vm.media_cell(source_index,MediaSortColumn(kind)) : std::wstring(); if (text.empty()) text = L"\u2014"; trailing = kind == ColumnKind::MediaDuration || kind == ColumnKind::MediaFps; }
+                if (IsExtensionColumn(kind) && vm.extension_cell) {
+                    const size_t ext = ExtensionColumnIndex(kind);
+                    uint32_t tone = 0;
+                    if (!vm.extension_cell(source_index, ext, text, tone)) text.clear();
+                    trailing = ext < vm.extension_columns.size() && vm.extension_columns[ext].align_end;
+                }
                 break;
             }
             if (hit_text(text,left,width,trailing)) return true;
@@ -1982,7 +2183,7 @@ bool MainRenderer::PointInItemGrip(const PaneViewModel& vm, const D2D1_RECT_F& f
         if (size_line) {
             w = std::max(w, MeasureLayoutText(compositor_, compositor_->DwriteFactory(), compositor_->FileNameFormat(),
                                               size_label->second));
-            h += kIconGridNameLineDip * scale_;
+            h = name.bottom - name.top;
         }
         const float mid = (name.left + name.right) * 0.5f;
         w = std::min(w, cell_w);
@@ -2067,12 +2268,133 @@ int MainRenderer::TreeMoreActionAt(const PaneViewModel& vm, const D2D1_RECT_F& f
     }
     return -1;
 }
+ID2D1Effect* MainRenderer::IconDesaturateEffect(float saturation, float opacity) {
+    auto* dc = compositor_ ? compositor_->Dc() : nullptr;
+    if (!dc || IsHighContrast()) return nullptr;
+    if (icon_color_matrix_dc_ != dc) {
+        icon_color_matrix_.reset();
+        icon_color_matrix_dc_ = dc;
+    }
+    if (!icon_color_matrix_.get()) {
+        constexpr GUID kColorMatrixClsid = {0x921F03D6, 0x641C, 0x47DF, {0x85, 0x2D, 0xB4, 0xBB, 0x61, 0x53, 0xAE, 0x11}};
+        if (FAILED(dc->CreateEffect(kColorMatrixClsid, &icon_color_matrix_)) || !icon_color_matrix_.get()) {
+            icon_color_matrix_.reset();
+            return nullptr;
+        }
+    }
+    const float s = std::clamp(saturation, 0.0f, 1.0f);
+    const float a = std::clamp(opacity, 0.0f, 1.0f);
+    const float lr = 0.2126f * (1.0f - s);
+    const float lg = 0.7152f * (1.0f - s);
+    const float lb = 0.0722f * (1.0f - s);
+    D2D1_MATRIX_5X4_F m{};
+    m.m[0][0] = lr + s; m.m[0][1] = lr;     m.m[0][2] = lr;     m.m[0][3] = 0.0f;
+    m.m[1][0] = lg;     m.m[1][1] = lg + s; m.m[1][2] = lg;     m.m[1][3] = 0.0f;
+    m.m[2][0] = lb;     m.m[2][1] = lb;     m.m[2][2] = lb + s; m.m[2][3] = 0.0f;
+    m.m[3][0] = 0.0f;   m.m[3][1] = 0.0f;   m.m[3][2] = 0.0f;   m.m[3][3] = a;
+    icon_color_matrix_->SetValue(0u, m);
+    return icon_color_matrix_.get();
+}
+
 void MainRenderer::DrawFolderIcon(float x, float y, float size, const Theme& theme,
-                                  float opacity) {
+                                  float opacity, float saturation) {
     (void)theme;
-    if (compositor_ && compositor_->Dc())
+    if (compositor_ && compositor_->Dc()) {
+        ID2D1Effect* effect = saturation < 0.999f ? IconDesaturateEffect(saturation, opacity) : nullptr;
         icon_cache_.Draw(compositor_->Dc(), D2D1::RectF(x, y, x + size, y + size),
-                         L"", L"", true, FILE_ATTRIBUTE_DIRECTORY, opacity);
+                         L"", L"", true, FILE_ATTRIBUTE_DIRECTORY, opacity, effect);
+    }
+}
+
+void MainRenderer::DrawSplitHeaderFolderIcon(const D2D1_RECT_F& rc, float focus_t, const Theme& theme) {
+    auto* dc = compositor_ ? compositor_->Dc() : nullptr;
+    const float size = (std::min)(rc.right - rc.left, rc.bottom - rc.top);
+    if (!dc || size <= 0.0f) return;
+    if (empty_folder_dc_ != dc || !empty_folder_geometry_[0].get()) {
+        // Ensure geometry is built via a minimal off-screen/zero-alpha pass if not yet primed.
+        for (auto& geometry : empty_folder_geometry_) geometry.reset();
+        brEmptyFolder_.reset();
+        empty_folder_dc_ = dc;
+        ComPtr<ID2D1Factory> factory;
+        dc->GetFactory(&factory);
+        if (!factory.get()) return;
+        const auto arc = [](ID2D1GeometrySink* sink, D2D1_POINT_2F to, float r) {
+            sink->AddArc(D2D1::ArcSegment(to, D2D1::SizeF(r, r), 0.0f,
+                                          D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+        };
+        const auto build = [&](ComPtr<ID2D1PathGeometry>& out, auto&& shape) {
+            ComPtr<ID2D1PathGeometry> geometry;
+            ComPtr<ID2D1GeometrySink> sink;
+            if (FAILED(factory->CreatePathGeometry(&geometry)) || FAILED(geometry->Open(&sink))) return false;
+            shape(sink.get());
+            if (FAILED(sink->Close())) return false;
+            out = std::move(geometry);
+            return true;
+        };
+        if (!build(empty_folder_geometry_[0], [&](ID2D1GeometrySink* k) {
+                k->BeginFigure({2.0f, 6.6f}, D2D1_FIGURE_BEGIN_FILLED);
+                arc(k, {4.6f, 4.0f}, 2.6f);
+                k->AddLine({8.8f, 4.0f});
+                k->AddBezier(D2D1::BezierSegment({9.5f, 4.0f}, {10.1f, 4.3f}, {10.6f, 4.8f}));
+                k->AddLine({12.0f, 6.0f});
+                k->AddLine({19.4f, 6.0f});
+                arc(k, {22.0f, 8.6f}, 2.6f);
+                k->AddLine({22.0f, 17.4f});
+                arc(k, {19.4f, 20.0f}, 2.6f);
+                k->AddLine({4.6f, 20.0f});
+                arc(k, {2.0f, 17.4f}, 2.6f);
+                k->EndFigure(D2D1_FIGURE_END_CLOSED);
+            }) ||
+            !build(empty_folder_geometry_[1], [&](ID2D1GeometrySink* k) {
+                k->BeginFigure({2.0f, 10.4f}, D2D1_FIGURE_BEGIN_FILLED);
+                k->AddBezier(D2D1::BezierSegment({2.0f, 9.4f}, {2.8f, 8.6f}, {3.8f, 8.6f}));
+                k->AddLine({20.2f, 8.6f});
+                k->AddBezier(D2D1::BezierSegment({21.2f, 8.6f}, {22.0f, 9.4f}, {22.0f, 10.4f}));
+                k->AddLine({22.0f, 17.4f});
+                arc(k, {19.4f, 20.0f}, 2.6f);
+                k->AddLine({4.6f, 20.0f});
+                arc(k, {2.0f, 17.4f}, 2.6f);
+                k->EndFigure(D2D1_FIGURE_END_CLOSED);
+            })) {
+            for (auto& geometry : empty_folder_geometry_) geometry.reset();
+            return;
+        }
+        // Reset [0] if [2]/[3] are still needed later by DrawEmptyFolderIcon? Keep [2]/[3] lazy in DrawEmptyFolderIcon.
+    }
+    ID2D1PathGeometry* back = empty_folder_geometry_[0].get();
+    ID2D1PathGeometry* front = empty_folder_geometry_[1].get();
+    if (!back || !front) return;
+    const float t = std::clamp(focus_t, 0.0f, 1.0f);
+    const float opacity = IsHighContrast() ? 1.0f : (0.55f + 0.45f * t);
+    D2D1_MATRIX_3X2_F previous{};
+    dc->GetTransform(&previous);
+    dc->SetTransform(D2D1::Matrix3x2F::Scale(size / 24.0f, size / 24.0f) *
+                     D2D1::Matrix3x2F::Translation(rc.left, rc.top) * previous);
+    const bool layered = opacity < 0.999f;
+    if (layered) {
+        dc->PushLayer(D2D1::LayerParameters1(D2D1::RectF(-2.0f, -2.0f, 26.0f, 26.0f), nullptr,
+                                             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                             D2D1::IdentityMatrix(), opacity, nullptr,
+                                             D2D1_LAYER_OPTIONS1_NONE), nullptr);
+    }
+    if (IsHighContrast()) {
+        const float stroke = std::max(1.0f, scale_) * 24.0f / size;
+        MakeBrush(dc, theme.text, brEmptyFolder_);
+        dc->DrawGeometry(back, brEmptyFolder_.get(), stroke);
+        MakeBrush(dc, theme.bg, brEmptyFolder_);
+        dc->FillGeometry(front, brEmptyFolder_.get());
+        MakeBrush(dc, theme.text, brEmptyFolder_);
+        dc->DrawGeometry(front, brEmptyFolder_.get(), stroke);
+    } else {
+        const D2D1_COLOR_F back_col = MixColor(HexColor(0x8C8C8C), HexColor(0xE9A823), t);
+        const D2D1_COLOR_F front_col = MixColor(HexColor(0xB5B5B5), HexColor(0xFFC54D), t);
+        MakeBrush(dc, back_col, brEmptyFolder_);
+        dc->FillGeometry(back, brEmptyFolder_.get());
+        MakeBrush(dc, front_col, brEmptyFolder_);
+        dc->FillGeometry(front, brEmptyFolder_.get());
+    }
+    if (layered) dc->PopLayer();
+    dc->SetTransform(previous);
 }
 
 void MainRenderer::DrawEmptyFolderIcon(float x, float y, float size, const Theme& theme,
@@ -2085,7 +2407,7 @@ void MainRenderer::DrawEmptyFolderIcon(float x, float y, float size, const Theme
         brEmptyFolder_.reset();
         empty_folder_dc_ = dc;
     }
-    if (!empty_folder_geometry_[0].get()) {
+    if (!empty_folder_geometry_[0].get() || !empty_folder_geometry_[2].get()) {
         ComPtr<ID2D1Factory> factory;
         dc->GetFactory(&factory);
         if (!factory.get()) return;
@@ -2235,46 +2557,60 @@ void MainRenderer::PrefetchNextScreen(const PaneViewModel& vm, int first, int la
     if (!pixels || first < 0 || last < first || pane_index < 0 ||
         pane_index >= static_cast<int>(prefetch_signature_.size())) return;
     const int count = static_cast<int>(vm.EntryCount());
-    const int begin = last + 1;
-    const int end = std::min(count - 1, last + (last - first + 1));
-    if (begin > end) return;
+    const int span = last - first + 1;
+    const int down_begin = last + 1;
+    const int down_end = std::min(count - 1, last + span);
+    const int up_end = first - 1;
+    const int up_begin = std::max(0, first - std::max(1, span / 2));
+    if (down_begin > down_end && up_begin > up_end) return;
     // Once per screen position: a frame that drew the same range asks nothing.
     const uint64_t signature = (vm.view_generation * 0x9E3779B97F4A7C15ull) ^
-        (static_cast<uint64_t>(begin) << 40) ^ (static_cast<uint64_t>(end) << 16) ^ pixels;
+        (static_cast<uint64_t>(first) << 36) ^ (static_cast<uint64_t>(last) << 16) ^ pixels;
     auto& done = prefetch_signature_[static_cast<size_t>(pane_index)];
     if (done == signature) return;
-    for (int i = begin; i <= end; ++i) {
+    const auto queue_index = [&](int i) {
         const int src = vm.SourceIndex(i);
-        if (src < 0) continue;
-        if (vm.content_results && !vm.content_results->Ready(static_cast<size_t>(src))) continue;
+        if (src < 0) return true;
+        if (vm.content_results && !vm.content_results->Ready(static_cast<size_t>(src))) return true;
         const ListEntryView& e = MakeVisibleEntry(vm, static_cast<size_t>(src));
         // Cloud placeholders would download; folders have their own cache.
-        if (e.is_dir || e.is_link || e.record_only || e.cloud_recall) continue;
-        if (!thumbnail_cache_.Prefetch(e.path, e.attrs, pixels, vm.view_generation,
-                                       e.modified_value, e.size_value)) return;  // busy: a later frame
+        if (e.is_dir || e.is_link || e.record_only || e.cloud_recall) return true;
+        const std::wstring& path = e.thumb_path.empty() ? e.path : e.thumb_path;
+        return thumbnail_cache_.Prefetch(path, e.attrs, pixels, vm.view_generation,
+                                         e.modified_value, e.size_value);
+    };
+    for (int i = down_begin; i <= down_end; ++i) {
+        if (!queue_index(i)) return;  // busy: a later frame
+    }
+    for (int i = up_end; i >= up_begin; --i) {
+        if (!queue_index(i)) return;
     }
     done = signature;
 }
 
 void MainRenderer::DrawFileIcon(float x, float y, float size, const Theme& theme,
-                                float opacity) {
+                                float opacity, float saturation) {
     (void)theme;
-    if (compositor_ && compositor_->Dc())
+    if (compositor_ && compositor_->Dc()) {
+        ID2D1Effect* effect = saturation < 0.999f ? IconDesaturateEffect(saturation, opacity) : nullptr;
         icon_cache_.Draw(compositor_->Dc(), D2D1::RectF(x, y, x + size, y + size),
-                         L"", L"", false, FILE_ATTRIBUTE_NORMAL, opacity);
+                         L"", L"", false, FILE_ATTRIBUTE_NORMAL, opacity, effect);
+    }
 }
 
 namespace {
-// Decode size for a view's thumbnails: big grids share one 256 px decode,
-// medium icons 128 px, other views their drawn size. Icon grids round up to
-// 128 / 256 / 512 px tiers, so zooming between sizes reuses decodes.
+// Decode size for a view's thumbnails: icon grids bucket to 64 / 128 / 256 /
+// 512 px tiers (extra-large starts at 256 px), so zooming between sizes
+// reuses decodes while small grids stay compact.
 uint32_t ThumbnailRequestPixels(ViewMode mode, float drawn_size) noexcept {
     long pixels = std::lround(drawn_size);
-    if (mode == ViewMode::ExtraLargeIcons || mode == ViewMode::LargeIcons)
+    if (mode == ViewMode::ExtraLargeIcons)
         pixels = std::max(256l, pixels);
-    else if (mode == ViewMode::MediumIcons)
-        pixels = std::max(128l, pixels);
-    if (IsZoomIconMode(mode)) pixels = pixels <= 128 ? 128l : pixels <= 256 ? 256l : 512l;
+    if (IsZoomIconMode(mode)) {
+        pixels = pixels <= 64 ? 64l
+               : pixels <= 128 ? 128l
+               : pixels <= 256 ? 256l : 512l;
+    }
     return static_cast<uint32_t>(std::clamp(pixels, 32l, 512l));
 }
 } // namespace
@@ -2367,7 +2703,9 @@ bool IsVideoName(const std::wstring& name) {
 
 // 0:07, 12:34, 1:02:03 (Explorer's style; no leading zero on the first field).
 std::wstring FormatPlayingTime(uint32_t duration_ms) {
-    const uint32_t total = (duration_ms + 500) / 1000;
+    // Saturated IPC duration is only a lower bound; keep the video glyph alone.
+    if (duration_ms == UINT32_MAX) return {};
+    const uint32_t total = duration_ms / 1000 + (duration_ms % 1000 >= 500 ? 1u : 0u);
     const uint32_t hours = total / 3600, minutes = total / 60 % 60, seconds = total % 60;
     wchar_t text[32]{};
     if (hours) swprintf_s(text, L"%u:%02u:%02u", hours, minutes, seconds);
@@ -2540,9 +2878,63 @@ void MainRenderer::DrawCloudBadge(const ListEntryView& entry, const D2D1_RECT_F&
     DrawIconText(left, top, d, d, look.glyph, L"", WithAlpha(ink, opacity), 0.62f);
 }
 
+D2D1_COLOR_F MainRenderer::ExtensionToneInk(uint32_t tone, const Theme& theme, D2D1_COLOR_F normal) const {
+    if (IsHighContrast()) return tone == 0 || tone == 1 ? normal : theme.text;
+    switch (tone) {   // PULSE_COLUMN_TONE_*
+    case 1: {         // muted
+        D2D1_COLOR_F c = theme.text_disabled;
+        return c;
+    }
+    case 2: return theme.accent;
+    case 3: return painter_.StatusToneColor(fluent::InfoBarKind::Success);
+    case 4: return painter_.CapacityInk(CapacityLevel::Warning);
+    case 5: return painter_.CapacityInk(CapacityLevel::Critical);
+    default: return normal;
+    }
+}
+
+void MainRenderer::DrawExtensionBadge(const D2D1_RECT_F& artwork, uint32_t icon, uint32_t tone, const Theme& theme,
+                                      float opacity) {
+    auto* dc = compositor_ ? compositor_->Dc() : nullptr;
+    const float art = std::min(artwork.right - artwork.left, artwork.bottom - artwork.top);
+    if (!dc || icon == 0 || art < 12.0f * scale_ || opacity <= 0.0f) return;
+    // The protected badge's size, mirrored to the top-right corner.
+    const float d = std::round(std::clamp(art * 0.42f, 11.0f * scale_, 18.0f * scale_));
+    const float cx = artwork.right - d * 0.25f;
+    const float cy = artwork.top + d * 0.25f;
+    const D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), d * 0.5f, d * 0.5f);
+    D2D1_COLOR_F plate = theme.surface_flyout;
+    plate.a = opacity;
+    MakeBrush(dc, plate, brFillInput_);
+    dc->FillEllipse(circle, brFillInput_.get());
+    MakeBrush(dc, WithAlpha(theme.text, 0.16f * opacity), brFillInput_);
+    dc->DrawEllipse(circle, brFillInput_.get(), std::max(1.0f, scale_));
+    const D2D1_COLOR_F ink = ExtensionToneInk(tone, theme, theme.text);
+    const float g = d * 0.62f;
+    DrawExtensionIcon(dc, icon, D2D1::RectF(cx - g * 0.5f, cy - g * 0.5f, cx + g * 0.5f, cy + g * 0.5f),
+                      WithAlpha(ink, ink.a * opacity), &theme, std::max(1.0f, 1.2f * scale_));
+}
+
+void MainRenderer::DrawPathIcon(const std::wstring& path, DWORD attributes, float x, float y, float size, const Theme& theme) {
+    ListEntryView entry;
+    entry.path = path;
+    const auto slash = path.find_last_of(L"\\/");
+    entry.name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    entry.attrs = attributes;
+    entry.is_dir = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    DrawEntryIcon(entry, x, y, size, theme);
+}
 void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, float size,
-                                 const Theme& theme, float opacity) {
+                                 const Theme& theme, float opacity, float saturation) {
     const auto dest = D2D1::RectF(x, y, x + size, y + size);
+    const auto desat_color = [&](D2D1_COLOR_F c) {
+        if (saturation >= 0.999f || IsHighContrast()) return c;
+        const float lum = 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+        const float a = c.a;
+        D2D1_COLOR_F out = MixColor(D2D1::ColorF(lum, lum, lum, 1.0f), c, saturation);
+        out.a = a;
+        return out;
+    };
     if (entry.record_only && compositor_ && compositor_->Dc()) {
         auto* dc = compositor_->Dc();
         MakeBrush(dc, WithAlpha(theme.text_secondary, 0.65f * opacity), brTextSecondary_);
@@ -2560,8 +2952,8 @@ void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, f
         // phone waits for Allow / Trust.
         const bool locked = (entry.device & fs::kPcDeviceLocked) != 0;
         const bool none = (entry.device & fs::kPcDevicePlaceholder) != 0;  // "no phone connected": faint plug
-        const D2D1_COLOR_F tint = none ? WithAlpha(theme.text_secondary, 0.75f)
-            : locked ? HexColor(theme.bg.r < 0.5f ? 0xE3A846u : 0xB7791Fu) : theme.accent;
+        const D2D1_COLOR_F tint = desat_color(none ? WithAlpha(theme.text_secondary, 0.75f)
+            : locked ? HexColor(theme.bg.r < 0.5f ? 0xE3A846u : 0xB7791Fu) : theme.accent);
         const float pad = size * 0.08f;
         MakeBrush(dc, WithAlpha(tint, 0.13f * opacity), brFillInput_);
         FillRoundedRect(dc, brFillInput_.get(), x + pad, y + pad, size - 2.0f * pad, size - 2.0f * pad, size * 0.22f);
@@ -2575,8 +2967,8 @@ void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, f
         // 局域网设备: PC, NAS or Mac on the
         // same soft plate as phones; NAS in teal so storage stands apart.
         const bool dark = theme.bg.r < 0.5f;
-        const D2D1_COLOR_F tint = entry.net_kind == 2 ? HexColor(dark ? 0x4CC2A4u : 0x1F8A70u)
-            : entry.net_kind == 3 ? WithAlpha(theme.text, 0.82f) : theme.accent;
+        const D2D1_COLOR_F tint = desat_color(entry.net_kind == 2 ? HexColor(dark ? 0x4CC2A4u : 0x1F8A70u)
+            : entry.net_kind == 3 ? WithAlpha(theme.text, 0.82f) : theme.accent);
         const float pad = size * 0.08f;
         MakeBrush(dc, WithAlpha(tint, 0.13f * opacity), brFillInput_);
         FillRoundedRect(dc, brFillInput_.get(), x + pad, y + pad, size - 2.0f * pad, size - 2.0f * pad, size * 0.22f);
@@ -2589,13 +2981,27 @@ void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, f
         auto* dc = compositor_->Dc();
         // 网盘程序入口: the icon the program registered (as Explorer shows it).
         if (ID2D1Bitmap* own = icon_cache_.ExactBitmapFor(entry.path, size)) {
+            if (ID2D1Effect* effect = saturation < 0.999f ? IconDesaturateEffect(saturation, opacity) : nullptr) {
+                const D2D1_SIZE_F bmp_size = own->GetSize();
+                if (bmp_size.width > 0.0f && bmp_size.height > 0.0f) {
+                    D2D1_MATRIX_3X2_F saved{};
+                    dc->GetTransform(&saved);
+                    dc->SetTransform(D2D1::Matrix3x2F::Scale(size / bmp_size.width, size / bmp_size.height) *
+                                     D2D1::Matrix3x2F::Translation(x, y) * saved);
+                    effect->SetInput(0, own);
+                    dc->DrawImage(effect, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+                    effect->SetInput(0, nullptr);
+                    dc->SetTransform(saved);
+                    return;
+                }
+            }
             dc->DrawBitmap(own, &dest, opacity, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
                            nullptr, nullptr);
             return;
         }
         // Not registered (or still resolving): the brand-tinted cloud on a
         // soft plate, plus the "opens another program" mark once there is room.
-        const D2D1_COLOR_F tint = HexColor(entry.launcher_rgb);
+        const D2D1_COLOR_F tint = desat_color(HexColor(entry.launcher_rgb));
         const float pad = size * 0.08f;
         MakeBrush(dc, WithAlpha(tint, 0.13f * opacity), brFillInput_);
         FillRoundedRect(dc, brFillInput_.get(), x + pad, y + pad, size - 2.0f * pad, size - 2.0f * pad, size * 0.22f);
@@ -2609,12 +3015,14 @@ void MainRenderer::DrawEntryIcon(const ListEntryView& entry, float x, float y, f
         }
         return;
     }
-    if (compositor_ && compositor_->Dc() &&
-        icon_cache_.Draw(compositor_->Dc(), dest, entry.path, entry.name, entry.is_dir,
-                         entry.attrs, opacity)) {
-        return;
+    if (compositor_ && compositor_->Dc()) {
+        ID2D1Effect* effect = saturation < 0.999f ? IconDesaturateEffect(saturation, opacity) : nullptr;
+        if (icon_cache_.Draw(compositor_->Dc(), dest, entry.path, entry.name, entry.is_dir,
+                             entry.attrs, opacity, effect)) {
+            return;
+        }
     }
-    if (entry.is_dir) DrawFolderIcon(x, y, size, theme, opacity);
+    if (entry.is_dir) DrawFolderIcon(x, y, size, theme, opacity, saturation);
     else DrawFileIcon(x, y, size, theme, opacity);
 }
 
@@ -2734,7 +3142,7 @@ void MainRenderer::DrawMorphFrom(const PaneViewModel& vm, const motion::ViewMorp
                       mode == ViewMode::MediumIcons;
     // Same inputs as the previous frame's DrawList: identical rects.
     const ViewLayout layout(mode, from.viewport, from.count, from.scroll_x, from.scroll_y,
-                            scale_, ViewLayoutParams(from.row_height_dip, from.icon_dip));
+                            scale_, ViewLayoutParams(from.row_height_dip, from.icon_dip, IconNameLineDip()));
     const auto [first, last] = layout.VisibleRange();
     static const std::vector<NameMatchRange> kNoMatches;
     // Details: the metadata columns fade out too, instead of vanishing.
@@ -2832,6 +3240,16 @@ void MainRenderer::DrawMorphFrom(const PaneViewModel& vm, const motion::ViewMorp
                 }
                 default: {
                     const ColumnKind media_kind = columns.kinds[static_cast<size_t>(col)];
+                    if (IsExtensionColumn(media_kind) && vm.extension_cell) {
+                        const size_t ext = ExtensionColumnIndex(media_kind);
+                        std::wstring ext_text;
+                        uint32_t ext_tone = 0;
+                        if (vm.extension_cell(src, ext, ext_text, ext_tone) && !ext_text.empty())
+                            draw(ext_text, left, avail,
+                                 ext < vm.extension_columns.size() && vm.extension_columns[ext].align_end
+                                     ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
+                        break;
+                    }
                     if (!IsMediaColumn(media_kind) || !vm.media_cell) break;
                     const std::wstring media_text = vm.media_cell(src, MediaSortColumn(media_kind));
                     draw(media_text.empty() ? std::wstring(L"\u2014") : media_text, left, avail,
@@ -2968,10 +3386,11 @@ void MainRenderer::DrawSplitterKnob(int index, const SplitterView& sp, bool hove
         dc->FillRectangle(line, brAccent_.get());
     }
     if (show <= 0.01f) return;
-    // Knob: 6 x 36 DIP along the divider, out of the swap button's way.
+    // Hover pill: 3 x 28 DIP in --t3 (matching .splitter:hover i), morphing to
+    // an accent handle + split ratio badge while actively dragged.
     float kx = cx, ky = cy;
-    const float alongLen = 36.0f * scale_ * (0.6f + 0.4f * show) * (1.0f + 0.25f * grab);
-    const float acrossLen = 6.0f * scale_ * (0.4f + 0.6f * show);
+    const float alongLen = (28.0f + 14.0f * grab) * scale_ * (0.75f + 0.25f * show);
+    const float acrossLen = (3.0f + 2.0f * grab) * scale_;
     if (sp.swap_rect.right > sp.swap_rect.left) {
         const bool overlaps = sp.vertical
             ? (ky + alongLen * 0.5f > sp.swap_rect.top && ky - alongLen * 0.5f < sp.swap_rect.bottom)
@@ -2984,8 +3403,17 @@ void MainRenderer::DrawSplitterKnob(int index, const SplitterView& sp, bool hove
     const D2D1_RECT_F knob = sp.vertical
         ? D2D1::RectF(kx - acrossLen * 0.5f, ky - alongLen * 0.5f, kx + acrossLen * 0.5f, ky + alongLen * 0.5f)
         : D2D1::RectF(kx - alongLen * 0.5f, ky - acrossLen * 0.5f, kx + alongLen * 0.5f, ky + acrossLen * 0.5f);
-    MakeBrush(dc, WithAlpha(theme.accent, (std::min)(1.0f, show)), brAccent_);
-    const float kr = 4.0f * scale_;
+    const D2D1_COLOR_F accent_ink = dark ? MixColor(theme.accent, HexColor(0xFFFFFF), 0.28f) : theme.accent;
+    const D2D1_COLOR_F hover_col = theme.text_disabled;
+    const float show_clamped = (std::min)(1.0f, show);
+    const D2D1_COLOR_F knob_col{
+        hover_col.r + (accent_ink.r - hover_col.r) * grab,
+        hover_col.g + (accent_ink.g - hover_col.g) * grab,
+        hover_col.b + (accent_ink.b - hover_col.b) * grab,
+        (hover_col.a + (accent_ink.a - hover_col.a) * grab) * show_clamped,
+    };
+    MakeBrush(dc, knob_col, brAccent_);
+    const float kr = acrossLen * 0.5f;
     dc->FillRoundedRectangle(D2D1::RoundedRect(knob, kr, kr), brAccent_.get());
     // Drag badge: "58% · 42%" next to the knob; accent while snapped.
     if (grab <= 0.05f) return;
@@ -3007,12 +3435,34 @@ void MainRenderer::DrawSplitterKnob(int index, const SplitterView& sp, bool hove
 }
 
 void MainRenderer::DrawPane(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme) {
+    const bool target_want = !embedded_ && vm.pane_slots.size() > 1 && vm.layout_controls.zoom_index < 0 &&
+                             (vm.toolbar_hovered || IsToolbarCommandRegion(vm.hover_region));
+    const float target_goal = target_want ? 1.0f : 0.0f;
+    if (!split_target_primed_ || !motion::SystemAnimationsEnabled() || IsHighContrast()) {
+        split_target_t_ = target_goal;
+        split_target_primed_ = true;
+        split_target_last_ms_ = motion_now_;
+    } else {
+        const float dt = static_cast<float>(std::min<uint64_t>(
+            64, motion_now_ > split_target_last_ms_ ? motion_now_ - split_target_last_ms_ : 16));
+        split_target_last_ms_ = motion_now_;
+        const float step = dt / 180.0f;
+        if (split_target_t_ < target_goal) split_target_t_ = (std::min)(target_goal, split_target_t_ + step);
+        else if (split_target_t_ > target_goal) split_target_t_ = (std::max)(target_goal, split_target_t_ - step);
+        if (std::abs(split_target_t_ - target_goal) > 0.004f) RequestMotionFrame();
+        else split_target_t_ = target_goal;
+    }
+
     if (!vm.pane_slots.empty()) {
-        for (int i = 0; i < static_cast<int>(vm.pane_slots.size()); ++i) {
-            const auto& slot = vm.pane_slots[static_cast<size_t>(i)];
-            const auto& zoomMotion = pane_zoom_motion_;
-            if (!(zoomMotion.start && zoomMotion.restoring && i != zoomMotion.excluded))
-                DrawSinglePane(vm, slot.pane, slot.rect, i, slot.focused, slot.target, theme);
+        for (int focus_pass = 0; focus_pass < 2; ++focus_pass) {
+            const bool draw_focused = focus_pass == 1;
+            for (int i = 0; i < static_cast<int>(vm.pane_slots.size()); ++i) {
+                const auto& slot = vm.pane_slots[static_cast<size_t>(i)];
+                if (slot.focused != draw_focused) continue;
+                const auto& zoomMotion = pane_zoom_motion_;
+                if (!(zoomMotion.start && zoomMotion.restoring && i != zoomMotion.excluded))
+                    DrawSinglePane(vm, slot.pane, slot.rect, i, slot.focused, slot.target, theme);
+            }
         }
         for (int i = 0; i < static_cast<int>(vm.splitters.size()); ++i) {
             const auto& sp = vm.splitters[static_cast<size_t>(i)];
@@ -3024,20 +3474,22 @@ void MainRenderer::DrawPane(const WindowViewModel& vm, const D2D1_RECT_F& rect, 
             spec.state.hovered = (vm.hover_region == static_cast<int>(HitTestResult::Splitter) &&
                                   vm.hover_control_index == i) || on_swap;
             spec.state.pressed = vm.splitter_pressed && spec.state.hovered;
-            painter_.DrawSplitter(spec);
+            if (IsHighContrast()) painter_.DrawSplitter(spec);
             DrawSplitterKnob(i, sp, spec.state.hovered && !on_swap, spec.state.pressed, vm.dark, theme);
             if (spec.state.hovered && !vm.splitter_pressed && sp.swap_rect.right > sp.swap_rect.left &&
                 compositor_ && compositor_->Dc()) {
                 auto* dc = compositor_->Dc();
+                const D2D1_COLOR_F accent_ink = (!IsHighContrast() && vm.dark)
+                    ? MixColor(theme.accent, HexColor(0xFFFFFF), 0.28f) : theme.accent;
                 const float r = (sp.swap_rect.right - sp.swap_rect.left) * 0.5f;
                 const auto disc = D2D1::Ellipse(D2D1::Point2F(sp.swap_rect.left + r, sp.swap_rect.top + r), r, r);
                 MakeBrush(dc, on_swap ? theme.fill_input_hover : theme.surface_card, brTextSecondary_);
                 dc->FillEllipse(disc, brTextSecondary_.get());
-                MakeBrush(dc, on_swap ? theme.accent : theme.stroke_card, brTextSecondary_);
+                MakeBrush(dc, on_swap ? accent_ink : theme.stroke_card, brTextSecondary_);
                 dc->DrawEllipse(disc, brTextSecondary_.get(), std::max(1.0f, scale_));
                 DrawPaneHeaderIcon(sp.swap_rect, sp.vertical ? PaneHeaderIcon::SwapHorizontal
                                                              : PaneHeaderIcon::SwapVertical,
-                                   on_swap ? theme.accent : theme.text_secondary);
+                                   on_swap ? accent_ink : theme.text_secondary);
             }
         }
         return;
@@ -3231,18 +3683,121 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     const float bottom = bounds.bottom;
     if (w <= 1.0f || bottom - y0 <= 1.0f) return;
 
+    const bool split = !embedded_ && (vm.pane_slots.size() > 1 || vm.layout_controls.pane_names.size() > 1);
+    const bool multi_pane = !embedded_ && vm.pane_slots.size() > 1 && vm.layout_controls.zoom_index < 0;
+    const D2D1_COLOR_F accent_ink = (!IsHighContrast() && vm.dark)
+        ? MixColor(theme.accent, HexColor(0xFFFFFF), 0.28f) : theme.accent;
+    const D2D1_COLOR_F line_color = IsHighContrast() ? theme.stroke_card
+        : D2D1::ColorF(vm.dark ? 1.0f : 0.0f, vm.dark ? 1.0f : 0.0f, vm.dark ? 1.0f : 0.0f, 0.085f);
+    const D2D1_COLOR_F line2_color = IsHighContrast() ? theme.stroke_divider
+        : D2D1::ColorF(vm.dark ? 1.0f : 0.0f, vm.dark ? 1.0f : 0.0f, vm.dark ? 1.0f : 0.0f, vm.dark ? 0.05f : 0.055f);
+    const auto lerp_rgba = [](const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t) noexcept {
+        const float oa = a.a + (b.a - a.a) * t;
+        if (oa <= 1e-5f) return D2D1_COLOR_F{0.0f, 0.0f, 0.0f, 0.0f};
+        const float ar = a.r * a.a, ag = a.g * a.a, ab = a.b * a.a;
+        const float br = b.r * b.a, bg = b.g * b.a, bb = b.b * b.a;
+        return D2D1_COLOR_F{
+            (ar + (br - ar) * t) / oa,
+            (ag + (bg - ag) * t) / oa,
+            (ab + (bb - ab) * t) / oa,
+            oa,
+        };
+    };
+
+    float focus_t = (!multi_pane || focused) ? 1.0f : 0.0f;
+    float hover_t = (vm.hover_pane_index == pane_index) ? 1.0f : 0.0f;
+    if (multi_pane && pane_index >= 0) {
+        auto& pm = split_pane_motion_[static_cast<size_t>(pane_index) % split_pane_motion_.size()];
+        const float focus_goal = focused ? 1.0f : 0.0f;
+        const float hover_goal = (vm.hover_pane_index == pane_index) ? 1.0f : 0.0f;
+        if (!pm.primed || motion_now_ == 0 || !motion::SystemAnimationsEnabled() || IsHighContrast()) {
+            pm.focus_t = focus_goal;
+            pm.hover_t = hover_goal;
+            pm.primed = true;
+            pm.last_ms = motion_now_;
+        } else {
+            const float dt = static_cast<float>(std::min<uint64_t>(
+                64, motion_now_ > pm.last_ms ? motion_now_ - pm.last_ms : 16));
+            pm.last_ms = motion_now_;
+            const float step = dt / 180.0f;
+            auto advance = [&](float& v, float goal) {
+                if (v < goal) v = (std::min)(goal, v + step);
+                else if (v > goal) v = (std::max)(goal, v - step);
+                if (std::abs(v - goal) > 0.004f) {
+                    RequestMotionFrame();
+                } else {
+                    v = goal;
+                }
+            };
+            advance(pm.focus_t, focus_goal);
+            advance(pm.hover_t, hover_goal);
+        }
+        focus_t = pm.focus_t;
+        hover_t = pm.hover_t;
+    }
+
+    const float card_radius = (split ? 10.0f : theme.radius_control) * scale_;
+    if (multi_pane && focus_t > 0.004f && !IsHighContrast()) {
+        // Active card elevation (--shadow) and outer accent halo (3px -> 4px on toolbar hover),
+        // drawn before PushAxisAlignedClip(bounds) so the outer ring and drop shadow are unclipped.
+        const float contact_alpha = (vm.dark ? 0.22f : 0.045f) * focus_t;
+        MakeBrush(dc, D2D1::ColorF(0.0f, 0.0f, 0.0f, contact_alpha), brFillHover_);
+        dc->FillRoundedRectangle(D2D1::RoundedRect(
+            D2D1::RectF(bounds.left - 0.5f * scale_, bounds.top + 1.0f * scale_,
+                        bounds.right + 0.5f * scale_, bounds.bottom + 1.5f * scale_),
+            card_radius + 0.5f * scale_, card_radius + 0.5f * scale_), brFillHover_.get());
+        const float soft_alpha = (vm.dark ? 0.13f : 0.032f) * focus_t;
+        MakeBrush(dc, D2D1::ColorF(0.0f, 0.0f, 0.0f, soft_alpha), brFillHover_);
+        for (int k = 3; k >= 1; --k) {
+            const float dy = (0.4f + static_cast<float>(k) * 1.25f) * scale_;
+            const float pad = static_cast<float>(k) * 0.75f * scale_;
+            dc->FillRoundedRectangle(D2D1::RoundedRect(
+                D2D1::RectF(bounds.left - pad * 0.5f, bounds.top + dy,
+                            bounds.right + pad * 0.5f, bounds.bottom + dy + pad * 0.5f),
+                card_radius + pad * 0.5f, card_radius + pad * 0.5f), brFillHover_.get());
+        }
+        const float halo_w = (3.0f + split_target_t_) * scale_ * focus_t;
+        const float halo_alpha = (0.12f + 0.12f * split_target_t_) * focus_t;
+        const float halo_half = halo_w * 0.5f;
+        MakeBrush(dc, WithAlpha(accent_ink, halo_alpha), brAccent_);
+        dc->DrawRoundedRectangle(D2D1::RoundedRect(
+            D2D1::RectF(bounds.left - halo_half, bounds.top - halo_half,
+                        bounds.right + halo_half, bounds.bottom + halo_half),
+            card_radius + halo_half, card_radius + halo_half), brAccent_.get(), halo_w);
+    }
+
     dc->PushAxisAlignedClip(bounds, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    // Each pane is a card on the shared sheet; the frame below outlines it.
-    // Over DWM material it replaces the title tint and sheet under it, so
-    // its opacity is the interface transparency's whatever the sidebar's.
+    // In split mode the header lives inside each pane's rounded card (card_top = pane_rect.top);
+    // in single-pane mode the title strip stays on the shared sheet above the card.
     const bool pane_cut = pane_alpha_ >= 0.0f;
-    MakeBrush(dc, pane_cut ? pane_color_ : WithAlpha(theme.surface_card, card_alpha_), brFillHover_);
+    const float card_top = split ? pane_rect.top : (std::min)(pane_rect.bottom, pane_rect.top + pane_header_height_);
+    const D2D1_COLOR_F dim_card = MixColor(theme.surface_card, theme.bg, vm.dark ? 0.45f : 0.62f);
+    const D2D1_COLOR_F resolved_card_rgb = (multi_pane && !IsHighContrast())
+        ? MixColor(dim_card, theme.surface_card, focus_t)
+        : theme.surface_card;
+    D2D1_COLOR_F card_paint = pane_cut ? pane_color_ : WithAlpha(resolved_card_rgb, card_alpha_);
+    if (pane_cut && multi_pane && !IsHighContrast()) {
+        const D2D1_COLOR_F dim_cut = MixColor(pane_color_, theme.bg, vm.dark ? 0.40f : 0.55f);
+        card_paint = WithAlpha(MixColor(dim_cut, pane_color_, focus_t), pane_alpha_);
+    }
+    MakeBrush(dc, card_paint, brFillHover_);
     if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-    FillRoundedRect(dc, brFillHover_.get(), pane_rect.left, pane_rect.top,
-                    pane_rect.right - pane_rect.left, pane_rect.bottom - pane_rect.top,
-                    theme.radius_control * scale_);
+    FillRoundedRect(dc, brFillHover_.get(), pane_rect.left, card_top,
+                    pane_rect.right - pane_rect.left, pane_rect.bottom - card_top,
+                    card_radius);
     if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+
+    struct TextBgScope {
+        D2D1_COLOR_F& slot;
+        D2D1_COLOR_F saved;
+        ~TextBgScope() { slot = saved; }
+    } text_bg_scope{text_background_, text_background_};
+    Theme pane_theme = theme;
+    if (multi_pane && !IsHighContrast()) {
+        pane_theme.bg = resolved_card_rgb;
+        text_background_ = resolved_card_rgb;
+    }
 
     float y = y0;
     const std::wstring& title = pane.header_text;
@@ -3252,14 +3807,38 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     const D2D1_RECT_F viewRc = PaneViewButtonRect(bounds, pane.filter_expand);
     const D2D1_RECT_F detailsRc = PaneDetailsRect(bounds, 1.0f, pane.size_control);
     const D2D1_RECT_F wallRc = PaneWallRect(pane, bounds);
+    if (split) {
+        if (focus_t > 0.004f && !IsHighContrast()) {
+            const D2D1_GRADIENT_STOP stops[2] = {
+                {0.0f, WithAlpha(accent_ink, 0.075f * focus_t)},
+                {1.0f, WithAlpha(accent_ink, 0.035f * focus_t)},
+            };
+            ComPtr<ID2D1GradientStopCollection> collection;
+            ComPtr<ID2D1LinearGradientBrush> hdr_grad;
+            if (SUCCEEDED(dc->CreateGradientStopCollection(stops, 2, &collection)) && collection.get() &&
+                SUCCEEDED(dc->CreateLinearGradientBrush(
+                    D2D1::LinearGradientBrushProperties(D2D1::Point2F(0.0f, bounds.top),
+                                                        D2D1::Point2F(0.0f, bounds.top + pane_header_height_)),
+                    collection.get(), &hdr_grad)) && hdr_grad.get()) {
+                dc->PushAxisAlignedClip(D2D1::RectF(bounds.left, bounds.top, bounds.right,
+                                                    bounds.top + pane_header_height_),
+                                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                const auto header_fill = D2D1::RoundedRect(
+                    D2D1::RectF(bounds.left, bounds.top, bounds.left + w,
+                                bounds.top + pane_header_height_ + 2.0f * card_radius), card_radius, card_radius);
+                dc->FillRoundedRectangle(&header_fill, hdr_grad.get());
+                dc->PopAxisAlignedClip();
+            }
+        }
+        MakeBrush(dc, line2_color, brStrokeDivider_);
+        FillRect(dc, brStrokeDivider_.get(), bounds.left, bounds.top + pane_header_height_ - 1.0f, w, 1.0f);
+    }
     if (pane.header_drop) {
-        MakeBrush(dc, WithAlpha(theme.accent, 0.18f), brFillHover_);
+        MakeBrush(dc, WithAlpha(accent_ink, 0.18f), brFillHover_);
         FillRoundedRect(dc, brFillHover_.get(), bounds.left + scale_, bounds.top + scale_,
             std::max(0.0f, w - 2.0f * scale_), pane_header_height_ - 2.0f * scale_,
-            theme.radius_control * scale_);
+            (split ? 9.0f : theme.radius_control) * scale_);
     }
-    // Keep the title stationary while the focused pane's controls crossfade.
-    const bool split = vm.layout_controls.pane_names.size() > 1;
     const D2D1_RECT_F sizeButtonRc = PaneSizeButtonRect(pane, bounds);
     const D2D1_RECT_F sizeSliderRc = PaneSizeSliderRect(pane, bounds);
     // A narrow pane's opened size slider takes the title's place.
@@ -3269,37 +3848,73 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     const bool zoomed = vm.layout_controls.zoom_index >= 0;
     const auto zoomChip = PaneZoomChipRect(pane,bounds);
     const float textRight = std::max(textLeft, zoomed ? zoomChip.left-8*scale_ : PaneHeaderTitleRight(pane, bounds));
-    const auto titleBadge = ChangeTitleRect(bounds, textRight, pane_header_height_, pane.title_change_badge, scale_, compositor_, pane.header_text);
-    const float textWidth = (titleBadge.right > titleBadge.left ? titleBadge.left - 4 * scale_ : textRight) - textLeft;
-    MakeBrush(dc, split && !focused ? theme.text_secondary : theme.text, brText_);
-    if (!sizePopup) {
-        DrawTextEndEllipsis(compositor_, compositor_->HeaderFormat(), brText_.get(), title,
-            textLeft, y, textWidth, pane_header_height_);
-        DrawChangeBadge(compositor_, painter_, pane.title_change_badge, titleBadge, theme, scale_);
+    if (split) {
+        if (!sizePopup) {
+            const SplitPaneHeaderLayout hdr = LayoutSplitPaneHeader(
+                pane, bounds, textRight, pane_header_height_, focused || !multi_pane, scale_, compositor_);
+            DrawSplitHeaderFolderIcon(hdr.icon, focus_t, pane_theme);
+            if (!hdr.prefix.empty()) {
+                IDWriteTextFormat* pre_fmt = compositor_->FileNameFormat()
+                    ? compositor_->FileNameFormat() : compositor_->SmallFormat();
+                MakeBrush(dc, theme.text_disabled, brTextSecondary_);
+                DrawTextEndEllipsis(compositor_, pre_fmt, brTextSecondary_.get(), hdr.prefix,
+                                    hdr.prefix_rect.left, hdr.prefix_rect.top,
+                                    hdr.prefix_rect.right - hdr.prefix_rect.left, pane_header_height_);
+            }
+            const bool strong_title = focused || !multi_pane;
+            IDWriteTextFormat* title_fmt = strong_title
+                ? (compositor_->TabActiveFormat() ? compositor_->TabActiveFormat() : compositor_->HeaderFormat())
+                : (compositor_->TabFormat() ? compositor_->TabFormat() : compositor_->TextFormat());
+            MakeBrush(dc, lerp_rgba(theme.text_secondary, theme.text, focus_t), brText_);
+            DrawTextEndEllipsis(compositor_, title_fmt, brText_.get(), title,
+                                hdr.title_rect.left, hdr.title_rect.top,
+                                hdr.title_rect.right - hdr.title_rect.left, pane_header_height_);
+            DrawSplitChangeStamp(compositor_, pane.title_change_badge, hdr.stamp_rect,
+                                 focus_t, pane_theme, accent_ink, scale_);
+        }
+    } else {
+        const auto titleBadge = ChangeTitleRect(bounds, textRight, pane_header_height_, pane.title_change_badge, scale_, compositor_, pane.header_text);
+        const float textWidth = (titleBadge.right > titleBadge.left ? titleBadge.left - 4 * scale_ : textRight) - textLeft;
+        MakeBrush(dc, theme.text, brText_);
+        if (!sizePopup) {
+            DrawTextEndEllipsis(compositor_, compositor_->HeaderFormat(), brText_.get(), title,
+                textLeft, y, textWidth, pane_header_height_);
+            DrawChangeBadge(compositor_, painter_, pane.title_change_badge, titleBadge, theme, scale_);
+        }
     }
 
-    const float controlsOpacity = split ? 1.0f : std::clamp(pane.header_controls_opacity, 0.0f, 1.0f);
+    const float controlsOpacity = split
+        ? (multi_pane && !IsHighContrast() ? 0.45f + 0.55f * (std::max)(focus_t, hover_t) : 1.0f)
+        : std::clamp(pane.header_controls_opacity, 0.0f, 1.0f);
     if (controlsOpacity > 0.0f) {
-        const bool fading = controlsOpacity < 1.0f;
+        const bool fading = controlsOpacity < 0.996f;
         if (fading) dc->PushLayer(D2D1::LayerParameters(D2D1::RectF(bounds.left, bounds.top,
             bounds.right, bounds.top + pane_header_height_), nullptr,
             D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::Matrix3x2F::Identity(), controlsOpacity), nullptr);
         // plate = false: the active button's plate is drawn separately (the view segment).
         auto headerButton = [&](const D2D1_RECT_F& rc, HitTestResult::Region region,
                                 PaneHeaderIcon icon, bool active, bool enabled = true, bool plate = true) {
-            const bool hovered = focused && enabled && vm.hover_region == static_cast<int>(region) &&
+            const bool hovered = (focused || split) && enabled && vm.hover_region == static_cast<int>(region) &&
                                  vm.hover_control_index == pane_index;
             const D2D1_COLOR_F fill = active
-                ? (plate ? WithAlpha(theme.accent, hovered ? 0.24f : 0.14f) : kTransparent)
+                ? (plate ? WithAlpha(accent_ink, hovered ? 0.24f : 0.14f) : kTransparent)
                 : (hovered ? theme.fill_hover : kTransparent);
             if (fill.a > 0.0f) {
+                const float btn_r = (split && !plate ? 5.0f : theme.radius_control) * scale_;
+                const D2D1_RECT_F fill_rc = (split && !plate)
+                    ? D2D1::RectF(rc.left + 1.0f * scale_, bounds.top + (pane_header_height_ - 24.0f * scale_) * 0.5f,
+                                  rc.right - 1.0f * scale_, bounds.top + (pane_header_height_ + 24.0f * scale_) * 0.5f)
+                    : rc;
                 MakeBrush(dc, fill, brFillHover_);
-                FillRoundedRect(dc, brFillHover_.get(), rc.left, rc.top,
-                                rc.right - rc.left, rc.bottom - rc.top,
-                                theme.radius_control * scale_);
+                FillRoundedRect(dc, brFillHover_.get(), fill_rc.left, fill_rc.top,
+                                fill_rc.right - fill_rc.left, fill_rc.bottom - fill_rc.top, btn_r);
             }
-            DrawPaneHeaderIcon(rc, icon, !enabled ? theme.text_disabled
-                : (active ? theme.accent : theme.text));
+            const D2D1_COLOR_F icon_col = !enabled ? theme.text_disabled
+                : split
+                    ? (active ? lerp_rgba(theme.text, accent_ink, focus_t)
+                              : (hovered ? theme.text : theme.text_secondary))
+                    : (active ? theme.accent : theme.text);
+            DrawPaneHeaderIcon(rc, icon, icon_col);
         };
         // Details, icons and the photo wall share a groove; the selected block
         // springs between them.
@@ -3308,10 +3923,19 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         const bool wallView = hasWall && pane.wall && IsZoomIconMode(pane.view_mode);
         const bool iconView = IsZoomIconMode(pane.view_mode) && !wallView;
         if(bounds.right-bounds.left>=280*scale_) {
-        MakeBrush(dc, WithAlpha(theme.text, 0.05f), brFillHover_);
-        FillRoundedRect(dc, brFillHover_.get(), detailsRc.left - 2.0f * scale_, detailsRc.top,
-                        (hasWall ? wallRc.right : mediumRc.right) - detailsRc.left + 4.0f * scale_,
-                        detailsRc.bottom - detailsRc.top, theme.radius_control * scale_);
+        if (split) {
+            const float seg_h = 28.0f * scale_;
+            const float seg_top = bounds.top + (pane_header_height_ - seg_h) * 0.5f;
+            MakeBrush(dc, theme.fill_hover, brFillHover_);
+            FillRoundedRect(dc, brFillHover_.get(), detailsRc.left - 2.0f * scale_, seg_top,
+                            (hasWall ? wallRc.right : mediumRc.right) - detailsRc.left + 4.0f * scale_,
+                            seg_h, 7.0f * scale_);
+        } else {
+            MakeBrush(dc, WithAlpha(theme.text, 0.05f), brFillHover_);
+            FillRoundedRect(dc, brFillHover_.get(), detailsRc.left - 2.0f * scale_, detailsRc.top,
+                            (hasWall ? wallRc.right : mediumRc.right) - detailsRc.left + 4.0f * scale_,
+                            detailsRc.bottom - detailsRc.top, theme.radius_control * scale_);
+        }
         HeaderSizeMotion* headerMotion = pane_index >= 0
             ? &header_size_motion_[static_cast<size_t>(pane_index) % header_size_motion_.size()] : nullptr;
         if (detailsView || iconView || wallView) {
@@ -3324,11 +3948,32 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
             const HitTestResult::Region selected = detailsView ? HitTestResult::PaneDetails
                                                  : wallView ? HitTestResult::PaneWall
                                                             : HitTestResult::PaneMediumIcons;
-            const bool hot = focused && vm.hover_region == static_cast<int>(selected) &&
+            const bool hot = (focused || split) && vm.hover_region == static_cast<int>(selected) &&
                              vm.hover_control_index == pane_index;
-            MakeBrush(dc, WithAlpha(theme.accent, hot ? 0.24f : 0.14f), brFillHover_);
-            FillRoundedRect(dc, brFillHover_.get(), block.left, block.top, block.right - block.left,
-                            block.bottom - block.top, theme.radius_control * scale_);
+            if (split) {
+                const float pill_h = 24.0f * scale_;
+                const float pill_top = bounds.top + (pane_header_height_ - pill_h) * 0.5f;
+                const D2D1_RECT_F pill_rc = D2D1::RectF(block.left + 1.0f * scale_, pill_top,
+                                                        block.right - 1.0f * scale_, pill_top + pill_h);
+                const float pill_r = 5.0f * scale_;
+                if (!IsHighContrast()) {
+                    MakeBrush(dc, D2D1::ColorF(0.0f, 0.0f, 0.0f, vm.dark ? 0.22f : 0.06f), brFillHover_);
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(
+                        D2D1::RectF(pill_rc.left, pill_rc.top + 1.0f * scale_, pill_rc.right, pill_rc.bottom + 1.0f * scale_),
+                        pill_r, pill_r), brFillHover_.get());
+                }
+                MakeBrush(dc, theme.surface_card, brFillHover_);
+                dc->FillRoundedRectangle(D2D1::RoundedRect(pill_rc, pill_r, pill_r), brFillHover_.get());
+                MakeBrush(dc, line_color, brStrokeCard_);
+                dc->DrawRoundedRectangle(D2D1::RoundedRect(
+                    D2D1::RectF(pill_rc.left + 0.5f * scale_, pill_rc.top + 0.5f * scale_,
+                                pill_rc.right - 0.5f * scale_, pill_rc.bottom - 0.5f * scale_),
+                    pill_r - 0.5f * scale_, pill_r - 0.5f * scale_), brStrokeCard_.get(), 1.0f * scale_);
+            } else {
+                MakeBrush(dc, WithAlpha(theme.accent, hot ? 0.24f : 0.14f), brFillHover_);
+                FillRoundedRect(dc, brFillHover_.get(), block.left, block.top, block.right - block.left,
+                                block.bottom - block.top, theme.radius_control * scale_);
+            }
         } else if (headerMotion) {
             headerMotion->segment.Hide();
         }
@@ -3343,23 +3988,53 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         DrawPaneSizeSlider(pane, pane_index, sizeSliderRc,
             sizePopup || !sizeButton ? (sizeSliderRc.right > sizeSliderRc.left ? sizeSliderRc : detailsRc)
                                      : sizeButtonRc,
-            focused && vm.hover_region == static_cast<int>(HitTestResult::PaneSizeSlider) &&
+            (focused || split) && vm.hover_region == static_cast<int>(HitTestResult::PaneSizeSlider) &&
                 vm.hover_control_index == pane_index,
-            theme);
+            pane_theme);
+        if (pane_expand_visible_) {
+            const auto expandRc = PaneExpandRect(bounds);
+            const bool hot = vm.hover_region == static_cast<int>(HitTestResult::PaneExpand) &&
+                vm.hover_control_index == pane_index;
+            if (hot) {
+                MakeBrush(dc, theme.fill_hover, brFillHover_);
+                dc->FillRoundedRectangle(D2D1::RoundedRect(expandRc, (split ? 6.0f : 4.0f) * scale_, (split ? 6.0f : 4.0f) * scale_), brFillHover_.get());
+            }
+            DrawPaneHeaderIcon(expandRc, vm.layout_controls.zoom_index >= 0 ? PaneHeaderIcon::Restore : PaneHeaderIcon::Expand,
+                hot ? (split ? theme.text : theme.accent) : theme.text_secondary);
+        }
+        if (pane_close_visible_) {
+            const auto closeRc = PaneCloseRect(bounds);
+            if (!split) {
+                MakeBrush(dc, WithAlpha(theme.text_secondary, 0.25f), brFillHover_);
+                const float dividerX = closeRc.left - 2.0f * scale_;
+                dc->DrawLine(D2D1::Point2F(dividerX, closeRc.top + 6.0f * scale_),
+                             D2D1::Point2F(dividerX, closeRc.bottom - 6.0f * scale_),
+                             brFillHover_.get(), scale_);
+            }
+            const bool closeHot = vm.hover_region == static_cast<int>(HitTestResult::PaneClose) &&
+                                  vm.hover_control_index == pane_index;
+            if (closeHot) {
+                MakeBrush(dc, theme.fill_hover, brFillHover_);
+                FillRoundedRect(dc, brFillHover_.get(), closeRc.left, closeRc.top,
+                                closeRc.right - closeRc.left, closeRc.bottom - closeRc.top,
+                                theme.radius_control * scale_);
+            }
+            DrawPaneHeaderIcon(closeRc, PaneHeaderIcon::Close, closeHot ? theme.text : theme.text_secondary);
+        }
         if (fading) dc->PopLayer();
     }
     if (zoomed && !sizePopup) {
-        MakeBrush(dc,WithAlpha(theme.accent,.12f),brFillHover_);
+        MakeBrush(dc,WithAlpha(accent_ink,.12f),brFillHover_);
         dc->FillRoundedRectangle(D2D1::RoundedRect(zoomChip,13*scale_,13*scale_),brFillHover_.get());
         auto icon=zoomChip; icon.left+=6*scale_;icon.right=icon.left+18*scale_;
-        DrawPaneHeaderIcon(icon,PaneHeaderIcon::Expand,theme.accent);
+        DrawPaneHeaderIcon(icon,PaneHeaderIcon::Expand,accent_ink);
         auto restore=zoomChip;restore.left=std::max(zoomChip.left,zoomChip.right-72*scale_);restore.top+=2*scale_;restore.bottom-=2*scale_;restore.right-=2*scale_;
         MakeBrush(dc,theme.surface_card,brFillHover_);
         dc->FillRoundedRectangle(D2D1::RoundedRect(restore,11*scale_,11*scale_),brFillHover_.get());
         MakeBrush(dc,theme.text,brText_);
         DrawTextEndEllipsis(compositor_,compositor_->SmallFormat(),brText_.get(),l10n::Get(l10n::StringId::PaneZoomRestore),
             restore.left+8*scale_,restore.top,restore.right-restore.left-16*scale_,restore.bottom-restore.top);
-        MakeBrush(dc,theme.accent,brText_);
+        MakeBrush(dc,accent_ink,brText_);
         DrawTextEndEllipsis(compositor_,compositor_->SmallFormat(),brText_.get(),l10n::Get(l10n::StringId::PaneZoomBadge),
             icon.right+2*scale_,zoomChip.top,56*scale_,zoomChip.bottom-zoomChip.top);
         if(zoomChip.right-zoomChip.left>240*scale_) {
@@ -3370,35 +4045,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                 icon.right+62*scale_,zoomChip.top,restore.left-icon.right-66*scale_,zoomChip.bottom-zoomChip.top);
         }
     }
-    if (pane_expand_visible_) {
-        const auto expandRc = PaneExpandRect(bounds);
-        const bool hot = vm.hover_region == static_cast<int>(HitTestResult::PaneExpand) &&
-            vm.hover_control_index == pane_index;
-        if (hot) {
-            MakeBrush(dc, theme.fill_hover, brFillHover_);
-            dc->FillRoundedRectangle(D2D1::RoundedRect(expandRc,4*scale_,4*scale_),brFillHover_.get());
-        }
-        DrawPaneHeaderIcon(expandRc, vm.layout_controls.zoom_index >= 0 ? PaneHeaderIcon::Restore : PaneHeaderIcon::Expand,
-            hot ? theme.accent : theme.text_secondary);
-    }
-    if (pane_close_visible_) {
-        const auto closeRc = PaneCloseRect(bounds);
-        MakeBrush(dc, WithAlpha(theme.text_secondary, 0.25f), brFillHover_);
-        const float dividerX = closeRc.left - 2.0f * scale_;
-        dc->DrawLine(D2D1::Point2F(dividerX, closeRc.top + 6.0f * scale_),
-                     D2D1::Point2F(dividerX, closeRc.bottom - 6.0f * scale_),
-                     brFillHover_.get(), scale_);
-        const bool closeHot = vm.hover_region == static_cast<int>(HitTestResult::PaneClose) &&
-                              vm.hover_control_index == pane_index;
-        if (closeHot) {
-            MakeBrush(dc, theme.fill_hover, brFillHover_);
-            FillRoundedRect(dc, brFillHover_.get(), closeRc.left, closeRc.top,
-                            closeRc.right - closeRc.left, closeRc.bottom - closeRc.top,
-                            theme.radius_control * scale_);
-        }
-        DrawPaneHeaderIcon(closeRc, PaneHeaderIcon::Close, closeHot ? theme.text : theme.text_secondary);
-    }
-    y += pane_header_height_;
+    y += pane_header_height_ + EmbeddedPickerRecentHeight();
 
     if (const ColumnStripLayout strip = ColumnStripGeometry(pane, pane_rect); strip.active) {
         DrawColumnStrip(vm, pane, pane_rect, pane_index, theme);
@@ -3488,8 +4135,8 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         y += bannerH;
     }
     if (pane.is_recent) {
-        D2D1_RECT_F track = RecentFilterRect(bounds, pane_header_height_ + bannerH, scale_, 0);
-        track.right = RecentFilterRect(bounds, pane_header_height_ + bannerH, scale_, 2).right;
+        D2D1_RECT_F track = RecentFilterRect(bounds, pane_header_height_ + EmbeddedPickerRecentHeight() + bannerH, scale_, 0);
+        track.right = RecentFilterRect(bounds, pane_header_height_ + EmbeddedPickerRecentHeight() + bannerH, scale_, 2).right;
         painter_.DrawSegmentedTrack(track);
         static constexpr pulse::l10n::StringId labels[] = {
             pulse::l10n::StringId::FilterAll, pulse::l10n::StringId::FilterFolders,
@@ -3497,7 +4144,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         };
         for (int i = 0; i < 3; ++i) {
             fluent::SegmentedItemSpec segment;
-            segment.bounds = RecentFilterRect(bounds, pane_header_height_ + bannerH, scale_, i);
+            segment.bounds = RecentFilterRect(bounds, pane_header_height_ + EmbeddedPickerRecentHeight() + bannerH, scale_, i);
             segment.shared_track = true;
             segment.text = pulse::l10n::Get(labels[i]);
             segment.position = i == 0 ? fluent::SegmentPosition::First
@@ -3508,7 +4155,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                                     vm.hover_pane_index == pane_index;
             painter_.DrawSegmentedItem(segment);
         }
-        const D2D1_RECT_F clear = RecentClearRect(bounds, pane_header_height_ + bannerH, scale_);
+        const D2D1_RECT_F clear = RecentClearRect(bounds, pane_header_height_ + EmbeddedPickerRecentHeight() + bannerH, scale_);
         fluent::ControlState clear_state;
         clear_state.enabled = pane.recent_total > 0;
         clear_state.hovered = IsHovered(vm, HitTestResult::RecentClear, pane_index);
@@ -3525,7 +4172,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         SearchFilterChipWidthsPx(painter_, scale_, labels, widths);
         for (int i = 0; i < 5; ++i) {
             fluent::ButtonSpec chip;
-            chip.bounds = SearchFilterRect(bounds, pane_header_height_ + bannerH, scale_, i, widths);
+            chip.bounds = SearchFilterRect(bounds, pane_header_height_ + EmbeddedPickerRecentHeight() + bannerH, scale_, i, widths);
             chip.text = labels[i];
             if (i == 4) chip.glyph = kSearchAdvancedGlyph;
             chip.kind = fluent::ButtonKind::Toggle;
@@ -3710,15 +4357,27 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                             w - 24.0f * scale_, column_header_height_);
         y += column_header_height_;
     } else if (ShowsColumnHeader(pane.view_mode)) {
-        // Match the pane's material opacity. Copy over a cut-through pane so
-        // the header does not become opaque by stacking the same tint twice;
-        // otherwise blend over the existing card, never making it clearer.
-        MakeBrush(dc, pane_cut ? pane_color_ : WithAlpha(theme.fill_input, theme.fill_input.a * card_alpha_),
-                  brFillInput_);
-        if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-        FillRect(dc, brFillInput_.get(), x, y, w, column_header_height_);
-        if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
-        FillRect(dc, brStrokeDivider_.get(), x, y + column_header_height_ - 1, w, 1);
+        if (!split) {
+            // Match the pane's material opacity. Copy over a cut-through pane so
+            // the header does not become opaque by stacking the same tint twice;
+            // otherwise blend over the existing card, never making it clearer.
+            // As the card's top row (the strip above is on the sheet) it follows the card's corners.
+            MakeBrush(dc, pane_cut ? pane_color_ : WithAlpha(theme.fill_input, theme.fill_input.a * card_alpha_),
+                      brFillInput_);
+            if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            if (std::abs(y - card_top) < 0.5f && std::abs(x - pane_rect.left) < 0.5f) {
+                dc->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, y + column_header_height_), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                FillRoundedRect(dc, brFillInput_.get(), x, y, w, column_header_height_ + 2.0f * card_radius, card_radius);
+                dc->PopAxisAlignedClip();
+            } else {
+                FillRect(dc, brFillInput_.get(), x, y, w, column_header_height_);
+            }
+            if (pane_cut) dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            FillRect(dc, brStrokeDivider_.get(), x, y + column_header_height_ - 1, w, 1);
+        } else {
+            MakeBrush(dc, line2_color, brStrokeDivider_);
+            FillRect(dc, brStrokeDivider_.get(), x, y + column_header_height_ - 1.0f, w, 1.0f);
+        }
         const DetailsColumnLayout columns = AnimateColumns(DetailsColumns(bounds, pane), pane_index);
         if (pane_index >= 0 && pane_index < static_cast<int>(painted_columns_.size())) {
             uint32_t mask = columns.two_line ? (1u << 8) : 0u;
@@ -3742,15 +4401,22 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
             const bool hot = vm.hover_region == static_cast<int>(HitTestResult::HeaderCheck) &&
                              vm.hover_pane_index == pane_index;
             EnsureRoundCapStroke(dc, roundCapStroke_);
-            MakeBrush(dc, theme.accent, brTagDot_);
-            DrawItemCheckBox(dc, brTagDot_.get(), roundCapStroke_.get(), box, scale_, theme, IsHighContrast(),
+            MakeBrush(dc, accent_ink, brTagDot_);
+            DrawItemCheckBox(dc, brTagDot_.get(), roundCapStroke_.get(), box, scale_, pane_theme, IsHighContrast(),
                              picked == 0 ? 0 : picked >= total ? 1 : 2, hot, 1.0f, 1.0f);
         }
         auto drawCol = [&](const std::wstring& label, SortColumn col, float cw, bool right = false,
                            bool sortable = true) {
             const bool active = sortable && !pane.curated_order && pane.sort_column == col;
-            MakeBrush(dc, active ? theme.accent : theme.text, brText_);
-            IDWriteTextFormat* fmt = compositor_->HeaderFormat();
+            const D2D1_COLOR_F col_ink = split
+                ? (active ? lerp_rgba(theme.text_secondary, theme.text, focus_t)
+                          : lerp_rgba(theme.text_disabled, theme.text_secondary, focus_t))
+                : (active ? theme.accent : theme.text);
+            MakeBrush(dc, col_ink, brText_);
+            IDWriteTextFormat* fmt = split
+                ? (active ? (compositor_->TabActiveFormat() ? compositor_->TabActiveFormat() : compositor_->HeaderFormat())
+                          : (compositor_->TabFormat() ? compositor_->TabFormat() : compositor_->FileNameFormat()))
+                : compositor_->HeaderFormat();
             const float textInset = 8.0f * scale_;
             const float lead = col == SortColumn::Name ? nameLead : 0.0f;
             const float contentLeft = cx + textInset + lead;
@@ -3786,7 +4452,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                              pane.sort_direction == SortDirection::Asc
                                  ? kIconChevronUp : kIconChevronDown,
                              pane.sort_direction == SortDirection::Asc ? L"^" : L"v",
-                             theme.accent, 0.75f);
+                             split ? col_ink : theme.accent, 0.75f);
             }
             fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             cx += cw;
@@ -3841,6 +4507,17 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
             case ColumnKind::Status:
                 drawCol(pulse::l10n::Get(pulse::l10n::StringId::ColumnStatus), SortColumn::Name, cw, false, false);
                 break;
+            case ColumnKind::Extension0: case ColumnKind::Extension1:
+            case ColumnKind::Extension2: case ColumnKind::Extension3: {
+                // Extension columns (pulse.columns): display-only.
+                const size_t ext = ExtensionColumnIndex(columns.kinds[static_cast<size_t>(col)]);
+                if (ext < pane.extension_columns.size())
+                    drawCol(pane.extension_columns[ext].title, SortColumn::Name, cw,
+                            pane.extension_columns[ext].align_end, false);
+                else
+                    cx += cw;
+                break;
+            }
             }
         };
         for (int col = 0; col < columns.count; ++col) {
@@ -3860,7 +4537,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         const int active_divider = divider_active
             ? std::clamp(vm.hover_control_index, 0, std::max(0, columns.count - 2))
             : -1;
-        MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+        MakeBrush(dc, split ? line2_color : theme.stroke_divider, brStrokeDivider_);
         for (int divider = 0; divider < columns.count - 1; ++divider) {
             const float dividerX = columns.DividerX(divider);
             FillRect(dc, brStrokeDivider_.get(),
@@ -3870,6 +4547,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         }
         if (active_divider >= 0) {
             const float dividerX = columns.DividerX(active_divider);
+            MakeBrush(dc, accent_ink, brAccent_);
             FillRect(dc, brAccent_.get(), dividerX - scale_, y + 4.0f * scale_,
                      2.0f * scale_, column_header_height_ - 8.0f * scale_);
         }
@@ -3923,14 +4601,14 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
             const D2D1_RECT_F plate = D2D1::RectF(left, y + 2.0f * scale_, left + cw,
                                                   y + column_header_height_ - 2.0f * scale_);
             painter_.FillRoundedRect(plate, 4.0f * scale_, theme.surface_flyout);
-            painter_.FillRoundedRect(plate, 4.0f * scale_, WithAlpha(theme.accent, 0.10f));
-            painter_.StrokeRoundedRect(plate, 4.0f * scale_, WithAlpha(theme.accent, 0.55f), std::max(1.0f, scale_));
+            painter_.FillRoundedRect(plate, 4.0f * scale_, WithAlpha(accent_ink, 0.10f));
+            painter_.StrokeRoundedRect(plate, 4.0f * scale_, WithAlpha(accent_ink, 0.55f), std::max(1.0f, scale_));
             cx = left;
             drawKind(drag_from);
             if (vm.column_drag_slot >= 0) {
                 // Over the plate: the line marks the slot even when the plate covers it.
                 const float lx = std::round(vm.column_drag_line_x);
-                MakeBrush(dc, theme.accent, brAccent_);
+                MakeBrush(dc, accent_ink, brAccent_);
                 FillRect(dc, brAccent_.get(), lx - scale_, y + 1.0f * scale_, 2.0f * scale_,
                          column_header_height_ - 2.0f * scale_);
             }
@@ -3940,16 +4618,16 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
     float listH = bottom - y;
     dc->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, bottom), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if ((!pane.loading || pane.is_changes) && pane.EntryCount() == 0)
-        DrawPaneEmptyState(vm, pane, D2D1::RectF(x, y, x + w, bottom), pane_index, theme);
+        DrawPaneEmptyState(vm, pane, D2D1::RectF(x, y, x + w, bottom), pane_index, pane_theme);
     else
         group_hover_pane_ = vm.hover_pane_index;
     // Pulse 助手's overlay: DrawList draws the rows' part; the spark, the line
     // under the column header and the title row's pill come after the clip.
-    AiListPainter ai_list(pane.ai_list.get(), compositor_, theme, scale_, motion_now_, pane_index);
+    AiListPainter ai_list(pane.ai_list.get(), compositor_, pane_theme, scale_, motion_now_, pane_index);
     g_ai_list_painter = &ai_list;
     g_ai_list_pane = pane_index;
-    DrawList(pane, x, y, w, listH, theme, vm.hover_region, vm.hover_control_index, focused || !split,
-             pane_index);
+    DrawList(pane, x, y, w, listH, pane_theme, vm.hover_region, vm.hover_control_index, focused || !multi_pane,
+             pane_index, split);
     g_ai_list_painter = nullptr;
     g_ai_list_pane = -1;
     dc->PopAxisAlignedClip();
@@ -3962,7 +4640,7 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         const float top = ShowsColumnHeader(pane.view_mode) ? y - column_header_height_ : pane_rect.top + 5.0f * scale_;
         const auto bar = D2D1::RectF(x + 6.0f * scale_, top, x + w - 6.0f * scale_, top + 30.0f * scale_);
         painter_.FillRoundedRect(bar, 6.0f * scale_, theme.surface_flyout);
-        if (pane.drop_parent) painter_.FillRoundedRect(bar, 6.0f * scale_, WithAlpha(theme.accent, 0.12f));
+        if (pane.drop_parent) painter_.FillRoundedRect(bar, 6.0f * scale_, WithAlpha(accent_ink, 0.12f));
         if (!dashStroke_.get()) {
             ID2D1Factory* factory = nullptr; dc->GetFactory(&factory);
             if (factory) {
@@ -3970,10 +4648,10 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
                 factory->CreateStrokeStyle(props, nullptr, 0, &dashStroke_); factory->Release();
             }
         }
-        MakeBrush(dc, pane.drop_parent ? theme.accent : theme.stroke_card, brFillInput_);
+        MakeBrush(dc, pane.drop_parent ? accent_ink : theme.stroke_card, brFillInput_);
         dc->DrawRoundedRectangle(D2D1::RoundedRect(bar, 6.0f * scale_, 6.0f * scale_),
             brFillInput_.get(), 1.5f * scale_, dashStroke_.get());
-        MakeBrush(dc, theme.accent, brFillInput_);
+        MakeBrush(dc, accent_ink, brFillInput_);
         const float cx = bar.left + 16.0f * scale_, cy = (bar.top + bar.bottom) * 0.5f;
         dc->DrawLine(D2D1::Point2F(cx, cy + 5 * scale_), D2D1::Point2F(cx, cy - 5 * scale_), brFillInput_.get(), 1.6f * scale_);
         dc->DrawLine(D2D1::Point2F(cx - 4 * scale_, cy - scale_), D2D1::Point2F(cx, cy - 5 * scale_), brFillInput_.get(), 1.6f * scale_);
@@ -3986,37 +4664,40 @@ void MainRenderer::DrawSinglePane(const WindowViewModel& vm, const PaneViewModel
         const bool show_hint = bar.right - bar.left > 320.0f * scale_;
         const float hint_width = show_hint ? 116.0f * scale_ : 0.0f;
         painter_.DrawText(text, D2D1::RectF(bar.left + 34 * scale_, bar.top, bar.right - 12 * scale_ - hint_width, bar.bottom),
-            compositor_->SmallFormat(), pane.drop_parent ? theme.accent : theme.text_secondary, fluent::HorizontalAlignment::Left);
+            compositor_->SmallFormat(), pane.drop_parent ? accent_ink : theme.text_secondary, fluent::HorizontalAlignment::Left);
         if (show_hint) painter_.DrawText(pulse::l10n::Get(pulse::l10n::StringId::DragDropPause),
             D2D1::RectF(bar.right - hint_width, bar.top, bar.right - 12 * scale_, bar.bottom),
             compositor_->SmallFormat(), theme.text_secondary, fluent::HorizontalAlignment::Right);
         if (pane.drop_parent && pane.drop_parent_progress >= 0) {
             const float progress = std::clamp(pane.drop_parent_progress, 0.0f, 1.0f);
             painter_.FillRoundedRect(D2D1::RectF(bar.left + 4 * scale_, bar.bottom - 4 * scale_,
-                bar.left + 4 * scale_ + (bar.right - bar.left - 8 * scale_) * progress, bar.bottom - 2 * scale_), scale_, theme.accent);
+                bar.left + 4 * scale_ + (bar.right - bar.left - 8 * scale_) * progress, bar.bottom - 2 * scale_), scale_, accent_ink);
             if (progress < 1.0f) RequestMotionFrame();
         }
     }
-    if (col_badge_.pane == pane_index) DrawColumnBadge(pane_index, theme);
+    if (col_badge_.pane == pane_index) DrawColumnBadge(pane_index, pane_theme);
     if (focused && pane.wall_hint_since)
-        DrawPaneWallHint(pane, pane_rect, vm.hover_region, vm.hover_control_index, theme);
+        DrawPaneWallHint(pane, pane_rect, vm.hover_region, vm.hover_control_index, pane_theme);
 
-    const float radius = theme.radius_control * scale_;
     D2D1_COLOR_F frameColor = CardFrameColor(theme, vm.dark, pane_alpha_ >= 0.0f ? pane_alpha_ : card_alpha_);
-    if (focused) frameColor = IsHighContrast() ? theme.accent : WithAlpha(theme.accent, 0.24f);
-    else if (target) frameColor = WithAlpha(theme.accent, 0.22f);
-    const float strokeW = focused && IsHighContrast() ? 1.5f * scale_ : 1.0f * scale_;
-    D2D1_ROUNDED_RECT frame = D2D1::RoundedRect(
-        D2D1::RectF(pane_rect.left + 0.5f * scale_, pane_rect.top + 0.5f * scale_,
-                    pane_rect.right - 0.5f * scale_, pane_rect.bottom - 0.5f * scale_),
-        radius, radius);
-    if (split && focused && !IsHighContrast()) {
-        const float marker_height = (std::min)(22.0f * scale_, pane_header_height_ - 8.0f * scale_);
-        MakeBrush(dc, theme.accent, brAccent_);
-        FillRoundedRect(dc, brAccent_.get(), pane_rect.left + 1.5f * scale_,
-            pane_rect.top + (pane_header_height_ - marker_height) * 0.5f,
-            2.5f * scale_, marker_height, 1.25f * scale_);
+    if (split) {
+        if (IsHighContrast()) {
+            frameColor = focused ? theme.accent : theme.stroke_card;
+        } else if (target && !focused) {
+            frameColor = WithAlpha(accent_ink, 0.45f);
+        } else {
+            frameColor = lerp_rgba(line_color, WithAlpha(accent_ink, 0.55f), focus_t);
+        }
+    } else {
+        if (focused) frameColor = IsHighContrast() ? theme.accent : WithAlpha(theme.accent, 0.24f);
+        else if (target) frameColor = WithAlpha(theme.accent, 0.22f);
     }
+    const float strokeW = focused && IsHighContrast() ? 1.5f * scale_ : 1.0f * scale_;
+    const float strokeHalf = strokeW * 0.5f;
+    D2D1_ROUNDED_RECT frame = D2D1::RoundedRect(
+        D2D1::RectF(pane_rect.left + strokeHalf, card_top + strokeHalf,
+                    pane_rect.right - strokeHalf, pane_rect.bottom - strokeHalf),
+        std::max(0.0f, card_radius - strokeHalf), std::max(0.0f, card_radius - strokeHalf));
     MakeBrush(dc, frameColor, brAccent_);
     if (target && !focused) {
         if (!dashStroke_.get() && dc) {
@@ -4194,15 +4875,9 @@ struct IconNameText {
     bool truncated = false;
 };
 
-using NameLine = FileNameLine;
-// Same break rules as the wrapped rename field (file_name_breaks.h).
-// Breaks are measured with plain DirectWrite advances, as the rename field
-// measures them, so a name keeps its line breaks when editing starts.
-std::vector<NameLine> WrapIconName(IDWriteFactory2* factory, IDWriteTextFormat* fmt,
-                                   const std::wstring& s, float width, size_t limit) {
-    return WrapFileName([&](const std::wstring& t) { return typography::MeasureAdvance(factory, fmt, t); },
-                        s, width, limit);
-}
+using icon_name::IconNameLayout;
+using icon_name::LayoutIconName;
+using icon_name::WrapIconName;
 
 // The part of a shown icon name that is the file's extension: the tail of
 // `shown` when it ends with it (a cut name keeps its extension too).
@@ -4212,65 +4887,6 @@ DWRITE_TEXT_RANGE ShownExtension(const std::wstring& name, const std::wstring& s
     const size_t n = name.size() - dot;
     if (shown.size() < n || shown.compare(shown.size() - n, n, name, dot, n) != 0) return {0, 0};
     return {static_cast<UINT32>(shown.size() - n), static_cast<UINT32>(n)};
-}
-
-struct IconNameLayout {
-    std::wstring shown;
-    struct Piece { size_t shown, source, length; };
-    std::vector<Piece> pieces;   // runs of `shown` copied from the name
-    bool truncated = false;
-};
-
-IconNameLayout LayoutIconName(Compositor* compositor, IDWriteFactory2* factory, IDWriteTextFormat* fmt,
-                              const std::wstring& name, float width, int max_lines) {
-    IconNameLayout out;
-    const auto measure = [&](const std::wstring& s) {
-        return MeasureLayoutText(compositor, factory, fmt, s);
-    };
-    const float budget = std::max(1.0f, width - 1.0f);
-    const size_t limit = static_cast<size_t>(std::max(1, max_lines));
-    const auto lines = WrapIconName(factory, fmt, name, budget, limit);
-    const auto add = [&](size_t source, size_t length) {
-        out.pieces.push_back({out.shown.size(), source, length});
-        out.shown.append(name, source, length);
-    };
-    const auto trimmed = [&](const NameLine& line) {
-        size_t n = line.length;
-        while (n > 0 && name[line.start + n - 1] == L' ') --n;
-        return n;
-    };
-    const size_t kept = std::min(lines.size(), lines.size() <= limit ? limit : limit - 1);
-    for (size_t i = 0; i < kept; ++i) {
-        if (i) out.shown.push_back(L'\u2028');
-        add(lines[i].start, trimmed(lines[i]));
-    }
-    if (lines.size() <= limit) return out;
-    // Last line: "head…tail", the tail being the extension and up to six
-    // characters before it - where versions, sizes and dates usually are.
-    out.truncated = true;
-    const size_t rest_at = lines[limit - 1].start;
-    const std::wstring rest = name.substr(rest_at);
-    size_t ext = 0;
-    const size_t dot = name.find_last_of(L'.');
-    if (dot != std::wstring::npos && dot > rest_at && name.size() - dot <= 9) ext = name.size() - dot;
-    const std::wstring ellipsis(1, L'\u2026');
-    size_t tail_n = std::min(rest.size() - 1, ext + 6);
-    while (tail_n > ext && measure(ellipsis + rest.substr(rest.size() - tail_n)) > budget * 0.6f) --tail_n;
-    while (tail_n > 0 && measure(ellipsis + rest.substr(rest.size() - tail_n)) > budget) --tail_n;
-    if (tail_n > 0 && IS_LOW_SURROGATE(rest[rest.size() - tail_n])) --tail_n;
-    const std::wstring tail = rest.substr(rest.size() - tail_n);
-    size_t lo = 0, hi = rest.size() - tail_n;
-    while (lo < hi) {
-        const size_t mid = (lo + hi + 1) / 2;
-        if (measure(rest.substr(0, mid) + ellipsis + tail) <= budget) lo = mid;
-        else hi = mid - 1;
-    }
-    if (lo > 0 && IS_HIGH_SURROGATE(rest[lo - 1])) --lo;
-    if (kept) out.shown.push_back(L'\u2028');
-    add(rest_at, lo);
-    out.shown += ellipsis;
-    add(name.size() - tail_n, tail_n);
-    return out;
 }
 
 // Wraps an icon-grid name to at most `max_lines` lines; a longer name keeps
@@ -4845,7 +5461,9 @@ bool MainRenderer::DrawCenteredIconName(const std::wstring& name, const D2D1_REC
     if (created) {
         layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        // FitIconName already inserts the line breaks. Do not add a hidden
+        // extra line when DirectWrite remeasures a nearly full line.
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         // Already shortened to fit: the format's own trimming would cut again.
         const DWRITE_TRIMMING untrimmed{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
         layout->SetTrimming(&untrimmed, nullptr);
@@ -4889,7 +5507,7 @@ float MainRenderer::DrawExpandedIconName(const std::wstring& name, const D2D1_RE
     auto* dc = compositor_ ? compositor_->Dc() : nullptr;
     if (!dc || !compositor_->DwriteFactory() || name.empty()) return 0.0f;
     constexpr int kExpandedLines = 6;
-    const float line = kIconGridNameLineDip * scale_;
+    const float line = IconNameLineDip() * scale_;
     const float edge = 4.0f * scale_;
     // A folder's size stays under its name, inside the plate.
     const float note_h = note.empty() ? 0.0f : line;
@@ -4930,7 +5548,7 @@ float MainRenderer::DrawExpandedIconName(const std::wstring& name, const D2D1_RE
             static_cast<UINT32>(fit.shown.size()), compositor_->FileNameFormat(),
             std::max(1.0f, text.right - text.left), text.bottom - text.top, &layout)) || !layout.get())
         return 0.0f;
-    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     const DWRITE_TRIMMING untrimmed{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
@@ -5180,7 +5798,6 @@ constexpr uint64_t kFolderSizePendingLimitMs = 10000;
 
 void MainRenderer::DrawListSkeleton(const D2D1_RECT_F& viewport, const Theme& theme,
                                     int pane_index) {
-    list_loading_active_ = true;
     if (pane_index < 0 || pane_index >= static_cast<int>(list_loading_since_.size())) return;
     const ULONGLONG now = GetTickCount64();
     uint64_t& since = list_loading_since_[pane_index];
@@ -5190,7 +5807,13 @@ void MainRenderer::DrawListSkeleton(const D2D1_RECT_F& viewport, const Theme& th
     }
     const uint64_t age = now - since;
     // Fast folders finish before this and never show placeholders.
-    if (age < 150 || IsHighContrast()) return;
+    if (age < 150) {
+        WakePaneAt(notify_hwnd_, pane_index, 1, since + 150, now);
+        return;
+    }
+    WakePaneAt(notify_hwnd_, pane_index, 1, 0, now);
+    if (IsHighContrast()) return;
+    list_loading_active_ = list_loading_active_ || list_loading_animate_;
     ID2D1DeviceContext* dc = compositor_->Dc();
     const float appear = list_loading_animate_
         ? std::min(1.0f, static_cast<float>(age - 150) / 200.0f) : 1.0f;
@@ -5248,49 +5871,30 @@ void MainRenderer::DrawListSkeleton(const D2D1_RECT_F& viewport, const Theme& th
 }
 
 float MainRenderer::CapacityReveal(const PaneViewModel& vm, int pane_index) {
-    // This PC tiles and its details view (and the overview card above it):
-    // the capacity bars grow from empty once per visit, after the listing
-    // lands. Safe to ask more than once a frame: the answer is the same.
-    NavEnter* nav = pane_index >= 0 && pane_index < static_cast<int>(nav_enter_.size())
-        ? &nav_enter_[static_cast<size_t>(pane_index)] : nullptr;
-    if (!nav) return 1.0f;
-    const bool grows = vm.view_mode == ViewMode::Tiles || vm.this_pc_columns;
-    if (nav->capacity_path != vm.path) {
-        nav->capacity_path = vm.path;
-        nav->capacity_pending = grows && motion::SystemAnimationsEnabled() && !IsHighContrast();
-        nav->capacity_start = 0;
-    }
-    if (nav->capacity_pending && !vm.loading) {
-        nav->capacity_pending = false;
-        // Drives list first; a folder of files has none to grow.
-        const size_t probe = std::min<size_t>(vm.EntryCount(), 64);
-        for (size_t k = 0; k < probe; ++k) {
-            const ListEntryView& probe_entry = MakeVisibleEntry(vm, k);
-            if (probe_entry.drive_used >= 0.0f && !probe_entry.device) {
-                nav->capacity_start = motion_now_;
-                break;
-            }
-        }
-    }
-    if (nav->capacity_pending) {
-        RequestMotionFrame();
-        return 0.0f;
-    }
-    if (nav->capacity_start) {
-        const float t = static_cast<float>(motion_now_ - nav->capacity_start) / kCapacityRevealMs;
-        if (t >= 1.0f || !grows) {
-            nav->capacity_start = 0;
-        } else {
-            RequestMotionFrame();
-            return motion::EaseOutCubic(t);
-        }
-    }
+    // Capacity is data, not progress: present its real proportion immediately.
+    (void)vm;
+    (void)pane_index;
     return 1.0f;
+}
+
+// 滚动到最后一项之后: a list that does not fit scrolls on past its last item,
+// half its height at most (two rows at least), with the last row still in
+// sight so the pane never looks empty. List view flows sideways: none.
+static float ScrollPastEndRoom(bool on, const PaneViewModel& vm, const D2D1_RECT_F& list,
+                        const ViewLayout& layout, float scale) {
+    if (!on || vm.view_mode == ViewMode::List || vm.column_strip.Active() || layout.MaxScrollY() <= 0.0f)
+        return 0.0f;
+    const float view_h = list.bottom - list.top;
+    const auto& m = layout.Metrics();
+    const float row = m.pitch_y > 0.0f ? m.pitch_y : m.cell_height;
+    if (view_h <= 0.0f || row <= 0.0f) return 0.0f;
+    const float room = (std::min)(view_h - row - 10.0f * scale, (std::max)(2.0f * row, 0.5f * view_h));
+    return (std::max)(0.0f, room);
 }
 
 void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, float h,
                             const Theme& theme, int hover_region, int hover_control_index,
-                            bool pane_focused, int pane_index) {
+                            bool pane_focused, int pane_index, bool split_mode) {
     struct ListPerfScope {
         FramePerf& perf;
         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -5310,7 +5914,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         // Directory enumeration is asynchronous. Leave the list quiet for its
         // brief initial frame instead of presenting it like a search request;
         // slow folders get placeholder rows after 150 ms.
-        if (UsesThumbnails(vm.view_mode)) thumbnail_cache_.Warm();
+        if (UsesThumbnails(vm.view_mode)) thumbnail_cache_.WarmPrimary();
         DrawListSkeleton(D2D1::RectF(x, y, x + w, y + h), theme, pane_index);
         return;
     }
@@ -5323,45 +5927,25 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         uint64_t& since = folder_size_pending_since_[static_cast<size_t>(pane_index)];
         if (vm.folder_size_pending.empty()) {
             since = 0;
+            WakePaneAt(notify_hwnd_, pane_index, 2, 0, motion_now_);
         } else {
             if (since == 0) since = motion_now_;
             folder_size_pending_age = motion_now_ - since;
             // Past kFolderSizePendingLimitMs the placeholders give way to the
             // calculate offer instead of shimmering indefinitely.
-            if (folder_size_pending_age <= kFolderSizePendingLimitMs) folder_size_anim_active_ = true;
+            WakePaneAt(notify_hwnd_, pane_index, 2,
+                folder_size_pending_age < 150 ? since + 150 : since + kFolderSizePendingLimitMs + 1,
+                motion_now_);
         }
     }
     const bool folder_size_animate = motion::SystemAnimationsEnabled() && !IsHighContrast();
     const std::wstring folder_size_offer = pulse::l10n::Get(pulse::l10n::StringId::FolderSizeCalculate);
     const std::wstring folder_size_scanning = pulse::l10n::Get(pulse::l10n::StringId::Calculating);
     const size_t entryCount = vm.EntryCount();
-    // Motion v2 "nav": a pane that changed folders lets the new rows enter
-    // from the direction of travel once its listing has arrived.
-    NavEnter* nav = pane_index >= 0 && pane_index < static_cast<int>(nav_enter_.size())
-        ? &nav_enter_[static_cast<size_t>(pane_index)] : nullptr;
-    if (nav) {
-        if (nav->path != vm.path) {
-            const bool animate = !nav->path.empty() && !vm.is_search && motion::SystemAnimationsEnabled() &&
-                                 !IsHighContrast();
-            const auto under = [](const std::wstring& child, const std::wstring& parent) {
-                if (parent.empty() || child.size() <= parent.size()) return false;
-                if (_wcsnicmp(child.c_str(), parent.c_str(), parent.size()) != 0) return false;
-                return parent.back() == L'\\' || child[parent.size()] == L'\\';
-            };
-            nav->dir = under(vm.path, nav->path) ? 1 : under(nav->path, vm.path) ? -1 : 0;
-            nav->pending = animate;
-            nav->start = 0;
-            nav->path = vm.path;
-        }
-        if (nav->pending && !vm.loading) {
-            nav->pending = false;
-            if (entryCount > 0) nav->start = motion_now_;
-        }
-        if (nav->start && motion_now_ - nav->start > 130u + motion::SpringSettleMs(motion::spring::Smooth))
-            nav->start = 0;
-        if (nav->start || nav->pending) RequestMotionFrame();
-    }
-    // This PC: the capacity bars grow from empty, once per visit.
+    // Navigation presents ready rows immediately; only same-folder layout
+    // changes use the short shared-element transition below.
+    if (pane_index >= 0 && pane_index < static_cast<int>(nav_enter_.size()))
+        nav_enter_[pane_index] = {};
     const float capacity_reveal = CapacityReveal(vm, pane_index);
 
     ItemCheckMotion* checks = item_checks_ && pane_index >= 0 &&
@@ -5383,10 +5967,13 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     const auto [startIdx, endIdx] = layout.VisibleRange();
     const DetailsColumnLayout detailsColumns = AnimateColumns(DetailsColumns(viewport, vm), pane_index);
     const bool detailsView = vm.view_mode == ViewMode::Details;
+    const bool dim_pane = split_mode && !pane_focused && !IsHighContrast();
+    const float icon_sat = dim_pane ? 0.45f : 1.0f;
+    const float icon_fade = dim_pane ? 0.80f : 1.0f;
     D2D1_COLOR_F zebraColor = theme.text;
     zebraColor.a = (theme.bg.r < 0.5f) ? 0.035f : 0.025f;
     FileItemSelectionPainter selection_painter(dc, theme, scale_, pane_focused,
-                                              IsHighContrast(), list_selection_outline_);
+                                              IsHighContrast(), list_selection_outline_, split_mode);
 
     // Rows slide into place after small inserts/removals and new rows flash
     // (ui_motion.h ListShiftMotion). Same folder, view, filter and scroll only.
@@ -5400,6 +5987,32 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     const uint64_t list_context = std::hash<std::wstring>{}(vm.path) ^
         (static_cast<uint64_t>(vm.view_mode) << 56) ^
         (vm.tree ? vm.tree->revision * 0x9e3779b97f4a7c15ULL : 0);
+    bool fast_glide = false;
+    if (pane_index >= 0 && pane_index < static_cast<int>(pane_scroll_velocity_.size()) &&
+        UsesThumbnails(vm.view_mode)) {
+        auto& vel = pane_scroll_velocity_[pane_index];
+        const int visible_span = (std::max)(1, endIdx - startIdx);
+        if (vel.list_context != list_context) {
+            vel = {list_context, startIdx, motion_now_, 0};
+        } else if (startIdx != vel.last_start_idx) {
+            const uint64_t dt_ms = motion_now_ > vel.last_sample_ms ? (motion_now_ - vel.last_sample_ms) : 0;
+            const int delta_items = std::abs(startIdx - vel.last_start_idx);
+            const bool big_jump = delta_items >= visible_span && dt_ms <= 60;
+            const bool high_velocity = dt_ms > 0 && dt_ms <= 60 &&
+                delta_items >= (std::max)(4, visible_span / 5) &&
+                static_cast<uint64_t>(delta_items) * 400ull >= static_cast<uint64_t>(visible_span) * dt_ms;
+            if (entryCount >= 256 && (big_jump || high_velocity)) {
+                vel.glide_until_ms = motion_now_ + 75;
+                RequestMotionFrame();
+            }
+            vel.last_start_idx = startIdx;
+            vel.last_sample_ms = motion_now_;
+        }
+        if (motion_now_ < vel.glide_until_ms) {
+            fast_glide = true;
+            RequestMotionFrame();
+        }
+    }
     const uint64_t arrangement = (std::hash<std::wstring>{}(vm.filter_text) * 31u) ^
         (static_cast<uint64_t>(vm.sort_column) << 40) ^ (static_cast<uint64_t>(vm.sort_direction) << 48);
     motion::ListShiftMotion* shift =
@@ -5407,7 +6020,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             ? &list_shift_[pane_index] : nullptr;
     if (shift) {
         shift->BeginFrame(list_context, vm.scroll_x, vm.scroll_y, entryCount, motion_frame_,
-                          motion_now_, !vm.is_search && !vm.loading && !(nav && nav->start), arrangement,
+                          motion_now_, !vm.is_search && !vm.loading, arrangement,
                           detailsView);
     }
     // View-mode switch: items travel from their previous cell/icon to the new
@@ -5458,13 +6071,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     if (!hover_drawn && pane_index >= 0 && pane_index < static_cast<int>(list_hover_motion_.size()))
         list_hover_motion_[pane_index].Hide();
 
-    // Mid-morph the list draws twice: shapes (backgrounds, icons) first, then
-    // every label inside one faded layer - one layer per pane, not per row.
-    // Spread invisible text preparation across the frames before the fade-in.
-    // Preparing every cold label in the first frame blocks the icon motion.
-    // Once text becomes visible, always draw the complete label pass.
-    const float text_alpha = morphing ? morph->TextOpacity() : 1.0f;
-    const int passes = morphing ? 2 : 1;
+    // Labels remain readable from the first frame of the short transition.
+    const int passes = 1;
     AiListPainter* const ai_painter = g_ai_list_pane == pane_index && g_ai_list_painter && g_ai_list_painter->On() &&
                                       !morphing ? g_ai_list_painter : nullptr;
     if (!ai_painter && !AiGhostEntries().empty() && g_ai_list_pane == pane_index) AiGhostEntries().clear();
@@ -5557,20 +6165,20 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             return;
         }
     };
-    for (int pass = 0; pass < passes; ++pass) {
-        const bool draw_shapes = pass == 0;
-        const bool draw_text = !morphing || pass == 1;
-        const bool text_layer = morphing && pass == 1 && text_alpha < 0.999f;
-        if (text_layer) {
-            // Never exactly 0: Direct2D skips the content of a fully
-            // transparent layer, which would defeat the warm-up above.
-            // Keep the warm-up layer at the minimum nonzero opacity.
-            dc->PushLayer(D2D1::LayerParameters1(viewport, nullptr, D2D1_ANTIALIAS_MODE_ALIASED,
-                              D2D1::IdentityMatrix(), std::max(text_alpha, 1.0f / 255.0f), nullptr,
-                              D2D1_LAYER_OPTIONS1_NONE), nullptr);
+    struct FastGlideGuard {
+        ThumbnailCache& cache;
+        bool active = false;
+        FastGlideGuard(ThumbnailCache& c, bool enable) : cache(c), active(enable) {
+            cache.SetFastScrollGlide(active);
         }
-        const bool warm_text = morphing && pass == 1 && text_alpha <= 0.0f;
-        const auto warm_start = std::chrono::steady_clock::now();
+        ~FastGlideGuard() {
+            if (active) cache.SetFastScrollGlide(false);
+        }
+    } fast_glide_guard(thumbnail_cache_, fast_glide);
+    for (int pass = 0; pass < passes; ++pass) {
+        const bool draw_shapes = true;
+        const bool draw_text = true;
+        const bool text_layer = false;
         int morph_order = 0;
         // Icon grids: names the rename card lies over fade to 38%, so the
         // card reads as floating above them.
@@ -5596,11 +6204,6 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         if (drawn_rows && !frame_partial_) drawn_rows->clear();
         uint32_t prefetch_pixels = 0;  // grid request size, for the next screen
         for (int i = startIdx; i >= 0 && i <= endIdx; ++i) {
-            if (warm_text) {
-                if (i < morph->TextWarmupNext()) { ++morph_order; continue; }
-                if (std::chrono::steady_clock::now() - warm_start >= std::chrono::milliseconds(8)) break;
-                morph->AdvanceTextWarmup(i + 1);
-            }
             D2D1_RECT_F cell = layout.ItemRect(i);
             if (cell.right < x || cell.left > x + w || cell.bottom < y || cell.top > y + h) continue;
             if (cell.bottom - cell.top < 0.5f) continue;   // row inside a collapsed group
@@ -5705,9 +6308,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 thumbRect.right += dx;
                 nameRc.left = std::min(nameRc.right, nameRc.left + dx);
             }
-            // Landing: a row a drag just dropped here stays hidden while the
-            // drag's cards fly onto it, then fades in (its flash runs on).
-            float row_land_hide = 0.0f;
+            // Give the flight its target without hiding the real, ready row.
             if (!vm.landing_names.empty() && vm.landing_names.contains(e.name)) {
                 if (draw_shapes) {
                     D2D1_MATRIX_3X2_F m{};
@@ -5719,10 +6320,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     const D2D1_POINT_2F b = at(cell.right, cell.bottom);
                     landing_rects_.push_back(D2D1::RectF(a.x, a.y, b.x, b.y));
                 }
-                row_land_hide = vm.landing_reveal_at == 0 || motion_now_ < vm.landing_reveal_at ? 1.0f
-                    : 1.0f - (std::min)(1.0f, static_cast<float>(motion_now_ - vm.landing_reveal_at) / 140.0f);
-                if (row_land_hide > 0.0f) RequestMotionFrame();
-                if (row_land_hide >= 1.0f) continue;
+
             }
             if (change && iconGrid) {
                 const float icon_inset = std::min(18 * scale_, (iconRect.bottom - iconRect.top) * 0.3f);
@@ -5746,22 +6344,10 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             const float row_dx = std::round(row_shift.x + morph_sample.cell.left - cell.left -
                                             14.0f * scale_ * row_leave * row_leave + ai_row.dx);
             const float row_dy = std::round(row_shift.y + morph_sample.cell.top - cell.top);
-            // Nav entry: smooth spring, 40 ms + 9 ms per visible row (max 90).
-            float nav_dx = 0.0f, nav_dy = 0.0f, nav_alpha = 1.0f;
-            if (nav && nav->start && !morph_item) {
-                const int order = (std::max)(0, i - startIdx);
-                const float delay = 40.0f + (std::min)(static_cast<float>(order) * 9.0f, 90.0f);
-                const float p = motion::SpringProgress(motion::spring::Smooth,
-                                                       static_cast<float>(motion_now_ - nav->start) - delay);
-                nav_alpha = (std::clamp)(p, 0.0f, 1.0f);
-                if (nav->dir != 0) nav_dx = static_cast<float>(nav->dir) * 16.0f * scale_ * (1.0f - p);
-                else nav_dy = 6.0f * scale_ * (1.0f - p);
-            }
             const float row_appear = shift ? shift->Appear(row_key) : 1.0f;
-            const RowShiftTransform row_transform(dc, row_dx + std::round(nav_dx), row_dy + std::round(nav_dy));
-            const float row_opacity = (1.0f - row_leave) * (1.0f - row_land_hide) * nav_alpha * row_appear *
-                                      ai_row.opacity;
-            if (nav_alpha <= 0.0f || row_appear <= 0.0f) continue;
+            const RowShiftTransform row_transform(dc, row_dx, row_dy);
+            const float row_opacity = (1.0f - row_leave) * row_appear * ai_row.opacity;
+            if (row_appear <= 0.0f) continue;
             struct RowFade {
                 ID2D1DeviceContext* dc;
                 bool on;
@@ -5815,8 +6401,11 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             // A marquee sweeps across many rows: hover feedback (row highlight,
             // link pill) would flicker under the pointer and animate every link.
             bool hover = (src == vm.hover_index) && !vm.marquee_active;
-            bool cut = e.record_only || vm.cut_names.contains(e.name);
-            const float hidden_alpha = HiddenEntryAlpha(e.attrs);
+            // Reuse the existing faded row treatment without changing clipboard semantics.
+            // High contrast keeps informational rows fully legible.
+            const bool muted = !IsHighContrast() && vm.muted_indices.contains(src);
+            bool cut = e.record_only || vm.cut_names.contains(e.name) || muted;
+            const float hidden_alpha = HiddenEntryAlpha(e.attrs) * (muted ? 0.55f : 1.0f);
             // Text follows the row's own time; the mark may take a folder's
             // newest change inside (change tracking), so a folder whose files
             // changed today reads as fresh without bolding its own date.
@@ -5830,11 +6419,17 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 mtimeMark = MtimeBucket(mtimeMarkTime, mtime_clock, &mtime_next_boundary_);
             }
             const bool mtimeMarked = mtimeMark <= mtime_last;
-            const bool mtimeFresh = mtime.bold && mtimeOwn <= 1 && mtimeOwn <= mtime_last;
+            const bool mtimeFresh = !dim_pane && mtime.bold && mtimeOwn <= 1 && mtimeOwn <= mtime_last;
             const bool mtimeOld = mtime_on && mtime.fade && mtimeOwn > mtime_last && !mtimeMarked;
-            const D2D1_COLOR_F mtimeColor = mtimeMarked
+            D2D1_COLOR_F mtimeColor = mtimeMarked
                 ? MtimeColor(mtime.palette, mtimeMark, theme.bg.r < 0.5f, theme.accent, IsHighContrast())
                 : D2D1_COLOR_F{};
+            if (dim_pane && mtimeMarked) {
+                const float lum = 0.2126f * mtimeColor.r + 0.7152f * mtimeColor.g + 0.0722f * mtimeColor.b;
+                const float a = mtimeColor.a * 0.78f;
+                mtimeColor = MixColor(D2D1::ColorF(lum, lum, lum, 1.0f), mtimeColor, 0.45f);
+                mtimeColor.a = a;
+            }
             const bool expand_link = e.is_link && !vm.marquee_active && (hover || selected) &&
                 src != vm.rename_index;
             const float link_expansion = e.is_link && pane_index >= 0 && pane_index < 8
@@ -5951,7 +6546,9 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             row_perf.Next(frame_perf_.row_icons_us, frame_perf_.row_icons_fallbacks);
             bool drewCloudThumbnail = false;  // the cloud badge goes inside a picture
             if (draw_shapes && morph_item) {
-                DrawMorphIcon(e, vm, morph_sample, row_dx, row_dy, iconRect,
+                auto icon_sample = morph_sample;
+                if (muted) icon_sample.opacity *= 0.55f;
+                DrawMorphIcon(e, vm, icon_sample, row_dx, row_dy, iconRect,
                               static_cast<ViewMode>(morph->FromMode()), theme);
             } else if (draw_shapes) {
                 const float snappedIconW = std::max(1.0f, std::round(iconRect.right - iconRect.left));
@@ -5989,7 +6586,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     float aspect = 0.0f;
                     wallDrawn = thumbnail_cache_.DrawWallThumbnail(dc, thumbRect, e.path, e.attrs,
                         ThumbnailRequestPixels(vm.view_mode, std::max(snappedThumbW, snappedThumbH)),
-                        vm.view_generation, e.modified_value, e.size_value, hidden_alpha, &aspect,
+                        vm.view_generation, e.modified_value, e.size_value, hidden_alpha * icon_fade, &aspect,
                         &wall_duration_ms) == PreviewDrawResult::Bitmap;
                     if (aspect > 0.0f && !e.path.empty() &&
                         WallAspects::Instance().Note(WallAspects::ContentHash(e.path, e.modified_value, e.size_value), aspect))
@@ -6021,7 +6618,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     if (iconGrid)
                         artwork = {iconX + renderedIconSize / 12.0f, iconY + renderedIconSize / 6.0f + align_bottom,
                                    iconX + renderedIconSize * 11.0f / 12.0f, iconRect.bottom};
-                    DrawEmptyFolderIcon(iconX, iconY + align_bottom, renderedIconSize, theme, hidden_alpha);
+                    DrawEmptyFolderIcon(iconX, iconY + align_bottom, renderedIconSize, theme, hidden_alpha * icon_fade);
                     artwork_hit_valid = true;
                 }
                 if (wallDrawn) media_duration_ms = wall_duration_ms;
@@ -6029,7 +6626,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 if (UsesThumbnails(vm.view_mode) && !wall_rows && !e.is_dir && !e.record_only) prefetch_pixels = thumb_pixels;
                 const bool drewThumbnail = wallDrawn || (!wallPic && !empty_folder && !e.record_only && UsesThumbnails(vm.view_mode) &&
                     DrawEntryThumbnail(dc, thumbRect, e, vm.view_mode, vm.view_generation, thumb_pixels,
-                        hidden_alpha, iconGrid, &artwork,
+                        hidden_alpha * icon_fade, iconGrid, &artwork,
                         &media_duration_ms)
                         == PreviewDrawResult::Bitmap);
                 drewCloudThumbnail = drewThumbnail;
@@ -6073,13 +6670,27 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     if (settled) {
                         const D2D1_RECT_F dest = D2D1::RectF(iconX + icon_inset, iconY,
                                                              iconX + icon_inset + icon_side, iconY + icon_side);
-                        dc->DrawBitmap(settled, &dest, hidden_alpha, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                                       nullptr, nullptr);
+                        ID2D1Effect* eff = dim_pane ? IconDesaturateEffect(icon_sat, hidden_alpha * icon_fade) : nullptr;
+                        const D2D1_SIZE_F bmp_sz = eff ? settled->GetSize() : D2D1_SIZE_F{};
+                        if (eff && bmp_sz.width > 0.0f && bmp_sz.height > 0.0f) {
+                            D2D1_MATRIX_3X2_F saved_xf{};
+                            dc->GetTransform(&saved_xf);
+                            dc->SetTransform(D2D1::Matrix3x2F::Scale((dest.right - dest.left) / bmp_sz.width,
+                                                                     (dest.bottom - dest.top) / bmp_sz.height) *
+                                             D2D1::Matrix3x2F::Translation(dest.left, dest.top) * saved_xf);
+                            eff->SetInput(0, settled);
+                            dc->DrawImage(eff, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
+                            eff->SetInput(0, nullptr);
+                            dc->SetTransform(saved_xf);
+                        } else {
+                            dc->DrawBitmap(settled, &dest, hidden_alpha * icon_fade,
+                                           D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+                        }
                     } else if (morphing && !own_icon) {
-                        if (e.is_dir) DrawFolderIcon(iconX, iconY, renderedIconSize, theme, hidden_alpha);
-                        else DrawFileIcon(iconX, iconY, renderedIconSize, theme, hidden_alpha);
+                        if (e.is_dir) DrawFolderIcon(iconX, iconY, renderedIconSize, theme, hidden_alpha * icon_fade, icon_sat);
+                        else DrawFileIcon(iconX, iconY, renderedIconSize, theme, hidden_alpha * icon_fade, icon_sat);
                     } else {
-                        DrawEntryIcon(e, iconX, iconY, renderedIconSize, theme, hidden_alpha);
+                        DrawEntryIcon(e, iconX, iconY, renderedIconSize, theme, hidden_alpha * icon_fade, icon_sat);
                     }
                 }
             }
@@ -6106,6 +6717,13 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             }
             if (draw_shapes && !morph_item && !e.record_only && IsProtectedSystemEntry(e.attrs))
                 DrawProtectedBadge(dc, iconGrid ? artwork : iconRect, scale_, theme);
+            // Extension badge (pulse.columns) on the icon's top-right corner.
+            if (draw_shapes && !morph_item && !e.record_only && vm.extension_badge) {
+                uint32_t ext_icon = 0, ext_tone = 0;
+                if (vm.extension_badge(src, ext_icon, ext_tone) && ext_icon != 0)
+                    DrawExtensionBadge(wallPic ? thumbRect : iconGrid ? artwork : iconRect, ext_icon, ext_tone, theme,
+                                       cut ? 0.55f : hidden_alpha);
+            }
             // Cloud folders: where each item's content lives, as in the 状态 column.
             // On pictures the badge takes the top-left corner (DrawCloudBadge).
             bool cloudTopLeft = false;
@@ -6154,7 +6772,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                                      selected ? 1 : 0, hover, check_tick, !hover && !selected ? 0.5f : 1.0f);
                 }
             }
-            // Mid-morph the labels are drawn in a second, faded pass.
+            // Text shares the same opaque pass as the short geometry transition.
             row_perf.Next(frame_perf_.row_text_us, frame_perf_.row_text_fallbacks);
             if (!draw_text) continue;
 
@@ -6176,7 +6794,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             const bool stripChevron = stripRow && e.is_dir;
             const bool showRowActions = vm.view_mode == ViewMode::Details && !stripRow &&
                 src != vm.rename_index &&
-                (hover || (selected && vm.selected_count == 1) || e.starred);
+                (hover || (!dim_pane && selected && vm.selected_count == 1) || e.starred);
             // OneDrive: 1 online only, 2 on this device, 3 always kept, 4 waiting
             // to sync, 5 syncing, 6 sync error, 7 warning, 8 not synced. Details
             // rows end their name column with it; the hover buttons take its place.
@@ -6209,7 +6827,8 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 DrawIconText(nameColRight + 2.0f * scale_, cell.top, 18.0f * scale_, cell.bottom - cell.top,
                              kIconChevronRight, L">", theme.text_secondary, 0.55f);
             }
-            const bool showStar = showRowActions;
+            const bool showStar = showRowActions && !vm.is_recycle && !e.record_only &&
+                !e.path.empty() && !fs::IsVirtualPath(e.path);
             const bool showNewTab = showRowActions && hover && e.is_dir;
             const bool showMore = showRowActions && (hover || (selected && vm.selected_count == 1));
             const bool rowSnippet = !e.snippet.empty() && vm.view_mode == ViewMode::Details;
@@ -6251,9 +6870,13 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             const bool staged_pill = vm.view_mode == ViewMode::Details && !change && e.badge.empty() &&
                 vm.staged && !vm.staged->empty() && vm.staged->contains(StagedPathHash(e.path));
             const std::wstring& staged_text = l10n::Get(l10n::StringId::TrayStagedBadge);
-            // In-app Git: a changed file gets its state pill when the slot is free.
+            // In-app Git: a changed file or changed folder gets its state pill when the slot is free.
             const GitMark gitMark = vm.GitMarkAt(src);
-            const bool git_pill = vm.view_mode == ViewMode::Details && !e.is_dir && gitMark != GitMark::None &&
+            const std::wstring gitBadgeText = gitMark == GitMark::None
+                ? std::wstring()
+                : (e.is_dir ? GitDirBadgeText(gitMark, vm.GitDirCountAt(src), vm.git_plain_terms)
+                            : GitMarkLabel(gitMark, vm.git_plain_terms));
+            const bool git_pill = vm.view_mode == ViewMode::Details && !gitBadgeText.empty() &&
                 !change && e.badge.empty() && !staged_pill;
             // Phone tiles: 手机 / iPhone + 只读 / 未解锁 chips after the name.
             std::wstring device_chip;
@@ -6271,7 +6894,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 : change && !iconGrid ? ChangeBadgeWidth(*change, scale_, compositor_) : vm.view_mode == ViewMode::Details && !e.badge.empty()
                 ? std::min(108.0f * scale_, painter_.MeasureTagWidth(e.badge))
                 : staged_pill ? std::min(108.0f * scale_, painter_.MeasureTagWidth(staged_text))
-                : git_pill ? std::min(108.0f * scale_, painter_.MeasureTagWidth(GitMarkText(gitMark))) : 0.0f;
+                : git_pill ? std::min(120.0f * scale_, painter_.MeasureTagWidth(gitBadgeText)) : 0.0f;
             // 今天修改的名称加粗: measured and drawn at semibold, so tags and pills still follow it.
             IDWriteTextFormat* nameFormat = compositor_->FileNameFormat();
             if (mtimeFresh && !iconGrid && !wallPic && !has_alias && src != vm.rename_index)
@@ -6291,7 +6914,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 // The rename frame is drawn after every row (below): it can be
                 // wider than its own cell.
             } else {
-                D2D1_COLOR_F nameColor = theme.text;
+                D2D1_COLOR_F nameColor = (dim_pane && !selected) ? theme.text_secondary : theme.text;
                 if (list_tag_names_ && tagDotCount > 0 && !IsHighContrast()) {
                     // First tag tints the name, pulled toward the text color so
                     // yellow on light and deep blue on dark stay readable.
@@ -6308,15 +6931,21 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                         have = true;
                     }
                     if (have) {
-                        const float k = theme.bg.r < 0.5f ? 0.22f : 0.30f;
-                        const D2D1_COLOR_F base = theme.text;
+                        const float k = dim_pane ? 0.55f : (theme.bg.r < 0.5f ? 0.22f : 0.30f);
+                        const D2D1_COLOR_F base = (dim_pane && !selected) ? theme.text_secondary : theme.text;
                         nameColor = D2D1::ColorF(tint.r + (base.r - tint.r) * k,
                                                  tint.g + (base.g - tint.g) * k,
-                                                 tint.b + (base.b - tint.b) * k, 1.0f);
+                                                 tint.b + (base.b - tint.b) * k, base.a);
                     }
                 }
-                if (gitMark != GitMark::None && !IsHighContrast())
+                if (gitMark != GitMark::None && !IsHighContrast()) {
                     nameColor = GitMarkColor(gitMark, theme.bg.r < 0.5f);
+                    if (dim_pane) {
+                        const float lum = 0.2126f * nameColor.r + 0.7152f * nameColor.g + 0.0722f * nameColor.b;
+                        nameColor = MixColor(D2D1::ColorF(lum, lum, lum, 1.0f), nameColor, 0.45f);
+                        nameColor.a = selected ? 1.0f : theme.text_secondary.a;
+                    }
+                }
                 if (cut) nameColor = WithAlpha(nameColor, 0.55f);
                 else if (!IsHighContrast()) nameColor = HiddenEntryNameColor(e.attrs, theme, nameColor);
                 if (rename_covers && nameRc.left < rename_card.right && nameRc.right > rename_card.left &&
@@ -6357,7 +6986,9 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                     // A folder showing its size keeps the last line for it.
                     const bool size_line = e.is_dir && vm.folder_size_labels.contains(src);
                     const int name_lines = wall_rows ? 1 : layout.Metrics().name_lines;
-                    DrawCenteredIconName(has_alias ? e.alias : shown_name, nameRc, nameColor, theme, name_matches,
+                    D2D1_RECT_F label = nameRc;
+                    if (size_line && !wall_rows) label.bottom = layout.FolderSizeRect(i).top;
+                    DrawCenteredIconName(has_alias ? e.alias : shown_name, label, nameColor, theme, name_matches,
                                          &name_truncated, size_line ? std::max(1, name_lines - 1) : name_lines,
                                          nullptr, !e.is_dir && !has_alias && !e.hidden_ext);
                     // The single selected item shows its whole name on top of
@@ -6541,7 +7172,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 if (git_pill && trail.badge.right > trail.badge.left) {
                     fluent::TagSpec pill;
                     pill.bounds = trail.badge;
-                    pill.text = GitMarkText(gitMark);
+                    pill.text = gitBadgeText;
                     pill.color = GitMarkColor(gitMark, theme.bg.r < 0.5f);
                     pill.bordered = false;
                     painter_.DrawTag(pill);
@@ -6589,7 +7220,15 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             }
 
             row_perf.Next(frame_perf_.row_columns_us, frame_perf_.row_columns_fallbacks);
-            MakeBrush(dc, cut ? WithAlpha(theme.text_secondary, 0.55f) : theme.text_secondary, brTextSecondary_);
+            const D2D1_COLOR_F meta_ink = dim_pane
+                ? D2D1_COLOR_F{
+                    theme.text_secondary.r + (theme.text_disabled.r - theme.text_secondary.r) * 0.55f,
+                    theme.text_secondary.g + (theme.text_disabled.g - theme.text_secondary.g) * 0.55f,
+                    theme.text_secondary.b + (theme.text_disabled.b - theme.text_secondary.b) * 0.55f,
+                    theme.text_secondary.a + (theme.text_disabled.a - theme.text_secondary.a) * 0.55f,
+                  }
+                : theme.text_secondary;
+            MakeBrush(dc, cut ? WithAlpha(meta_ink, meta_ink.a * 0.55f) : meta_ink, brTextSecondary_);
             if (vm.view_mode == ViewMode::Details) {
                 const auto draw_detail_text = [&](std::wstring_view text, float left, float width,
                                                   DWRITE_TEXT_ALIGNMENT alignment) {
@@ -6686,6 +7325,24 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                             }
                             continue;
                         }
+                    }
+                    if (IsExtensionColumn(detailsColumns.kinds[static_cast<size_t>(col)])) {
+                        // Extension columns: asked off the UI thread, blank until known.
+                        const size_t ext = ExtensionColumnIndex(detailsColumns.kinds[static_cast<size_t>(col)]);
+                        std::wstring ext_text;
+                        uint32_t ext_tone = 0;
+                        if (!vm.extension_cell || ext >= vm.extension_columns.size() ||
+                            !vm.extension_cell(src, ext, ext_text, ext_tone) || ext_text.empty())
+                            continue;
+                        if (ext_tone != 0) {
+                            const D2D1_COLOR_F ink = ExtensionToneInk(ext_tone, theme, secondary);
+                            MakeBrush(dc, cut ? WithAlpha(ink, ink.a * 0.55f) : ink, brTextSecondary_);
+                        }
+                        draw_detail_text(fit(ext_text, avail), left, avail,
+                                         vm.extension_columns[ext].align_end ? DWRITE_TEXT_ALIGNMENT_TRAILING
+                                                                             : DWRITE_TEXT_ALIGNMENT_LEADING);
+                        if (ext_tone != 0) MakeBrush(dc, secondary, brTextSecondary_);
+                        continue;
                     }
                     if (IsMediaColumn(detailsColumns.kinds[static_cast<size_t>(col)])) {
                         // 媒体文件夹专用列: read off the UI thread; a dash until known.
@@ -6933,6 +7590,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                                 MakeBrush(dc, base, brFillInput_);
                                 dc->FillRoundedRectangle(D2D1::RoundedRect(bar, barH * 0.5f, barH * 0.5f), brFillInput_.get());
                                 if (folder_size_animate) {
+                                    folder_size_anim_active_ = true;
                                     // A soft highlight sweeps across the bar every 1.4 s.
                                     const float cx = bar.left - barW + 3.0f * barW *
                                         static_cast<float>(motion_now_ % 1400) / 1400.0f;
@@ -7103,6 +7761,11 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
                 }
             }
 
+            if (detailsView && !stripRow) {
+                row_star_hits_.Remember({vm.view_generation, src, static_cast<int>(vm.view_mode),
+                    e.path, e.name, e.modified_value, e.size_value, cell},
+                    trail.show_star ? trail.star : D2D1_RECT_F{});
+            }
             if (trail.show_star || trail.show_new_tab || trail.show_more) {
                 const bool starHot = hover_region == static_cast<int>(HitTestResult::RowStar) &&
                                      hover_control_index == src;
@@ -7158,7 +7821,7 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             }
         }
         if (text_layer) dc->PopLayer();
-        PrefetchNextScreen(vm, startIdx, endIdx, prefetch_pixels, pane_index);
+        if (!fast_glide) PrefetchNextScreen(vm, startIdx, endIdx, prefetch_pixels, pane_index);
     }
     if (!sticky.pins.empty()) {
         dc->PopAxisAlignedClip();
@@ -7194,12 +7857,14 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             const float dx = std::round(DetailsLeadDip(vm, pin.row) * scale_);
             const float side = std::max(1.0f, std::round(std::min(icon_home.right - icon_home.left,
                                                                   icon_home.bottom - icon_home.top)));
-            DrawEntryIcon(e, std::round(icon_home.left + dx), std::round(icon_home.top + dy), side, theme, 1.0f);
+            DrawEntryIcon(e, std::round(icon_home.left + dx), std::round(icon_home.top + dy), side, theme, icon_fade, icon_sat);
             const D2D1_RECT_F name_home = layout.NameRect(pin.row);
             const float name_x = std::min(name_home.right, name_home.left + dx);
             const float name_right = detailsColumns.DividerX(0) - margin_;
+            Theme pin_theme = theme;
+            if (dim_pane) pin_theme.text = theme.text_secondary;
             DrawTruncatedName(e.name, name_x, name_home.top + dy, std::max(1.0f, name_right - name_x),
-                              std::max(1.0f, name_home.bottom - name_home.top), theme, false, kNoMatches, false);
+                              std::max(1.0f, name_home.bottom - name_home.top), pin_theme, false, kNoMatches, false);
             dc->PopAxisAlignedClip();
         }
         // The stack's lower edge: a hairline, then a soft shadow over the rows.
@@ -7251,6 +7916,12 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
             expanded_overflow_index_ = expanded_name.source;
         }
     }
+    if (morphing) DrawMorphFrom(vm, *morph, viewport, theme);
+    if (shift) shift->EndFrame();
+    DrawGroupHeaders(vm, layout, viewport, theme, hover_region, hover_control_index, pane_index,
+                     pane_focused, split_mode);
+
+    // Rename UI floats above list content, including sticky group headers.
     if (vm.rename_index >= 0 && vm.ViewIndex(vm.rename_index) >= 0) {
         // On top of the neighbouring cells it overlaps in icon and tile views.
         dc->PushAxisAlignedClip(D2D1::RectF(x, y, x + w, y + h), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -7312,9 +7983,6 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
     } else if (pane_index >= 0 && pane_index < static_cast<int>(rename_pop_.size())) {
         rename_pop_[static_cast<size_t>(pane_index)] = {};
     }
-    if (morphing) DrawMorphFrom(vm, *morph, viewport, theme);
-    if (shift) shift->EndFrame();
-    DrawGroupHeaders(vm, layout, viewport, theme, hover_region, hover_control_index, pane_index);
 
     if (vm.marquee_active) {
         D2D1_RECT_F clip = D2D1::RectF(x, y, x + w, y + h);
@@ -7348,9 +8016,22 @@ void MainRenderer::DrawList(const PaneViewModel& vm, float x, float y, float w, 
         }
         dc->PopAxisAlignedClip();
     }
-    DrawScrollbar(vm, x, y, w, h, theme);
-    if (vm.view_mode == ViewMode::List && layout.MaxScrollX() > 0.0f)
-        painter_.DrawScrollbar(PaneHScrollbarSpec(vm, D2D1::RectF(x, y, x + w, y + h), layout.MaxScrollX(), scale_));
+    {
+        fluent::ScrollbarSpec vbar = PaneScrollbarSpec(vm, viewport,
+            layout.ContentHeight() + ScrollPastEndRoom(scroll_past_end_, vm, viewport, layout, scale_), scale_);
+        if (split_mode) vbar.viewport.bottom = (std::max)(vbar.viewport.top, vbar.viewport.bottom - 5.0f * scale_);
+        if (dim_pane) vbar.opacity *= 0.45f + 0.55f * std::clamp(vbar.expand_progress, 0.0f, 1.0f);
+        painter_.DrawScrollbar(vbar);
+    }
+    if (vm.view_mode == ViewMode::List && layout.MaxScrollX() > 0.0f) {
+        fluent::ScrollbarSpec hbar = PaneHScrollbarSpec(vm, viewport, layout.MaxScrollX(), scale_);
+        if (split_mode) {
+            hbar.viewport.left += 5.0f * scale_;
+            hbar.viewport.right = (std::max)(hbar.viewport.left, hbar.viewport.right - 5.0f * scale_);
+        }
+        if (dim_pane) hbar.opacity *= 0.45f + 0.55f * std::clamp(hbar.expand_progress, 0.0f, 1.0f);
+        painter_.DrawScrollbar(hbar);
+    }
 }
 
 // "Group by" headers: chevron, label, count, rule and group bytes. The group
@@ -7402,7 +8083,8 @@ std::wstring MainRenderer::GroupLabel(const PaneViewModel& vm, const ListGroup& 
 
 void MainRenderer::DrawGroupHeaders(const PaneViewModel& vm, const ViewLayout& layout,
                                     const D2D1_RECT_F& viewport, const Theme& theme,
-                                    int hover_region, int hover_control_index, int pane_index) {
+                                    int hover_region, int hover_control_index, int pane_index,
+                                    bool pane_focused, bool split_mode) {
     const ListGroups* groups = vm.Groups();
     if (!groups || !layout.Grouped() || !compositor_) return;
     ID2D1DeviceContext* dc = compositor_->Dc();
@@ -7424,10 +8106,15 @@ void MainRenderer::DrawGroupHeaders(const PaneViewModel& vm, const ViewLayout& l
         const float h = hr.bottom - hr.top;
         const bool hot = header_hot_region && hover_control_index == index;
         if (pinned) {
-            MakeBrush(dc, WithAlpha(theme.bg, 0.78f), brFillHover_);
-            FillRect(dc, brFillHover_.get(), hr.left, hr.top, hr.right - hr.left, h);
-            MakeBrush(dc, theme.header_bg, brFillHover_);
-            FillRect(dc, brFillHover_.get(), hr.left, hr.top, hr.right - hr.left, h);
+            if (split_mode) {
+                MakeBrush(dc, WithAlpha(theme.bg, 0.95f), brFillHover_);
+                FillRect(dc, brFillHover_.get(), hr.left, hr.top, hr.right - hr.left, h);
+            } else {
+                MakeBrush(dc, WithAlpha(theme.bg, 0.78f), brFillHover_);
+                FillRect(dc, brFillHover_.get(), hr.left, hr.top, hr.right - hr.left, h);
+                MakeBrush(dc, theme.header_bg, brFillHover_);
+                FillRect(dc, brFillHover_.get(), hr.left, hr.top, hr.right - hr.left, h);
+            }
             MakeBrush(dc, theme.stroke_divider, brFillHover_);
             FillRect(dc, brFillHover_.get(), hr.left, hr.bottom - 1.0f * scale_, hr.right - hr.left, 1.0f * scale_);
         }
@@ -7438,14 +8125,21 @@ void MainRenderer::DrawGroupHeaders(const PaneViewModel& vm, const ViewLayout& l
         }
         float x = rc.left + 4.0f * scale_;
         DrawIconText(x, hr.top, 16.0f * scale_, h, g.collapsed ? L"\xE76C" : L"\xE70D",
-                     g.collapsed ? L">" : L"v", theme.text_secondary, 0.62f);
+                     g.collapsed ? L">" : L"v",
+                     (!split_mode || pane_focused) ? theme.text_secondary : theme.text_disabled, 0.62f);
         x += 22.0f * scale_;
         const D2D1_RECT_F select_rc = GroupSelectRect(rc, scale_);
-        const bool show_select = hot && GroupSelectVisible(rc, scale_);
+        const bool show_select = hot && vm.group_select && GroupSelectVisible(rc, scale_);
         const float text_right = (show_select ? select_rc.left : rc.right) - 8.0f * scale_;
 
         if (vm.group_by == 5 && !g.label.empty()) {
-            MakeBrush(dc, HexColor(g.color_rgb), brAccent_);
+            D2D1_COLOR_F dot_c = HexColor(g.color_rgb);
+            if (split_mode && !pane_focused && !IsHighContrast()) {
+                const float lum = 0.2126f * dot_c.r + 0.7152f * dot_c.g + 0.0722f * dot_c.b;
+                dot_c = MixColor(D2D1::ColorF(lum, lum, lum, 1.0f), dot_c, 0.45f);
+                dot_c.a = 0.80f;
+            }
+            MakeBrush(dc, dot_c, brAccent_);
             dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x + 4.0f * scale_, hr.top + h * 0.5f),
                 4.0f * scale_, 4.0f * scale_), brAccent_.get());
             x += 14.0f * scale_;
@@ -7468,18 +8162,24 @@ void MainRenderer::DrawGroupHeaders(const PaneViewModel& vm, const ViewLayout& l
             dup_head = true;
         }
         const D2D1_COLOR_F amber = HexColor(theme.bg.r < 0.5f ? 0xF0C27Eu : 0xA0681Bu);
+        IDWriteTextFormat* gh_fmt = (split_mode && !dup_head && compositor_->TabActiveFormat())
+            ? compositor_->TabActiveFormat() : label_fmt;
         const float label_w = std::min(std::max(0.0f, text_right - x),
-                                       MeasureLayoutText(compositor_, factory, label_fmt, label) + 1.0f);
-        MakeBrush(dc, dup_head ? theme.text : theme.accent, brAccent_);
-        DrawTextEndEllipsis(compositor_, label_fmt, brAccent_.get(), label, x, hr.top, label_w, h);
-        x += label_w + (dup_head ? 10.0f : 8.0f) * scale_;
+                                       MeasureLayoutText(compositor_, factory, gh_fmt, label) + 1.0f);
+        const D2D1_COLOR_F gh_ink = dup_head
+            ? ((split_mode && !pane_focused) ? theme.text_secondary : theme.text)
+            : (split_mode ? ((pane_focused || IsHighContrast()) ? theme.text_secondary : theme.text_disabled)
+                          : theme.accent);
+        MakeBrush(dc, gh_ink, brAccent_);
+        DrawTextEndEllipsis(compositor_, gh_fmt, brAccent_.get(), label, x, hr.top, label_w, h);
+        x += label_w + (dup_head ? 10.0f : (split_mode ? 6.0f : 8.0f)) * scale_;
 
         wchar_t count[64]{};
         swprintf_s(count, l10n::Get(g.count == 1 ? l10n::StringId::GroupCountOne
                                                  : l10n::StringId::GroupCount).c_str(), g.count);
         const std::wstring count_text = dup_head ? dup_part[1] : std::wstring(count);
         const float count_w = MeasureLayoutText(compositor_, factory, small_fmt, count_text) + 1.0f;
-        MakeBrush(dc, theme.text_secondary, brTextSecondary_);
+        MakeBrush(dc, (split_mode && !dup_head && !IsHighContrast()) ? theme.text_disabled : theme.text_secondary, brTextSecondary_);
         if (x + count_w <= text_right)
             DrawTextRect(dc, small_fmt, brTextSecondary_.get(), count_text, x, hr.top, count_w, h);
         x += count_w + 10.0f * scale_;
@@ -7580,7 +8280,8 @@ void MainRenderer::DrawScrollbar(const PaneViewModel& vm, float x, float y, floa
     const D2D1_RECT_F list = D2D1::RectF(x, y, x + w, y + h);
     ViewLayout layout(vm.view_mode, list, vm.EntryCount(),
                       vm.scroll_x, vm.scroll_y, scale_, ListRowHeightDip(vm, list), vm.Groups());
-    painter_.DrawScrollbar(PaneScrollbarSpec(vm, list, layout.ContentHeight(), scale_));
+    painter_.DrawScrollbar(PaneScrollbarSpec(vm, list,
+        layout.ContentHeight() + ScrollPastEndRoom(scroll_past_end_, vm, list, layout, scale_), scale_));
 }
 bool MainRenderer::PaneScrollbarGeometry(const PaneViewModel& vm, const D2D1_RECT_F& full_bounds,
                                           D2D1_RECT_F& track, D2D1_RECT_F& thumb, float& max_scroll) const {
@@ -7588,10 +8289,11 @@ bool MainRenderer::PaneScrollbarGeometry(const PaneViewModel& vm, const D2D1_REC
     const float extra = PaneExtraTop(vm, scale_, pane_bounds.right - pane_bounds.left, compositor_);
     const auto list = PaneListRect(pane_bounds, extra, vm.view_mode);
     ViewLayout layout(vm.view_mode, list, vm.EntryCount(), vm.scroll_x, vm.scroll_y, scale_, ListRowHeightDip(vm, list), vm.Groups());
-    max_scroll = layout.MaxScrollY();
+    const float past_end = ScrollPastEndRoom(scroll_past_end_, vm, list, layout, scale_);
+    max_scroll = layout.MaxScrollY() + past_end;
     // The drawn bar's thumb (DrawScrollbar), a little wider to grab.
     const D2D1_RECT_F drawn = fluent::ScrollbarThumbRect(
-        PaneScrollbarSpec(vm, list, layout.ContentHeight(), scale_), scale_);
+        PaneScrollbarSpec(vm, list, layout.ContentHeight() + past_end, scale_), scale_);
     if (drawn.bottom <= drawn.top) return false;
     track = D2D1::RectF(list.right - 14 * scale_, list.top, list.right, list.bottom);
     thumb = D2D1::RectF(track.left, drawn.top, track.right, drawn.bottom);
@@ -7604,6 +8306,15 @@ float MainRenderer::MaxScrollForPane(const PaneViewModel& vm, const D2D1_RECT_F&
     D2D1_RECT_F list = PaneListRect(pane_bounds, extra, vm.view_mode);
     ViewLayout layout(vm.view_mode, list, vm.EntryCount(), vm.scroll_x, vm.scroll_y, scale_, ListRowHeightDip(vm, list), vm.Groups());
     return layout.MaxScrollY();
+}
+
+float MainRenderer::ScrollPastEndForPane(const PaneViewModel& vm, const D2D1_RECT_F& full_bounds) const {
+    if (!scroll_past_end_) return 0.0f;
+    const D2D1_RECT_F pane_bounds = PaneBodyBounds(vm, full_bounds);
+    const float extra = PaneExtraTop(vm, scale_, pane_bounds.right - pane_bounds.left, compositor_);
+    D2D1_RECT_F list = PaneListRect(pane_bounds, extra, vm.view_mode);
+    ViewLayout layout(vm.view_mode, list, vm.EntryCount(), vm.scroll_x, vm.scroll_y, scale_, ListRowHeightDip(vm, list), vm.Groups());
+    return ScrollPastEndRoom(true, vm, list, layout, scale_);
 }
 
 float MainRenderer::MaxScrollXForPane(const PaneViewModel& vm,

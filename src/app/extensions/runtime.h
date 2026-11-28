@@ -2,7 +2,11 @@
 
 #include "manifest.h"
 #include "authorization.h"
+#include "package_signature.h"
 #include <functional>
+#include <string>
+#include <utility>
+#include <vector>
 #include "../../common/json_value.h"
 
 namespace pulse::extensions {
@@ -26,6 +30,9 @@ bool ValidateCaller(const CallerLease& caller);
 // Explicit package ownership. Startup is transactional; UI changes never access disk.
 size_t PackageCount();
 const Manifest* PackageManifest(size_t package);
+// Verified lowercase SHA-256 publisher fingerprint if signed; empty for unsigned local packages.
+std::string PackagePublisherId(size_t package);
+std::wstring PackagePublishTrustKey(size_t package);
 // Immutable startup path, paired with the native digest in PackageManifest.
 std::wstring PackageNativePath(size_t package);
 bool PackageEnabled(size_t package);
@@ -36,6 +43,14 @@ bool PackageStoreMode();
 std::wstring PackageStoreRoot();
 // Host-only UI-thread diagnostic; no policy contents or authorization authority.
 uint64_t StoreTrustCheckSequence();
+// Developer mode (devmode_plan.md), as read once at startup from extensions-dev next to the store.
+bool DeveloperModeAtStartup();
+// Loaded from a developer folder (shadow copy), not from the store registry.
+bool PackageFromDeveloperFolder(size_t package);
+// Startup results for developer folder packages that did not load: {id, error code}.
+std::vector<std::pair<std::string, std::string>> DeveloperFolderLoadErrors();
+// Enabled unsigned store packages left out because developer mode was off at startup.
+std::vector<std::string> SkippedUnsignedPackages();
 // Legacy single-package compatibility refers only to slot zero, never the selected UI panel.
 const Manifest* CurrentManifest();
 bool Enabled();

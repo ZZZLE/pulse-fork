@@ -185,6 +185,19 @@ int wmain(int argc, wchar_t** argv) {
     callbacks.open_folder = [&](const std::wstring& folder) { opened.push_back(folder); };
     ops::OpSpeedGraph saved_history;
     callbacks.speed_history = [&](uint64_t) { return saved_history; };
+    uint64_t action_task = 0;
+    std::string action_id;
+    callbacks.task_action = [&](uint64_t task, const std::string& action) { action_task = task; action_id = action; };
+    // The other-operations strip acts on tasks by id; only its own mode sets
+    // these, the other modes check the card's plain pause/cancel callbacks.
+    const bool task_strip_mode = argc > 3 && wcscmp(argv[3], L"--task-strip-only") == 0;
+    uint64_t selected_task = 0, paused_task = 0, resumed_task = 0, cancelled_task = 0;
+    if (task_strip_mode) {
+        callbacks.select_task = [&](uint64_t task) { selected_task = task; };
+        callbacks.pause_task = [&](uint64_t task) { paused_task = task; };
+        callbacks.resume_task = [&](uint64_t task) { resumed_task = task; };
+        callbacks.cancel_task = [&](uint64_t task) { cancelled_task = task; };
+    }
     ui::FileOperationWindow window;
     Check(window.Create(nullptr, std::move(callbacks)), "create hidden operation window");
     const double mb = 1024.0 * 1024.0;
@@ -254,6 +267,63 @@ int wmain(int argc, wchar_t** argv) {
         return failures ? 1 : 0;
     }
 
+    if (argc > 3 && wcscmp(argv[3], L"--plugin-task-only") == 0) {
+        // A plugin task (pulse.tasks after V1): named steps, footer hint, explained failure, actions.
+        uint64_t task = 3000;
+        for (const bool dark : {false, true}) {
+            window.SetTheme(dark, ui::HexColor(0x527D70));
+            const std::wstring suffix = dark ? L"-dark" : L"-light";
+            Access::Size(window, 144, false);
+            Access::Place(window, -4000, -4000);
+            ops::OpStatus running;
+            running.external = true; running.type = ops::OpType::External; running.active = true; running.can_pause = false;
+            running.phase = ops::OpPhase::Running; running.task_id = task++;
+            running.external_title = running.summary = L"解压 设计稿-v3.rar";
+            running.source_label = L"设计稿-v3.rar"; running.destination_label = L"下载\\设计稿-v3";
+            running.external_steps = {L"解压到临时位置", L"写入目标 · 可撤销"};
+            running.external_step = 1; running.percent = 42.0f;
+            running.total_items = 312; running.completed_items = 126; running.total_bytes = 248ull << 20; running.transferred_bytes = 101ull << 20;
+            running.current_item = L"设计稿-v3\\图层\\banner@2x.psd";
+            running.external_note = L"解压完成前目标文件夹不会改动";
+            running.speed_basis = ops::OpSpeedBasis::Bytes;
+            running.bytes_per_second = running.peak_bytes_per_second = 86.4 * mb;
+            running.eta_seconds = 12;
+            window.Update(running);
+            Access::Place(window, -4000, -4000);
+            Access::Graph(window, 0.42f, 86.4 * mb);
+            Access::Elapsed(window, 6000, false);
+            shot(L"plugin-step1" + suffix);
+            running.external_step = 2; running.percent = 96.0f; running.external_linked = 77; running.completed_items = 300; running.transferred_bytes = 238ull << 20;
+            running.external_note = L"写入后可以撤销";
+            window.Update(running);
+            Access::Place(window, -4000, -4000);
+            shot(L"plugin-step2" + suffix);
+            ops::OpStatus failed = running;
+            failed.active = false; failed.phase = ops::OpPhase::Failed; failed.external_outcome = ops::ExternalOutcome::Failed;
+            failed.external_linked = 0;
+            failed.external_log = L"Data Error : IMG_2041.HEIC\nCRC Failed · 2026-11-11 10:42:07";
+            failed.task_id = task++;
+            failed.last_error = L"压缩包已损坏：CRC 校验失败";
+            failed.external_detail = L"数据和记录的校验值不一致，可能下载不完整或磁盘出错。";
+            failed.external_assurance = L"目标文件夹没有任何改动，临时文件已清理。";
+            failed.external_actions = {{"test", L"测试压缩包", false}, {"retry", L"重试", true}};
+            window.Update(failed);
+            Access::Place(window, -4000, -4000);
+            shot(L"plugin-failed" + suffix);
+            const POINT retry = Access::FindControl(window, 41);
+            Check(retry.x >= 0, "plugin task action button is hit-testable");
+            if (retry.x >= 0) {
+                SendMessageW(Access::Handle(window), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(retry.x, retry.y));
+                SendMessageW(Access::Handle(window), WM_LBUTTONUP, 0, MAKELPARAM(retry.x, retry.y));
+            }
+            Check(action_task == failed.task_id && action_id == "retry", "plugin task action routes its id to the host");
+            action_task = 0; action_id.clear();
+        }
+        window.Destroy();
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
+
     if (argc > 3 && wcscmp(argv[3], L"--copy-pipeline-only") == 0) {
         Check(!output.empty(), "pipeline screenshots require output directory");
         uint64_t pipeline_task = 1000;
@@ -306,6 +376,125 @@ int wmain(int argc, wchar_t** argv) {
                 shot(L"pipeline-verifying-99" + suffix);
             }
         }
+        std::printf("%s\n", failures == 0 ? "ALL PASS" : "FAILURES");
+        window.Destroy();
+        CoUninitialize();
+        return failures == 0 ? 0 : 1;
+    }
+    if (task_strip_mode) {
+        // Several operations at once: the card shows one, the strip above the
+        // footer lists the others with their state, pause and cancel.
+        constexpr int kRow = 60;  // kHitTaskRow + row * 4 + part
+        auto other = [](uint64_t id, ops::OpType type, ops::OpPhase phase, float percent, const wchar_t* name) {
+            ops::OpStatus st;
+            st.task_id = id; st.active = true; st.type = type; st.phase = phase; st.percent = percent;
+            st.source_label = name; st.destination_label = L"D:\\Backup";
+            return st;
+        };
+        auto queued_same = other(24, ops::OpType::Copy, ops::OpPhase::Queued, -1.0f, L"site-packages");
+        queued_same.wait_reason = ops::OpWaitReason::SamePlace;
+        auto queued_full = other(25, ops::OpType::RealDelete, ops::OpPhase::Queued, -1.0f, L"dist");
+        queued_full.wait_reason = ops::OpWaitReason::LanesFull;
+        auto paused_delete = other(22, ops::OpType::RecycleDelete, ops::OpPhase::Paused, 18.0f, L"build-cache");
+        const std::vector<ops::OpStatus> others = {
+            Running(ops::OpType::Copy, 63.0f),  // the shown task (id 11): left out of the strip
+            other(21, ops::OpType::Move, ops::OpPhase::Running, 37.0f, L"node_modules"),
+            paused_delete,
+            queued_same,
+            other(23, ops::OpType::Copy, ops::OpPhase::WaitingForConflict, 52.0f, L"Photos 2025"),
+            queued_full,
+        };
+        struct StripScale { UINT dpi; const wchar_t* tag; };
+        for (const bool dark : {false, true}) {
+            window.SetTheme(dark, ui::HexColor(0x6474C7));
+            window.SetAutoClose(false);
+            const std::wstring theme = dark ? L"dark" : L"light";
+            for (const StripScale scale : { StripScale{96, L"100"}, StripScale{144, L"150"}, StripScale{192, L"200"} }) {
+                const std::wstring sfx = L"-" + theme + L"-" + scale.tag;
+                window.SetOtherTasks({});
+                Access::Size(window, scale.dpi, false);
+                Access::Place(window, -4000, -4000);
+                window.Update(Running(ops::OpType::Copy, 63.0f));
+                Access::Graph(window, 0.63f, 212.0 * mb);
+                Access::Elapsed(window, 61000, false);
+                const int base_height = Access::Height(window);
+                window.SetOtherTasks(others);
+                const int strip = Access::Height(window) - base_height;
+                // 4 rows of 44 + padding 2 * 6 + the "+N" line 20 = 208 DIPs.
+                const int expected = MulDiv(208, static_cast<int>(scale.dpi), 96);
+                Check(std::abs(strip - expected) <= 2, "strip grows the card by its rows");
+                shot(L"strip-4rows-more" + sfx);
+                window.SetOtherTasks({others[1], paused_delete});
+                shot(L"strip-2rows" + sfx);
+                if (scale.dpi == 144) {
+                    window.SetOtherTasks({});
+                    Access::Size(window, scale.dpi, true);
+                    window.SetOtherTasks({others[1], queued_same});
+                    shot(L"strip-detailed" + sfx);
+                    window.SetOtherTasks({});
+                    Access::Size(window, scale.dpi, false);
+                }
+                window.SetOtherTasks({});
+                Check(std::abs(Access::Height(window) - base_height) <= 1, "strip leaves no gap once the others end");
+            }
+        }
+        // Behaviour at 100%: order, which controls exist, and what clicks do.
+        window.SetTheme(false, ui::HexColor(0x6474C7));
+        Access::Size(window, 96, false);
+        window.Update(Running(ops::OpType::Copy, 63.0f));
+        window.SetOtherTasks(others);
+        auto click = [&](POINT at) {
+            const LPARAM where = MAKELPARAM(at.x, at.y);
+            SendMessageW(Access::Handle(window), WM_MOUSEMOVE, 0, where);
+            SendMessageW(Access::Handle(window), WM_LBUTTONDOWN, MK_LBUTTON, where);
+            SendMessageW(Access::Handle(window), WM_LBUTTONUP, 0, where);
+        };
+        // Row 0 needs a choice (no pause), row 1 runs, row 2 is paused, row 3
+        // is the first queued one; the other queued one falls under "+N".
+        Check(Access::FindControl(window, kRow + 0 * 4 + 1).x < 0, "a task waiting for a choice offers no pause");
+        const POINT pause_running = Access::FindControl(window, kRow + 1 * 4 + 1);
+        Check(pause_running.x >= 0, "a running task in the strip has a pause button");
+        click(pause_running);
+        Check(paused_task == 21, "strip pause pauses that task");
+        click(Access::FindControl(window, kRow + 2 * 4 + 1));
+        Check(resumed_task == 22, "strip button resumes a paused task");
+        click(Access::FindControl(window, kRow + 0 * 4 + 2));
+        Check(cancelled_task == 23, "strip cancel cancels that task");
+        click(Access::FindControl(window, kRow + 1 * 4 + 0));
+        Check(selected_task == 21, "clicking a strip row shows that task");
+        Check(Access::FindControl(window, kRow + 3 * 4 + 0).x < 0 && Access::FindControl(window, kRow + 3 * 4 + 2).x >= 0,
+              "the fourth row is the first queued task: cancel, nothing to open");
+        // "+1 more" shows every task; "show less" folds them again.
+        const int folded = Access::Height(window);
+        const POINT more = Access::FindControl(window, 58);
+        Check(more.x >= 0, "the strip offers to show the tasks past its rows");
+        click(more);
+        Check(Access::Height(window) - folded == 44 && Access::FindControl(window, kRow + 4 * 4 + 2).x >= 0,
+              "showing all adds the fifth task's row");
+        shot(L"strip-expanded");
+        click(Access::FindControl(window, 58));
+        Check(Access::Height(window) == folded && Access::FindControl(window, kRow + 4 * 4 + 2).x < 0,
+              "show less folds the list back to four rows");
+        // Queued rows: cancel only, nothing to show in the card yet.
+        window.SetOtherTasks({queued_same});
+        Check(Access::FindControl(window, kRow + 0).x < 0, "a queued row cannot be opened in the card");
+        // A queued task can be held: it does not start until resumed.
+        paused_task = 0;
+        click(Access::FindControl(window, kRow + 1));
+        Check(paused_task == 24, "a queued task can be paused from the strip");
+        auto held = queued_same;
+        held.pause_requested = true;
+        window.SetOtherTasks({held});
+        resumed_task = 0;
+        click(Access::FindControl(window, kRow + 1));
+        Check(resumed_task == 24, "a held queued task is resumed from the same button");
+        shot(L"strip-queued-paused");
+        window.SetOtherTasks({queued_same});
+        cancelled_task = 0;
+        click(Access::FindControl(window, kRow + 2));
+        Check(cancelled_task == 24, "a queued task can be cancelled from the strip");
+        Check(paused == 0 && resumed == 0 && cancelled == 0 && dismissed == 0,
+              "strip buttons leave the shown task alone");
         std::printf("%s\n", failures == 0 ? "ALL PASS" : "FAILURES");
         window.Destroy();
         CoUninitialize();

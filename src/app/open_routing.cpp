@@ -2,11 +2,22 @@
 #include "open_routing.h"
 
 #include "app_internal.h"
+#include "app_commands.h"
+#include "extension_store_ui.h"
+#include "extensions/native/command_contributions.h"
+#include "extensions/native/associations_adapter_host.h"
+#include "extensions/ext_open_intent.h"
+#include "../ops/archive_open_fallback.h"
+#include "../../extensions/7zip/takeover_record.h"
 #include "../common/localization.h"
+#include "../common/path_utils.h"
+#include "../common/reveal_item_entry.h"
+#include "../common/picker_pulse_open.h"
 #include "app_messages.h"
 #include "closed_windows.h"
 #include "default_file_manager.h"
 #include "external_open.h"
+#include "search_tab_handoff.h"
 #include "tray_reveal.h"
 #include "window_factory.h"
 #include "window_merge.h"
@@ -14,6 +25,8 @@
 #include "../common/runtime_log.h"
 
 #include <algorithm>
+#include <map>
+#include <optional>
 #include <vector>
 
 namespace pulse {
@@ -27,6 +40,16 @@ bool IsBusy(const AppState& s) {
     if (s.renameIndex >= 0 || s.addressEditing) return true;
     if (s.hwnd && !IsWindowEnabled(s.hwnd)) return true;
     return GetCapture() != nullptr;
+}
+
+bool ConfirmExternalWindowReveal(const AppState& target) {
+    const auto state = app::InspectWindowRevealState(target.hwnd);
+    if (state.Restored()) return true;
+    diagnostics::runtime::Event("external_reveal_failed", {
+        {"window", reinterpret_cast<uintptr_t>(target.hwnd)}, {"window_valid", state.valid},
+        {"visible_after", state.visible}, {"minimized_after", state.minimized},
+        {"foreground_after", state.foreground}}, diagnostics::runtime::Level::Warning);
+    return false;
 }
 
 int LayoutTabIndex(const AppState& s, const void* tab) {
@@ -65,27 +88,167 @@ void ForgetOpenToast(AppCore& core) {
     core.open_convert_into = nullptr;
 }
 
+// File Explorer opened an archive whose file type 接管压缩包 made Pulse's (extensions/7zip):
+// "pulse:extract:<path>" or "pulse:archive-preview:<path>". The path comes after the prefix.
+struct ArchiveLaunch { std::wstring path; bool extract = true; };
+std::optional<ArchiveLaunch> ParseArchiveLaunch(const std::wstring& raw) {
+    for (const auto& [prefix, extract] : {std::pair<std::wstring_view, bool>{takeover::kExtractLaunch, true},
+                                          {takeover::kPreviewLaunch, false}}) {
+        if (raw.size() <= prefix.size() || CompareStringOrdinal(raw.data(), static_cast<int>(prefix.size()), prefix.data(),
+                                                                static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL) continue;
+        ArchiveLaunch launch{raw.substr(prefix.size()), extract};
+        while (!launch.path.empty() && launch.path.front() == L'"') launch.path.erase(launch.path.begin());
+        while (!launch.path.empty() && launch.path.back() == L'"') launch.path.pop_back();
+        return launch;
+    }
+    return std::nullopt;
+}
+
+// 在 Pulse 里打开: the quick preview opens on the archive's row, once its folder has loaded and
+// selected it (a preview shown earlier follows the selection away). Gives up after about 10 s.
+struct PendingPreview { std::wstring path; int ticks = 0; };
+constexpr UINT_PTR kArchivePreviewTimer = 0x50A7C;
+std::map<HWND, PendingPreview>& PendingPreviews() {
+    static std::map<HWND, PendingPreview> pending;
+    return pending;
+}
+bool SamePath(std::wstring_view a, std::wstring_view b) {
+    const auto lhs = path::StripExtendedPathPrefix(a);
+    const auto rhs = path::StripExtendedPathPrefix(b);
+    return CompareStringOrdinal(lhs.c_str(), -1, rhs.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+void CALLBACK PreviewTick(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+    auto& pending = PendingPreviews();
+    const auto at = pending.find(hwnd);
+    AppState* s = GetAppState(hwnd);
+    ui::QuickPreviewItem item;
+    const bool ready = at != pending.end() && s && SelectedQuickPreviewItem(*s, item) && SamePath(item.path, at->second.path);
+    if (!ready && at != pending.end() && s && ++at->second.ticks < 50) return;
+    KillTimer(hwnd, id);
+    if (at != pending.end()) pending.erase(at);
+    if (ready) OpenQuickPreview(*s, item, true);
+}
 }  // namespace
+
+void PreviewArchiveWhenSelected(AppState& target, const std::wstring& path) {
+    ui::QuickPreviewItem item;
+    if (SelectedQuickPreviewItem(target, item) && SamePath(item.path, path)) {
+        KillTimer(target.hwnd, kArchivePreviewTimer);
+        PendingPreviews().erase(target.hwnd);
+        OpenQuickPreview(target, item, true);
+        return;
+    }
+    PendingPreviews()[target.hwnd] = {path, 0};
+    SetTimer(target.hwnd, kArchivePreviewTimer, 200, PreviewTick);
+}
 
 bool ExternalOpenWindowBusy(const AppState& state) { return IsBusy(state); }
 
-ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bool reveal) {
+bool IsArchiveLaunch(const std::wstring& raw) { return ParseArchiveLaunch(raw).has_value(); }
+
+bool IsExtensionOpenLaunch(const std::wstring& raw) { return extensions::IsExtOpenIntent(raw); }
+
+ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& intent, bool reveal) {
+    std::wstring item;
+    const auto picker = picker_pulse_open::Parse(intent);
+    if ((intent.starts_with(picker_pulse_open::kFolder) || intent.starts_with(picker_pulse_open::kFile)) && !picker)
+        return {ExternalOpenStatus::Failed, nullptr};
+    if (picker) { item = picker->path; reveal = picker->file; }
+    if (intent.starts_with(reveal_item_entry::kIntent)) {
+        const auto target = std::wstring_view(intent).substr(reveal_item_entry::kIntent.size());
+        if (!reveal_item_entry::ValidTarget(target)) return {ExternalOpenStatus::Failed, nullptr};
+        item.assign(target);
+        reveal = true;
+    }
+    const auto& raw = item.empty() ? intent : item;
+    // The archive is shown selected in its folder (as any file Pulse is asked to open), then extracted
+    // there or previewed. Nothing runs until a window has taken it, so a deferred request is retried whole.
+    if (const auto archive = ParseArchiveLaunch(raw)) {
+        const DWORD attributes = GetFileAttributesW(archive->path.c_str());
+        const bool file = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+        const auto result = OpenExternalFolder(mru, archive->path, false);
+        if (!file || result.status != ExternalOpenStatus::Dispatched || !result.target) return result;
+        AppState& target = *result.target;
+        if (archive->extract) {
+            if (!extensions::native::HandleArchiveOpenFallback(target, archive->path)) {
+                // The 7-Zip extension is gone or turned off: give the archive types back, then open it as Windows would.
+                takeover::RemoveAll();
+                target.ops.OpenWith(archive->path, false);
+            }
+        } else {
+            PreviewArchiveWhenSelected(target, archive->path);
+        }
+        return result;
+    }
+    if (const auto ext_open = extensions::ParseExtOpenIntent(raw)) {
+        const DWORD attributes = GetFileAttributesW(ext_open->path.c_str());
+        const bool file = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+        const auto result = OpenExternalFolder(mru, ext_open->path, false);
+        if (!file || result.status != ExternalOpenStatus::Dispatched || !result.target) return result;
+        AppState& target = *result.target;
+        if (!extensions::native::HandleExtensionFileOpen(
+                target, ext_open->package_id, ext_open->handler_id, ext_open->path, ext_open->preview)) {
+            extensions::native::RemovePackageAssociationsOnHost(ext_open->package_id);
+            target.ops.OpenWith(ext_open->path, false);
+        }
+        return result;
+    }
     const bool activate = raw == L"pulse:activate";
     const bool icon = raw.empty();
     const bool win_e = raw == L"pulse:win-e";
     const bool explicit_window = raw == L"pulse:new-window" || raw == L"pulse:this-pc";
     const bool explicit_tab = raw == L"pulse:new-tab";
     const bool launch = activate || icon || win_e || explicit_window || explicit_tab || app::IsThisPcArgument(raw);
+    if (!launch && !reveal && !mru.shot.active && IsExtensionPackageFilePath(raw)) {
+        std::wstring unquoted = raw;
+        while (!unquoted.empty() && unquoted.front() == L'"') unquoted.erase(unquoted.begin());
+        while (!unquoted.empty() && unquoted.back() == L'"') unquoted.pop_back();
+        const wchar_t root_buf[4] = {
+            unquoted.size() >= 3 ? unquoted[0] : L'\0', L':', L'\\', L'\0'};
+        const UINT drive_type = (!fs::IsUncPath(unquoted) && unquoted.size() >= 3 &&
+                                 unquoted[1] == L':' && (unquoted[2] == L'\\' || unquoted[2] == L'/'))
+            ? GetDriveTypeW(root_buf)
+            : DRIVE_UNKNOWN;
+        const bool local_drive = (drive_type == DRIVE_FIXED || drive_type == DRIVE_REMOVABLE ||
+                                  drive_type == DRIVE_RAMDISK);
+        const DWORD attrs = local_drive ? GetFileAttributesW(unquoted.c_str()) : FILE_ATTRIBUTE_NORMAL;
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            std::vector<AppState*> pkg_windows;
+            std::vector<app::ExternalOpenWindow> pkg_snapshot;
+            app::ForEachWindowSharingCore(mru, [&](AppState& w) {
+                if (!w.hwnd) return;
+                app::ExternalOpenWindow e;
+                e.minimized = IsIconic(w.hwnd) != FALSE;
+                e.hidden = !IsWindowVisible(w.hwnd);
+                e.busy = IsBusy(w);
+                e.last_input_tick = w.last_input_tick;
+                pkg_windows.push_back(&w);
+                pkg_snapshot.push_back(e);
+            });
+            if (pkg_windows.empty()) return {ExternalOpenStatus::Failed, nullptr};
+            const auto pkg_decision = app::DecideLaunchTarget(2, pkg_snapshot, false);
+            if (pkg_decision.action == app::ExternalOpenAction::Deferred) {
+                return {ExternalOpenStatus::Deferred, nullptr};
+            }
+            AppState* pkg_target = pkg_decision.window < pkg_windows.size() ? pkg_windows[pkg_decision.window] : pkg_windows.front();
+            RevealWindow(*pkg_target);
+            if (!ConfirmExternalWindowReveal(*pkg_target)) return {ExternalOpenStatus::Failed, nullptr};
+            OpenExtensionPackageInStore(*pkg_target, unquoted);
+            return {ExternalOpenStatus::Dispatched, pkg_target};
+        }
+    }
     const bool this_pc = launch;
     const auto* current = ActiveTab(mru);
     const std::wstring path = icon || win_e || raw == L"pulse:new-window" || explicit_tab
         ? (mru.appPrefs.new_window_shows == 0 ? mru.appPrefs.home_folder :
            mru.appPrefs.new_window_shows == 1 ? std::wstring() :
-           current ? current->current_path : std::wstring())
+           current ? app::AddressSearchHandoffPath(*current) : std::wstring())
         : this_pc ? std::wstring() : ResolveOpenFolderPath(raw, reveal);
+    if (!item.empty() && path.empty()) return {ExternalOpenStatus::Failed, nullptr};
     // Screenshot runs stay one window (plan §8.7); nothing to open stays as before.
     if (mru.shot.active || (!this_pc && path.empty())) {
         OpenFolderInNewTab(mru, raw, reveal);
+        if (!mru.shot.active && !ConfirmExternalWindowReveal(mru)) return {ExternalOpenStatus::Failed, nullptr};
         return {ExternalOpenStatus::Dispatched, &mru};
     }
     AppCore& core = mru.core;
@@ -115,10 +278,10 @@ ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bo
     // The first tab can only move out while it is still there and not alone.
     batch.tab_movable = batch.tab_movable && batch_tab_movable;
 
-    const app::ExternalOpenPolicy policy = OpenPolicy(mru);
+    const app::ExternalOpenPolicy policy = picker ? app::ExternalOpenPolicy::AlwaysTab : OpenPolicy(mru);
     app::ExternalOpenRequest request;
     request.new_window = false;
-    request.can_dedupe = !this_pc;
+    request.can_dedupe = !this_pc && !picker;
     request.tick = now;
     const int launch_mode = activate ? 2 : explicit_tab ? 1 : icon ? mru.appPrefs.open_pulse_icon :
         win_e ? mru.appPrefs.open_win_e : mru.appPrefs.open_this_pc;
@@ -163,6 +326,10 @@ ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bo
             // close-to-tray reopening is configured to start at a fresh location.
             if (activate) target->hidden_to_tray = false;
             RevealWindow(*target);
+        } else if (picker) {
+            OpenTabAt(*target, path);
+            if (picker->file) SelectLaunchedFile(*target, raw, true);
+            RevealWindow(*target);
         } else OpenFolderInNewTab(*target, raw, reveal);
         opened = decision.action != app::ExternalOpenAction::Activate;
         break;
@@ -187,7 +354,7 @@ ExternalOpenResult OpenExternalFolder(AppState& mru, const std::wstring& raw, bo
         break;
     }
     }
-    if (!target) {
+    if (!target || !ConfirmExternalWindowReveal(*target)) {
         log_launch("external_launch_result", static_cast<uint64_t>(ExternalOpenStatus::Failed));
         return {ExternalOpenStatus::Failed, nullptr};
     }

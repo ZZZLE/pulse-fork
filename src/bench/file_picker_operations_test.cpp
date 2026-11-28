@@ -2,14 +2,26 @@
 #include "../common/localization.h"
 #include "../app/context_menu.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
 #include <string_view>
+#include <vector>
 
 namespace {
 int failures = 0;
 bool create_only = false;
+bool background_only = false;
+constexpr UINT kBackgroundProbe = WM_APP + 61;
+LRESULT CALLBACK BackgroundProbeProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == kBackgroundProbe) {
+        auto* probe = reinterpret_cast<std::function<void()>*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (probe) (*probe)();
+        return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
 void Check(bool ok, const char* label) {
     std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", label);
     failures += !ok;
@@ -24,7 +36,7 @@ int RunFilePickerOperationsTest() {
     using namespace pulse;
     setvbuf(stdout, nullptr, _IONBF, 0);
 #ifdef PULSE_FILE_PICKER_OPERATIONS_STANDALONE
-    if (create_only) {
+    if (create_only || background_only) {
         const auto desktop_name = L"PulsePickerOperations_" + std::to_wstring(GetCurrentProcessId());
         const HDESK desktop = CreateDesktopW(desktop_name.c_str(), nullptr, nullptr, 0, GENERIC_ALL, nullptr);
         if (!desktop || !SetThreadDesktop(desktop)) return 2;
@@ -46,6 +58,75 @@ int RunFilePickerOperationsTest() {
     Check(owner != nullptr, "isolated owner window");
     if (!owner) return 1;
     ui::PickerOperationSession session;
+    if (background_only) {
+        const DWORD ui_thread = GetCurrentThreadId();
+        std::atomic_bool dispatched{false};
+        std::atomic_bool different_thread{false};
+        std::atomic_bool disabled_during_work{false};
+        std::atomic_int calls{0};
+        int reentered_calls = 0;
+        std::function<void()> probe = [&] {
+            session.RunBackground(owner, [&](const std::atomic_bool&) {
+                ++reentered_calls;
+                return std::wstring();
+            }, false, D2D1::ColorF(0x0078D4));
+            dispatched = true;
+        };
+        const auto original_proc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(owner, GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(BackgroundProbeProc)));
+        SetWindowLongPtrW(owner, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&probe));
+        auto result = session.RunBackground(owner, [&](const std::atomic_bool&) -> std::wstring {
+            ++calls;
+            different_thread = GetCurrentThreadId() != ui_thread;
+            disabled_during_work = !IsWindowEnabled(owner);
+            PostMessageW(owner, kBackgroundProbe, 0, 0);
+            const auto deadline = GetTickCount64() + 3000;
+            while (!dispatched && GetTickCount64() < deadline) Sleep(5);
+            if (!dispatched || !CopyFileW((root / L"source.txt").c_str(),
+                (root / L"destination/background.txt").c_str(), TRUE)) return L"background fixture failed";
+            return {};
+        }, false, D2D1::ColorF(0x0078D4));
+        Check(result.error.empty() && Read(root / L"destination/background.txt") == "picker fixture",
+            "background operation completes real isolated file copy");
+        Check(calls == 1 && different_thread && disabled_during_work && dispatched && reentered_calls == 0,
+            "background operation runs once off UI thread while modal loop pumps and rejects reentry");
+        Check(IsWindowEnabled(owner), "background completion restores owner");
+        std::atomic_bool observed_cancel{false};
+        PostMessageW(owner, WM_CLOSE, 0, 0);
+        result = session.RunBackground(owner, [&](const std::atomic_bool& cancelled) -> std::wstring {
+            ++calls;
+            const auto deadline = GetTickCount64() + 3000;
+            while (!cancelled && GetTickCount64() < deadline) Sleep(5);
+            observed_cancel = cancelled.load();
+            return observed_cancel ? L"fixture cancelled" : L"cancellation was not delivered";
+        }, false, D2D1::ColorF(0x0078D4));
+        Check(observed_cancel && result.error == L"fixture cancelled" && calls == 2 && IsWindowEnabled(owner),
+            "owner close delivers cancellation and waits for worker without replay");
+        observed_cancel = false;
+        PostMessageW(owner, WM_CLOSE, 0, 0);
+        result = session.RunBackground(owner, [&](const std::atomic_bool& cancelled) -> std::wstring {
+            ++calls;
+            const auto deadline = GetTickCount64() + 3000;
+            while (!cancelled && GetTickCount64() < deadline) Sleep(5);
+            observed_cancel = cancelled.load();
+            if (!CopyFileW((root / L"source.txt").c_str(),
+                (root / L"destination/settled.txt").c_str(), TRUE)) return L"settled fixture failed";
+            return {};
+        }, false, D2D1::ColorF(0x0078D4));
+        Check(observed_cancel && result.error.empty() && calls == 3 && IsWindowEnabled(owner) &&
+            Read(root / L"destination/settled.txt") == "picker fixture",
+            "completed noninterruptible transfer is not relabeled cancelled or replayed");
+        result = session.RunBackground(owner, [&](const std::atomic_bool& cancelled) -> std::wstring {
+            ++calls;
+            return cancelled ? L"stale cancellation" : std::wstring();
+        }, false, D2D1::ColorF(0x0078D4));
+        Check(result.error.empty() && calls == 4, "next background operation clears prior cancellation");
+        SetWindowLongPtrW(owner, GWLP_USERDATA, 0);
+        SetWindowLongPtrW(owner, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original_proc));
+        DestroyWindow(owner);
+        OleUninitialize();
+        return failures ? 1 : 0;
+    }
     const auto run = [&](ops::OpRequest request) {
         auto result = session.Run(owner, std::move(request), false, D2D1::ColorF(0x0078D4));
         Check(IsWindowEnabled(owner), "operation restores owner after worker settles");
@@ -211,8 +292,47 @@ int RunFilePickerOperationsTest() {
 }
 
 #if defined(PULSE_FILE_PICKER_OPERATIONS_STANDALONE)
+int RunIdleBench() {
+    using namespace pulse;
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    LARGE_INTEGER freq{};
+    QueryPerformanceFrequency(&freq);
+    auto now_qpc = []() -> int64_t { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v.QuadPart; };
+    auto to_ms = [&](int64_t a, int64_t b) -> double { return (b - a) * 1000.0 / freq.QuadPart; };
+    auto median = [](std::vector<double> values) -> double {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    std::vector<double> ctor_runs, dtor_runs, total_runs;
+    for (int run = 0; run < 10; ++run) {
+        const int64_t t0 = now_qpc();
+        auto session = std::make_unique<ui::PickerOperationSession>();
+        const int64_t t1 = now_qpc();
+        Check(!session->CanUndo(), "idle session reports CanUndo == false");
+        session->Cancel();
+        const int64_t t2 = now_qpc();
+        session.reset();
+        const int64_t t3 = now_qpc();
+        const double ctor_ms = to_ms(t0, t1);
+        const double dtor_ms = to_ms(t2, t3);
+        const double total_ms = ctor_ms + dtor_ms;
+        std::printf("IDLE_SESSION run=%d%s ctor_ms=%.3f dtor_ms=%.3f total_ms=%.3f\n",
+            run, run == 0 ? "(warmup)" : "", ctor_ms, dtor_ms, total_ms);
+        if (run > 0) {
+            ctor_runs.push_back(ctor_ms);
+            dtor_runs.push_back(dtor_ms);
+            total_runs.push_back(total_ms);
+        }
+    }
+    std::printf("IDLE_SESSION_SUMMARY n=%zu ctor_median_ms=%.3f dtor_median_ms=%.3f total_median_ms=%.3f\n",
+        total_runs.size(), median(ctor_runs), median(dtor_runs), median(total_runs));
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--idle-bench") return RunIdleBench();
     create_only = argc == 2 && std::string_view(argv[1]) == "--create-only";
+    background_only = argc == 2 && std::string_view(argv[1]) == "--background-only";
     return RunFilePickerOperationsTest();
 }
 #endif

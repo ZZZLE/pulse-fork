@@ -1,6 +1,7 @@
 #include "filename_pinyin.h"
 // index_query.cpp — Compile Everything-subset queries into predicate groups.
 #include "index_query.h"
+#include <regex>
 #include "search_kinds.h"
 #include "../common/path_utils.h"
 #include <windows.h>
@@ -8,6 +9,13 @@
 #include <cwctype>
 
 namespace pulse::index {
+
+struct NameRegex {
+    std::wregex expression;
+    explicit NameRegex(std::wstring_view pattern)
+        : expression(pattern.begin(), pattern.end(), std::regex_constants::ECMAScript |
+                     std::regex_constants::icase | std::regex_constants::optimize) {}
+};
 
 namespace {
 
@@ -338,6 +346,20 @@ bool SkipFromFilenameNeedle(const RawToken& tok) {
 Term ParseTerm(std::wstring_view tok, bool quoted, bool negated) {
     Term t;
     std::wstring_view val;
+    if (!quoted && tok.size() > 5 && IsModifier(tok, L"regex", val)) {
+        t.name_how = NameHow::Regex;
+        t.name_not = negated;
+        // Doubled quotes keep the query delimiter separate from regex syntax.
+        for (size_t i = 0; i < val.size(); ++i) {
+            t.name.push_back(val[i]);
+            if (val[i] == L'"' && i + 1 < val.size() && val[i + 1] == L'"') ++i;
+        }
+        if (!t.name.empty() && t.name.size() <= 1024) {
+            try { t.name_regex = std::make_shared<NameRegex>(t.name); }
+            catch (const std::regex_error&) {}
+        }
+        return t;
+    }
     if (!quoted && (IsModifier(tok, L"ext", val))) {
         ApplyExt(t, val);
         t.ext_not = negated;
@@ -424,7 +446,14 @@ std::vector<RawToken> TokenizeQuery(std::wstring_view raw, std::vector<size_t>* 
                 if (IsColon(c)) {
                     if (i < raw.size() && raw[i] == L'"') {
                         tok.text.push_back(raw[i++]);
-                        while (i < raw.size() && raw[i] != L'"') tok.text.push_back(raw[i++]);
+                        const bool regex = StartsWithI(tok.text, L"regex:") || StartsWithI(tok.text, L"regex：");
+                        while (i < raw.size()) {
+                            if (raw[i] == L'"') {
+                                if (!regex || i + 1 == raw.size() || raw[i + 1] != L'"') break;
+                                tok.text.push_back(raw[i++]);
+                            }
+                            tok.text.push_back(raw[i++]);
+                        }
                         if (i < raw.size() && raw[i] == L'"') tok.text.push_back(raw[i++]);
                         break;
                     }
@@ -457,15 +486,19 @@ std::wstring Fold(std::wstring_view s) {
 }
 
 bool ContainsFolded(const wchar_t* s, uint32_t n, const std::wstring& needle) {
-    if (needle.empty()) return true;
-    if (needle.size() > n) return false;
+    const size_t m = needle.size();
+    if (m == 0) return true;
+    if (m > n) return false;
     const wchar_t* lut = Lut();
     const wchar_t first = needle[0];
-    const uint32_t last = n - static_cast<uint32_t>(needle.size());
+    const wchar_t last_ch = needle[m - 1];
+    const uint32_t last = n - static_cast<uint32_t>(m);
+    const size_t mid = m > 1 ? m - 1 : 1;
     for (uint32_t i = 0; i <= last; ++i) {
         if (lut[static_cast<uint16_t>(s[i])] != first) continue;
+        if (m > 1 && lut[static_cast<uint16_t>(s[i + m - 1])] != last_ch) continue;
         bool ok = true;
-        for (size_t j = 1; j < needle.size(); ++j) {
+        for (size_t j = 1; j < mid; ++j) {
             if (lut[static_cast<uint16_t>(s[i + j])] != needle[j]) { ok = false; break; }
         }
         if (ok) return true;
@@ -530,6 +563,11 @@ bool WordStartFolded(const wchar_t* s, uint32_t n, const std::wstring& needle) {
 
 bool MatchName(const wchar_t* s, uint32_t n, const Term& t) {
     switch (t.name_how) {
+    case NameHow::Regex:
+        // Invalid/over-complex expressions fail closed even under negation.
+        if (!t.name_regex) return t.name_not;
+        try { return std::regex_search(s, s + n, t.name_regex->expression); }
+        catch (const std::regex_error&) { return t.name_not; }
     case NameHow::Exact:     return EqualsFolded(s, n, t.name);
     case NameHow::Wildcard:  return WildcardFolded(s, n, t.name);
     case NameHow::Substring: return ContainsFolded(s, n, t.name) ||
@@ -590,6 +628,23 @@ size_t QueryPrimaryNameLen(const CompiledQuery& q) {
         }
     }
     return best;
+}
+
+bool QueryHasInvalidRegex(const CompiledQuery& q) {
+    for (const auto& group : q.groups)
+        for (const auto& term : group)
+            if (term.name_how == NameHow::Regex && !term.name_regex) return true;
+    return false;
+}
+
+std::wstring RegexQueryToken(std::wstring_view pattern) {
+    std::wstring token = L"regex:\"";
+    for (const auto ch : pattern) {
+        token.push_back(ch);
+        if (ch == L'"') token.push_back(ch);
+    }
+    token.push_back(L'"');
+    return token;
 }
 
 bool QueryIsSimpleName(const CompiledQuery& q) {
@@ -676,22 +731,49 @@ bool MatchTerm(std::wstring_view path, std::wstring_view name, bool is_dir,
     return true;
 }
 
+int ScoreLiteralFolded(const wchar_t* s, uint32_t n, const std::wstring& needle) {
+    const size_t m = needle.size();
+    if (m == 0) return n == 0 ? 600 : 500;
+    if (m > n) return 0;
+    const wchar_t* lut = Lut();
+    const wchar_t first = needle[0];
+    const wchar_t last_ch = needle[m - 1];
+    const uint32_t last = n - static_cast<uint32_t>(m);
+    const size_t mid = m > 1 ? m - 1 : 1;
+    auto matches_at = [&](uint32_t i) {
+        for (size_t j = 1; j < mid; ++j) {
+            if (lut[static_cast<uint16_t>(s[i + j])] != needle[j]) return false;
+        }
+        return true;
+    };
+    if (lut[static_cast<uint16_t>(s[0])] == first &&
+        (m == 1 || lut[static_cast<uint16_t>(s[m - 1])] == last_ch) &&
+        matches_at(0)) {
+        return n == m ? 600 : 500;
+    }
+    int score = 0;
+    for (uint32_t i = 1; i <= last; ++i) {
+        if (lut[static_cast<uint16_t>(s[i])] != first) continue;
+        if (m > 1 && lut[static_cast<uint16_t>(s[i + m - 1])] != last_ch) continue;
+        if (!matches_at(i)) continue;
+        if (!(std::iswalnum(s[i - 1]) || s[i - 1] > 127)) return 400;
+        score = 300;
+    }
+    return score;
+}
+
 int RankName(const wchar_t* s, uint32_t n, bool is_dir, const CompiledQuery& q) {
     int best = 0;
     for (const auto& g : q.groups) {
         for (const auto& t : g) {
             if (t.name_not || t.name_how == NameHow::Any || t.name.empty()) continue;
             int sc = 0;
-            if (t.name_how == NameHow::Wildcard) {
+            if (t.name_how == NameHow::Regex) {
+                if (MatchName(s, n, t)) sc = 150;
+            } else if (t.name_how == NameHow::Wildcard) {
                 if (WildcardFolded(s, n, t.name)) sc = 150;
-            } else if (EqualsFolded(s, n, t.name)) {
-                sc = 600;
-            } else if (StartsWithFolded(s, n, t.name)) {
-                sc = 500;
-            } else if (WordStartFolded(s, n, t.name)) {
-                sc = 400;
-            } else if (ContainsFolded(s, n, t.name)) {
-                sc = 300;
+            } else {
+                sc = ScoreLiteralFolded(s, n, t.name);
             }
             if (!sc && t.pinyin) {
                 const auto match = FindPinyinMatch({s, n}, t.name);

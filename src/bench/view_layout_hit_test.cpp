@@ -18,6 +18,28 @@ int main() {
         check(first.left > 0 && last.right < 900 && xl.HitTest(first.left - 1, 20) == -1 &&
               xl.HitTest(last.right + 1, 20) == -1, "extra-large row margins are blank");
     }
+    {
+        bool label_fits = true, size_slot = true, bottom_hit = true;
+        for (float dpi : {1.0f, 1.5f, 2.0f}) for (float font : {1.0f, 1.12f, 1.25f})
+        for (auto mode : {ViewMode::MediumIcons, ViewMode::LargeIcons, ViewMode::ExtraLargeIcons}) {
+            const float line = kIconGridNameLineDip * font;
+            const ViewLayout layout(mode, {0, 0, 900 * dpi, 700 * dpi}, 30, 0, 0, dpi,
+                ViewLayoutParams(IconGridNameBlockDip(4), 0, line));
+            const auto label = layout.NameRect(0);
+            const auto cell = layout.ItemRect(0);
+            const auto second_row = layout.ItemRect(layout.Metrics().columns);
+            const auto size = layout.FolderSizeRect(0);
+            label_fits &= layout.Metrics().name_lines == 4 && label.bottom <= cell.bottom &&
+                cell.bottom < second_row.top &&
+                std::abs((label.bottom - label.top) - (4 * line + 2) * dpi) < 0.01f;
+            size_slot &= std::abs(size.top - (label.top + 3 * line * dpi)) < 0.01f &&
+                size.bottom == label.bottom;
+            bottom_hit &= layout.HitTest((label.left + label.right) * 0.5f, label.bottom - 1) == 0;
+        }
+        check(label_fits, "scaled four-line name block fits without clipping into the next row");
+        check(size_slot, "folder size reserves a complete scaled name line");
+        check(bottom_hit, "last visible name line belongs to the same item");
+    }
     check(ViewLayout(ViewMode::List, {0, 0, 800, 250}, 30, 0, 0, 1).HitTest(30, 245) == -1,
           "column-major bottom remainder is blank");
     for (int mode = 0; mode < 8; ++mode) {
@@ -145,6 +167,41 @@ int main() {
         ViewLayoutParams wp(0, 0);
         wp.wall = &wall;
         check(!ViewLayout(ViewMode::LargeIcons, {0, 0, 700, 400}, 7, 0, 0, 1, wp, &gs).Grouped(), "photo wall is not grouped");
+    }
+    {
+        // List view like File Explorer: each column as wide as its longest name.
+        const float scale = 1.5f;
+        const D2D1_RECT_F viewport{0, 0, 1200, 24 * scale * 3 + 10};   // three rows per column
+        check(ListRowsPerColumn(viewport.bottom, scale) == 3, "list: rows per column follow the viewport height");
+        // Column 0: short names; column 1: one long name; column 2: a name past the cap; column 3: one short row.
+        const std::vector<float> text = {30, 40, 35, 50, 400, 60, 90, 2000, 20, 25};
+        const ListColumns columns = BuildListColumns(text, 3, scale);
+        const auto width = [&](size_t c) { return columns.left[c + 1] - columns.left[c]; };
+        check(columns.left.size() == 5 && columns.left[0] == 0, "list: one offset per column plus the content width");
+        check(std::abs(width(0) - std::round(std::max(40 + kListItemChromeDip * scale, kListColumnMinDip * scale))) < 0.01f,
+              "list: a short column fits its longest name, not a fixed width");
+        check(std::abs(width(1) - std::round(400 + kListItemChromeDip * scale)) < 0.01f, "list: a long name widens only its own column");
+        check(std::abs(width(2) - kListColumnMaxDip * scale) < 0.01f, "list: a very long name stops at the column cap");
+        check(std::abs(width(3) - kListColumnMinDip * scale) < 0.01f, "list: a column never goes below the minimum");
+        ViewLayoutParams params;
+        params.list_columns = &columns;
+        const ViewLayout list(ViewMode::List, viewport, text.size(), 0, 0, scale, params);
+        const auto r4 = list.ItemRect(4), r7 = list.ItemRect(7), r9 = list.ItemRect(9);
+        check(r4.left == columns.left[1] && r4.right == columns.left[2] && r7.left == columns.left[2] &&
+              r9.left == columns.left[3] && list.ContentWidth() == columns.left.back(),
+              "list: item rects follow the measured columns");
+        check(list.HitTest(columns.left[1] + 5, r4.top + 2) == 4 && list.HitTest(columns.left[2] - 1, r4.top + 2) == 4 &&
+              list.HitTest(columns.left[2] + 1, r7.top + 2) == 7 && list.HitTest(columns.left.back() + 3, 2) == -1,
+              "list: hit testing finds the column by its measured span");
+        check(list.MoveIndex(1, 1, 0) == 4 && list.MoveIndex(4, -1, 0) == 1, "list: left / right still step one column");
+        const ViewLayout scrolled(ViewMode::List, viewport, text.size(), columns.left[2], 0, scale, params);
+        const auto [first, last] = scrolled.VisibleRange();
+        check(first <= 6 && last >= 9 && scrolled.ItemRect(7).left == 0, "list: scrolling by measured offsets");
+        // Columns built for another split (the pane was resized) are not used.
+        const D2D1_RECT_F taller{0, 0, 1200, 24 * scale * 5 + 4};
+        const ViewLayout stale(ViewMode::List, taller, text.size(), 0, 0, scale, params);
+        check(std::abs((stale.ItemRect(5).right - stale.ItemRect(5).left) - kListColumnDefaultDip * scale) < 0.01f,
+              "list: columns of another row split fall back to the default width");
     }
     return failures ? 1 : 0;
 }

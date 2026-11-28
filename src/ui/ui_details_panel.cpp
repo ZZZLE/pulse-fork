@@ -51,7 +51,7 @@ DetailsMotion& DetailsMotionFor(const void* renderer) {
 
 D2D1_RECT_F MainRenderer::DetailsPanelRect(float w, float h) const {
     if (DetailsPanelWidth(w) <= 0.0f) return D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
-    const float pw = details_width_ * scale_;
+    const float pw = EmbeddedPickerLayout() ? std::max(0.0f, DetailsPanelWidth(w) - margin_) : details_width_ * scale_;
     const float top = title_bar_height_ + toolbar_height_ + margin_;
     const float bottom = h - status_height_ - margin_;
     return D2D1::RectF(w - margin_ - pw, top, w - margin_, bottom);
@@ -69,7 +69,7 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
         ? DetailsPreviewHeight(panel, s, d.preview_expansion, d) : 0.0f;
     DetailsHitRects hit;
     LayoutDetailsPanel(panel, s, d, compositor_->DwriteFactory(),
-                       compositor_->SmallFormat(), compositor_, previewH, hit);
+                       compositor_->SmallFormat(), compositor_, previewH, hit, EmbeddedPickerLayout() && d.preview_only);
 
     DetailsMotion& dm = DetailsMotionFor(this);
     if (motion_now_ - dm.animations_checked > 2000 || !dm.animations_checked) {
@@ -171,6 +171,104 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
              compositor_->SmallFormat(), theme.text);
     };
 
+    if (EmbeddedPickerLayout() && d.preview_only && d.picker_save_mode) {
+        const auto layout = LayoutPickerSavePreview(panel, s, d.picker_save_to_tray);
+        details_preview_bounds_ = {};
+        dc->PushAxisAlignedClip(panel, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const auto draw_text = [&](const std::wstring& value, D2D1_RECT_F bounds, IDWriteTextFormat* fmt, const D2D1_COLOR_F& color) {
+            if (!fmt || bounds.right <= bounds.left || bounds.bottom <= bounds.top || value.empty()) return;
+            MakeBrush(dc, color, brText_);
+            DrawTextEndEllipsis(compositor_, fmt, brText_.get(), value,
+                bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+        };
+        const auto draw_kv = [&](const D2D1_RECT_F& row, l10n::StringId key_id, const std::wstring& val, const D2D1_COLOR_F& val_color) {
+            if (row.right <= row.left || row.bottom <= row.top) return;
+            const std::wstring key = l10n::Get(key_id);
+            const float kw = std::min((row.right - row.left) * 0.44f,
+                MeasureLayoutText(compositor_, compositor_->DwriteFactory(), compositor_->SmallFormat(), key) + 8.0f * s);
+            draw_text(key, {row.left, row.top, row.left + kw, row.bottom}, compositor_->SmallFormat(), theme.text_secondary);
+            draw_text(val, {row.left + kw, row.top, row.right, row.bottom}, compositor_->SmallFormat(), val_color);
+        };
+        const bool hc = IsHighContrast();
+        const D2D1_COLOR_F ok_ink = hc ? theme.text : (vm.dark ? HexColor(0x6CCB5F) : HexColor(0x0F7B0F));
+        const D2D1_COLOR_F warn_ink = hc ? theme.text : (vm.dark ? HexColor(0xFCE100) : HexColor(0x9D5D00));
+        const D2D1_COLOR_F ok_bg = hc ? theme.bg : (vm.dark ? WithAlpha(HexColor(0x6CCB5F), 0.14f) : WithAlpha(HexColor(0x0F7B0F), 0.10f));
+        const D2D1_COLOR_F warn_bg = hc ? theme.bg : (vm.dark ? WithAlpha(HexColor(0xFCE100), 0.14f) : WithAlpha(HexColor(0x9D5D00), 0.11f));
+
+        if (d.picker_save_to_tray) {
+            draw_text(l10n::Get(l10n::StringId::PickerSaveToTrayHeading), layout.heading, compositor_->HeaderFormat(), theme.text);
+            std::wstring loc_val = l10n::Get(l10n::StringId::PickerSaveToTrayLocationVal);
+            if (const auto pos = loc_val.find(L"{path}"); pos != std::wstring::npos)
+                loc_val.replace(pos, 6, d.save_folder_text.empty() ? L"Pulse\\shelf" : d.save_folder_text);
+            draw_kv(layout.kv_rows[0], l10n::StringId::Location, loc_val, theme.text);
+            std::wstring count_val = l10n::Get(l10n::StringId::PickerSaveToTrayInTrayValue);
+            if (const auto pos = count_val.find(L"{count}"); pos != std::wstring::npos)
+                count_val.replace(pos, 7, std::to_wstring(d.save_tray_count));
+            draw_kv(layout.kv_rows[1], l10n::StringId::PickerSaveToTrayInTrayLabel, count_val, theme.text);
+            draw_kv(layout.kv_rows[2], l10n::StringId::PickerSaveDestDisk, d.save_disk_text, theme.text);
+            if (layout.banner.right > layout.banner.left) {
+                painter_.FillRoundedRect(layout.banner, 6.0f * s, warn_bg);
+                painter_.StrokeRoundedRect(layout.banner, 6.0f * s, WithAlpha(warn_ink, hc ? 1.0f : 0.35f), std::max(1.0f, s));
+                painter_.DrawWrappedCaption(l10n::Get(l10n::StringId::PickerSaveToTrayTempHint),
+                    D2D1::Point2F(layout.banner.left + 8.0f * s, layout.banner.top + 6.0f * s),
+                    std::max(1.0f, layout.banner.right - layout.banner.left - 16.0f * s), warn_ink);
+            }
+            if (layout.divider.right > layout.divider.left) {
+                MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+                dc->FillRectangle(layout.divider, brStrokeDivider_.get());
+            }
+            draw_text(l10n::Get(l10n::StringId::PickerSaveToTrayLaterTitle), layout.subheading, compositor_->SmallFormat(), theme.text_secondary);
+            static constexpr l10n::StringId kBullets[3] = {
+                l10n::StringId::PickerSaveToTrayLater1,
+                l10n::StringId::PickerSaveToTrayLater2,
+                l10n::StringId::PickerSaveToTrayLater3
+            };
+            float by = layout.subheading.bottom + 6.0f * s;
+            const float bw = std::max(1.0f, layout.subheading.right - layout.subheading.left);
+            const float b_limit = panel.bottom - 10.0f * s;
+            for (size_t i = 0; i < 3; ++i) {
+                const std::wstring btext = l10n::Get(kBullets[i]);
+                const float bh = std::max(18.0f * s, painter_.MeasureWrappedCaptionHeight(btext, bw));
+                if (by + bh > b_limit) break;
+                painter_.DrawWrappedCaption(btext, D2D1::Point2F(layout.subheading.left, by), bw, theme.text_secondary);
+                by += bh + 6.0f * s;
+            }
+        } else {
+            draw_text(l10n::Get(l10n::StringId::PickerSaveHereHeading), layout.heading, compositor_->HeaderFormat(), theme.text);
+            draw_kv(layout.kv_rows[0], l10n::StringId::PickerSaveDestFolder, d.save_folder_text, theme.text);
+            draw_kv(layout.kv_rows[1], l10n::StringId::PickerSameNameSeries, d.save_series_text, theme.text);
+            draw_kv(layout.kv_rows[2], l10n::StringId::PickerSaveDestDisk, d.save_disk_text, theme.text);
+            draw_kv(layout.kv_rows[3], l10n::StringId::PickerSaveDestPerm, d.save_perm_text, d.save_perm_ok ? ok_ink : warn_ink);
+            draw_kv(layout.kv_rows[4], l10n::StringId::PickerSaveDestSync, d.save_sync_text, theme.text_secondary);
+            if (layout.banner.right > layout.banner.left && !d.save_banner_text.empty()) {
+                const D2D1_COLOR_F b_ink = d.save_clash ? warn_ink : ok_ink;
+                const D2D1_COLOR_F b_bg = d.save_clash ? warn_bg : ok_bg;
+                painter_.FillRoundedRect(layout.banner, 6.0f * s, b_bg);
+                painter_.StrokeRoundedRect(layout.banner, 6.0f * s, WithAlpha(b_ink, hc ? 1.0f : 0.35f), std::max(1.0f, s));
+                painter_.DrawWrappedCaption(d.save_banner_text,
+                    D2D1::Point2F(layout.banner.left + 8.0f * s, layout.banner.top + 6.0f * s),
+                    std::max(1.0f, layout.banner.right - layout.banner.left - 16.0f * s), b_ink);
+            }
+            if (layout.divider.right > layout.divider.left) {
+                MakeBrush(dc, theme.stroke_divider, brStrokeDivider_);
+                dc->FillRectangle(layout.divider, brStrokeDivider_.get());
+            }
+            draw_text(l10n::Get(l10n::StringId::PickerSaveAfterHeading), layout.subheading, compositor_->SmallFormat(), theme.text_secondary);
+            const auto draw_after = [&](const D2D1_RECT_F& row, l10n::StringId label, bool checked, HitTestResult::Region region) {
+                if (row.right <= row.left || row.bottom <= row.top) return;
+                fluent::ControlState st{};
+                st.enabled = d.save_after_available;
+                st.checked = checked;
+                st.hovered = st.enabled && IsHovered(vm, region);
+                painter_.DrawCheckBox(row, l10n::Get(label), st);
+            };
+            draw_after(layout.after_show, l10n::StringId::PickerSaveAfterShowShort, d.save_after_show, HitTestResult::DetailsSaveAfterShow);
+            draw_after(layout.after_copy, l10n::StringId::PickerSaveAfterCopyShort, d.save_after_copy, HitTestResult::DetailsSaveAfterCopy);
+        }
+        dc->PopAxisAlignedClip();
+        return;
+    }
+
     if (!d.has_selection) {
         const D2D1_RECT_F content = D2D1::RectF(
             panel.left + 16.0f * s, panel.top + 16.0f * s,
@@ -199,6 +297,59 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
             D2D1::RectF(content.left, art.bottom + gap,
                         content.right, art.bottom + gap + titleHeight),
             compositor_->HeaderFormat(), theme.text_secondary);
+        return;
+    }
+
+    if (EmbeddedPickerLayout() && d.preview_only) {
+        const auto layout = LayoutPickerPreview(panel, s, previewH, d.picker_archive);
+        details_preview_bounds_ = layout.preview;
+        dc->PushAxisAlignedClip(panel, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const auto line = [&](const std::wstring& value, D2D1_RECT_F bounds, const D2D1_COLOR_F& color) {
+            if (bounds.right <= bounds.left || bounds.bottom <= bounds.top || value.empty()) return;
+            MakeBrush(dc, color, brText_);
+            DrawTextEndEllipsis(compositor_, compositor_->SmallFormat(), brText_.get(), value,
+                bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top);
+        };
+        line(d.name, layout.name, theme.text);
+        auto subtitle = d.subtitle_text.empty() ? FormatListType(d.name, d.is_dir) : d.subtitle_text;
+        if (!d.is_dir) subtitle += L" \u00B7 " + format::ByteSize(d.size_value);
+        line(subtitle, layout.subtitle, theme.text_secondary);
+        if (d.modified_value) {
+            const FILETIME time{static_cast<DWORD>(d.modified_value), static_cast<DWORD>(d.modified_value >> 32)};
+            line(l10n::Get(l10n::StringId::Modified) + L" " + format::LocalFileTime(time), layout.modified, theme.text_secondary);
+        }
+        line(path::FriendlyPathText(d.path), layout.location, theme.text_secondary);
+        const auto action = [&](D2D1_RECT_F bounds, l10n::StringId label, HitTestResult::Region region) {
+            if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+            fluent::ControlState state;
+            state.hovered = IsHovered(vm, region);
+            painter_.DrawButton({bounds, {}, {}, fluent::ButtonKind::Standard, state});
+            bounds.left += 8.0f * s; bounds.right -= 8.0f * s;
+            line(l10n::Get(label), bounds, theme.text);
+        };
+        if (d.picker_archive)
+            action(layout.enter_archive, l10n::StringId::PickerEnterArchive, HitTestResult::DetailsOpen);
+        action(layout.copy_path, l10n::StringId::CopyPath, HitTestResult::DetailsCopyPath);
+        action(layout.reveal, l10n::StringId::AiAsstShowInPulse, HitTestResult::DetailsNewTab);
+        if (layout.footer_hint.right > layout.footer_hint.left) {
+            float hx = layout.footer_hint.left;
+            const float hy = layout.footer_hint.top;
+            const float hh = layout.footer_hint.bottom - hy;
+            const auto draw_kbd_hint = [&](const std::wstring& key, const std::wstring& desc) {
+                const float kw = std::max(22.0f * s, painter_.MeasureBadgeWidth(key));
+                if (hx + kw > layout.footer_hint.right) return;
+                painter_.DrawBadge({{hx, hy + 1.0f * s, hx + kw, hy + hh - 1.0f * s}, key, fluent::BadgeKind::Keycap});
+                hx += kw + 4.0f * s;
+                const float dw = MeasureLayoutText(compositor_, compositor_->DwriteFactory(), compositor_->SmallFormat(), desc);
+                if (hx < layout.footer_hint.right) {
+                    line(desc, {hx, hy, std::min(layout.footer_hint.right, hx + dw + 2.0f * s), layout.footer_hint.bottom}, theme.text_secondary);
+                    hx += dw + 10.0f * s;
+                }
+            };
+            draw_kbd_hint(l10n::Get(l10n::StringId::PickerPreviewSpaceKey), l10n::Get(l10n::StringId::PickerPreviewSpaceHint));
+            draw_kbd_hint(L"Ctrl C", l10n::Get(l10n::StringId::CopyPath));
+        }
+        dc->PopAxisAlignedClip();
         return;
     }
 
@@ -454,6 +605,7 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
 
     if (d.multi_count <= 1) {
         for (const auto& def : kDetailsSections) {
+            if (def.id == 5 && d.git_branch_text.empty()) continue;   // not in a repository
             // Section separator (matches the 8 DIP gap in LayoutDetailsPanel).
             y += 8.0f * s;
             MakeBrush(dc, theme.stroke_card, brStrokeCard_);
@@ -583,6 +735,111 @@ void MainRenderer::DrawDetailsPanel(const WindowViewModel& vm, const D2D1_RECT_F
                         d.free_space_text.empty() ? pulse::l10n::Get(pulse::l10n::StringId::LoadingEllipsis)
                                                   : d.free_space_text, iy);
                 y = iy + 8.0f * s;
+                break;
+            }
+            case 5: { // Git
+                using Sid = pulse::l10n::StringId;
+                const bool plain = d.git_plain_terms;
+                float iy = y;
+                infoRow(pulse::l10n::Get(Sid::GitScBranch).c_str(), d.git_branch_text, iy);
+                const float state_y = iy;
+                infoRow(pulse::l10n::Get(Sid::ColumnStatus).c_str(), std::wstring(), iy);
+                std::wstring state_str = d.git_state_text;
+                if (!d.is_dir && d.git_summary_ready && (d.git_added > 0 || d.git_deleted > 0)) {
+                    state_str += L"  (+" + std::to_wstring(d.git_added) + L" \u2212" + std::to_wstring(d.git_deleted) + L")";
+                }
+                text(state_str, D2D1::RectF(panel.left + pad + 100.0f * s, state_y,
+                                            panel.right - pad, state_y + 18.0f * s),
+                     compositor_->SmallFormat(),
+                     d.git_mark != GitMark::None ? GitMarkColor(d.git_mark, vm.dark) : theme.text);
+
+                const std::wstring open_lbl = (!d.is_dir && d.git_mark != GitMark::None)
+                    ? pulse::l10n::Get(plain ? Sid::GitViewChangesPlain : Sid::GitViewChangesGit)
+                    : pulse::l10n::Get(Sid::GitScMenu);
+                ghostButton(hit.git_open, L"\xF003", open_lbl, IsHovered(vm, HitTestResult::DetailsGitOpen));
+                y = hit.git_open.bottom + 6.0f * s;
+
+                if (hit.git_stage.right > hit.git_stage.left) {
+                    const bool currently_staged = d.git_staged && !d.git_unstaged;
+                    const Sid stg_id = currently_staged
+                        ? (plain ? Sid::GitStagedOnePlain : Sid::GitScUnstage)
+                        : (plain ? Sid::GitStageOnePlain : Sid::GitScStage);
+                    ghostButton(hit.git_stage, currently_staged ? L"\xE73E" : L"\xE710",
+                                pulse::l10n::Get(stg_id), IsHovered(vm, HitTestResult::DetailsGitStage));
+                    if (hit.git_discard.right > hit.git_discard.left) {
+                        const Sid dsc_id = d.git_untracked
+                            ? (plain ? Sid::GitDeleteUntrackedPlain : Sid::GitDeleteUntrackedGit)
+                            : (plain ? Sid::GitDiscardPlain : Sid::GitScDiscard);
+                        ghostButton(hit.git_discard, L"\xE7A7", pulse::l10n::Get(dsc_id),
+                                    IsHovered(vm, HitTestResult::DetailsGitDiscard));
+                    }
+                    y += 26.0f * s + 8.0f * s;
+                }
+
+                if (!d.git_preview_lines.empty()) {
+                    const size_t nlines = (std::min<size_t>)(6, d.git_preview_lines.size());
+                    const float box_h = 10.0f * s + static_cast<float>(nlines) * 16.0f * s;
+                    const D2D1_RECT_F box = D2D1::RectF(panel.left + pad, y, panel.right - pad, y + box_h);
+                    painter_.FillRoundedRect(box, 6.0f * s, theme.surface_card);
+                    painter_.StrokeRoundedRect(box, 6.0f * s, theme.stroke_card, 1.0f);
+                    const D2D1_COLOR_F add_bg = vm.dark ? D2D1::ColorF(0x3DD68C, 0.14f) : D2D1::ColorF(0x1F9D55, 0.10f);
+                    const D2D1_COLOR_F del_bg = vm.dark ? D2D1::ColorF(0xFF6369, 0.14f) : D2D1::ColorF(0xE5484D, 0.09f);
+                    const D2D1_COLOR_F add_fg = vm.dark ? D2D1::ColorF(0x3DD68C) : D2D1::ColorF(0x1A7F37);
+                    const D2D1_COLOR_F del_fg = vm.dark ? D2D1::ColorF(0xFF6369) : D2D1::ColorF(0xB42318);
+                    for (size_t i = 0; i < nlines; ++i) {
+                        const auto& ln = d.git_preview_lines[i];
+                        const float ly = box.top + 5.0f * s + static_cast<float>(i) * 16.0f * s;
+                        const D2D1_RECT_F lrc = D2D1::RectF(box.left + 4.0f * s, ly, box.right - 4.0f * s, ly + 16.0f * s);
+                        if (ln.sign == L'+') {
+                            MakeBrush(dc, add_bg, brFillHover_);
+                            dc->FillRectangle(lrc, brFillHover_.get());
+                        } else if (ln.sign == L'-') {
+                            MakeBrush(dc, del_bg, brFillHover_);
+                            dc->FillRectangle(lrc, brFillHover_.get());
+                        }
+                        const std::wstring row_txt = std::wstring(1, ln.sign) + L" " + ln.text;
+                        text(row_txt, D2D1::RectF(lrc.left + 4.0f * s, lrc.top, lrc.right - 4.0f * s, lrc.bottom),
+                             compositor_->SmallFormat(),
+                             ln.sign == L'+' ? add_fg : ln.sign == L'-' ? del_fg : theme.text_secondary);
+                    }
+                    y += box_h + 8.0f * s;
+                }
+
+                if (!d.git_history.empty()) {
+                    text(pulse::l10n::Get(plain ? Sid::GitFileHistoryPlain : Sid::GitFileHistoryGit),
+                         D2D1::RectF(panel.left + pad, y, hit.git_history.left - 4.0f * s, y + 20.0f * s),
+                         compositor_->SmallFormat(), theme.text_secondary);
+                    {
+                        const bool hot = IsHovered(vm, HitTestResult::DetailsGitHistory);
+                        const std::wstring exp_lbl = pulse::l10n::Get(plain ? Sid::GitExpandAllPlain : Sid::GitExpandAllGit);
+                        std::wstring rendered_exp = exp_lbl;
+                        if (const size_t at = rendered_exp.find(L"{n}"); at != std::wstring::npos) {
+                            rendered_exp.replace(at, 3, std::to_wstring(d.git_history.size()));
+                        }
+                        text(rendered_exp, hit.git_history, compositor_->SmallFormat(),
+                             hot ? theme.accent_hover : theme.accent, true);
+                    }
+                    y += 22.0f * s;
+                    const size_t hn = (std::min<size_t>)(3, d.git_history.size());
+                    const std::wstring rst_lbl = pulse::l10n::Get(
+                        plain ? Sid::GitHistRestoreFilePlain : Sid::GitHistRestoreFileGit);
+                    for (size_t i = 0; i < hn; ++i) {
+                        const auto& h = d.git_history[i];
+                        text(h.subject,
+                             D2D1::RectF(panel.left + pad, y, panel.right - pad, y + 18.0f * s),
+                             compositor_->SmallFormat(), theme.text);
+                        const std::wstring sub = (h.author.empty() ? h.hash.substr(0, 7) : h.author) +
+                                                 (h.time_text.empty() ? L"" : L" · " + h.time_text);
+                        text(sub,
+                             D2D1::RectF(panel.left + pad, y + 16.0f * s, hit.git_hist_restore[i].left - 6.0f * s, y + 34.0f * s),
+                             compositor_->SmallFormat(), theme.text_secondary);
+                        const bool hot_r = IsHovered(vm, HitTestResult::DetailsGitRestore, static_cast<int>(i));
+                        text(rst_lbl, hit.git_hist_restore[i], compositor_->SmallFormat(),
+                             hot_r ? theme.accent_hover : theme.accent, true);
+                        y += 38.0f * s;
+                    }
+                }
+                y += 2.0f * s;
                 break;
             }
             default: break;

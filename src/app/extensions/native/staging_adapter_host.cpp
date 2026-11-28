@@ -39,10 +39,11 @@ StagingBackend MakeStagingBackend(HWND owner, CallerBinding caller) {
     backend.submit = [owner, caller](const StageSubmission& stage) -> StageSubmitResult {
         auto* app = GetAppState(owner);
         if (!app || !ValidateCallerBinding(caller)) return {};
+        const auto* manifest = PackageManifest(caller.Package().slot);
+        if (!manifest || manifest->id != caller.Package().id) return {};
         using I = l10n::StringId;
-        const std::wstring package = Wide(caller.Package().id);
-        const auto& trusted = app->appPrefs.extension_publish_trusted;
-        const bool always = std::find(trusted.begin(), trusted.end(), package) != trusted.end();
+        const std::string publisher = PackagePublisherId(caller.Package().slot);
+        const bool always = IsPublishTrusted(app->appPrefs.extension_publish_trusted, publisher, caller.Package().id);
         ui::ConfirmDialogSpec spec;
         spec.title = l10n::Get(I::ExtensionPublishTitle);
         spec.message = l10n::Get(I::ExtensionPublishMessage);
@@ -70,10 +71,10 @@ StagingBackend MakeStagingBackend(HWND owner, CallerBinding caller) {
         const auto choice = always ? ui::ConfirmChoice::Confirm
                                    : ui::ShowConfirmDialogEx(owner, spec, app->darkMode, app->accentColor);
         app = GetAppState(owner);
-        if (app && choice == ui::ConfirmChoice::Secondary) {
-            auto& list = app->appPrefs.extension_publish_trusted;
-            if (std::find(list.begin(), list.end(), package) == list.end()) list.push_back(package);
-            if (!app->isolatedTest) app->appPrefs.Save();
+        if (!always && app) DeferOperationAutoShow(*app);
+        if (app && choice == ui::ConfirmChoice::Secondary && ValidateCallerBinding(caller)) {
+            if (GrantPublishTrust(app->appPrefs.extension_publish_trusted, publisher, caller.Package().id) && !app->isolatedTest)
+                app->appPrefs.Save();
         }
         if ((choice != ui::ConfirmChoice::Confirm && choice != ui::ConfirmChoice::Secondary) || !app ||
             !ValidateCallerBinding(caller) ||
@@ -129,7 +130,6 @@ StagingBackend MakeStagingBackend(HWND owner, CallerBinding caller) {
         if (!app || !ValidateCallerBinding(caller)) return {PULSE_ERROR_STATE, {}};
         ui::FolderPickerSpec spec;
         app::ApplyPickerAppearanceToSpec(app::PickerAppearanceFromPrefs(app->appPrefs), spec);
-        spec.show_hidden = app->appPrefs.show_hidden_files;
         spec.initial_path = initial;
         const bool isolated = app->isolatedTest;
         spec.on_dialog_event = [isolated](HWND window, ui::PickerDialogEvent event, const ui::PickerDialogSnapshot&, const std::wstring&) {
@@ -138,6 +138,7 @@ StagingBackend MakeStagingBackend(HWND owner, CallerBinding caller) {
         };
         std::wstring path;
         const bool chosen = ui::ShowFolderPicker(owner, spec, app->darkMode, app->accentColor, path);
+        if (auto* current = GetAppState(owner)) DeferOperationAutoShow(*current);
         return chosen && GetAppState(owner) && ValidateCallerBinding(caller)
             ? std::make_pair(PULSE_OK, std::move(path)) : std::make_pair(PULSE_ERROR_STATE, std::wstring{});
     };

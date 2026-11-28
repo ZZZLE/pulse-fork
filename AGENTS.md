@@ -1,5 +1,13 @@
 # Repository Guidelines
 
+## 强约束：不要偷懒，不要作弊
+
+- 对已授权的批量任务，一批完成并通过相关验证后，直接按优先级开展下一批，不以等待用户发送“继续”作为默认停点。维护已完成、待做、阻塞清单；单项受阻时先做其他独立项。范围内任务完成、用户叫停，或剩余工作确实需要用户决定或授权时再停。
+- 不得以计划、文档、扩展名清单、编译成功或模拟结果冒充功能交付。按影响范围验证真实生产路径；记录命令、样本、失败、结果及未验证边界。不得伪造、挑选有利测量、删除失败用例或降低断言来制造通过。
+- 宣称提速必须有同条件的新旧对照，区分后台请求、解码耗时和窗口首显。未测、未改善或退化要如实说明。不为凑批次数修改无证据的问题。
+- 视频优化以播放正常、预览流畅为验收前提。缩略图速度不可代替播放验收；涉及共享资源时，在后台抽帧负载下核对播放出帧、时钟、暂停和跳转，披露首帧或卡顿回退。不要用降低播放画质、帧率或关闭音轨换取跑分。
+- 连续执行不等于扩大授权：不得因此覆盖用户文件、安装发布、打断用户桌面或跳过必要审批。
+
 ## 工作范围与执行方式
 
 - 以用户当前请求和本次改动为边界，保留已有未提交修改，不顺手重构或修复无关问题。
@@ -37,7 +45,7 @@ cmake --build build --target pulse
 .\build_release.bat
 ```
 
-`build_release.bat` builds all Release targets; build one target during iteration. For the optional headless suite, configure with `-DPULSE_WITH_SELFTEST=ON`, then run `pulse.exe --selftest` and explicitly wait for it to exit.
+`build_release.bat` builds `pulse_package` (the programs the installer ships, no tests); build one target during iteration, and build test programs by name. For the optional headless suite, configure with `-DPULSE_WITH_SELFTEST=ON`, then run `pulse.exe --selftest` and explicitly wait for it to exit.
 
 `build_installer.bat` builds Release and packs `dist\PulseSetup-<version>.exe` with the Pulse setup (`src/setup` bootstrapper + `tools/pack_installer/pack_installer.py`, via `scripts/pack_setup.bat`; needs Python 3). `/skipbuild` packs the existing `build` folder; `build_win81_installer.bat` packs `build-win81` as `-win81`. The installer requires admin, optionally registers and starts the `PulseIndex` service for full-disk MFT/USN indexing, and removes it on uninstall. Crash logs live in `%LOCALAPPDATA%\Pulse` (`pulse_crash.log`, `pulse_shell_host.log`) so installed copies under Program Files can write them.
 

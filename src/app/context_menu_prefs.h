@@ -7,11 +7,21 @@
 #pragma once
 #include "../ipc/ctx_menu_util.h"
 #include "builtin_menu_items.h"
+#include <map>
+#include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace pulse::app {
+
+enum class ExtensionMenuPlacement : uint8_t {
+    Default = 0,
+    Flat = 1,
+    Submenu = 2,
+    Hidden = 3,
+};
 
 struct SeenMenuItem {
     std::wstring key;
@@ -19,6 +29,13 @@ struct SeenMenuItem {
     bool flyout = false;
     bool from_com = false;
     ipc::CtxMenuCategory category = ipc::CtxMenuCategory::Software;
+    bool tree_node = false;
+    std::wstring parent_key;
+    std::wstring root_key; // Legacy handler/catalog root, for settings navigation.
+    std::wstring source;
+    uint32_t depth = 0;
+    uint32_t default_order = 0; // Latest observed direct-sibling position, not identity.
+    bool configurable = true; // False for ambiguous sibling identity or ancestry.
 };
 
 struct SlowComExt {
@@ -53,13 +70,21 @@ struct ContextMenuPrefs {
 
     std::unordered_map<std::wstring, bool> item_enabled;
     std::vector<SeenMenuItem> seen;
+    std::map<std::wstring, std::vector<std::wstring>> node_order;
     std::unordered_map<std::wstring, SlowComExt> slow_ext;
     // Pulse's own menu rows / row buttons the user turned off (BuiltinMenuBit).
     uint64_t builtin_hidden = 0;
     // Their order per BuiltinMenuSurface; empty = table order.
     BuiltinMenuOrder builtin_order[static_cast<size_t>(BuiltinMenuSurface::Count)];
+    // Native extension context-menu overrides (UTF-8 package_id / "native:<pkg>:<cmd>").
+    std::map<std::string, ExtensionMenuPlacement> extension_placement;
+    std::set<std::string> extension_hidden_commands;
 
     void ResetToDefaults();
+    ExtensionMenuPlacement PlacementForExtension(std::string_view package_id) const;
+    void SetExtensionPlacement(std::string_view package_id, ExtensionMenuPlacement placement);
+    bool ExtensionCommandVisible(std::string_view identity) const;
+    void SetExtensionCommandVisible(std::string_view identity, bool on);
     // Re-keys the seen catalog through CatalogKey and carries the per-item
     // overrides onto the new keys; run whenever the catalog is loaded.
     void MigrateSeenKeys();
@@ -81,6 +106,16 @@ struct ContextMenuPrefs {
     std::vector<std::wstring> DisabledHandlerClsids() const;
     bool RecordSeen(const std::wstring& key, const std::wstring& text, bool flyout,
                     ipc::CtxMenuCategory category, bool from_com = false);
+    bool RecordSeenNode(SeenMenuItem item);
+    bool RecordSeenNodes(std::vector<SeenMenuItem> items);
+    std::vector<SeenMenuItem> NodeChildren(const std::wstring& parent_key,
+                                         const std::wstring& root_key = L"") const;
+    bool NodeEnabled(const std::wstring& key) const;
+    bool SetNodeEnabled(const std::wstring& key, bool on);
+    std::vector<std::wstring> NodeOrder(const std::wstring& parent_key) const;
+    bool SetNodeOrder(const std::wstring& parent_key, const std::vector<std::wstring>& keys);
+    bool MoveNode(const std::wstring& key, int direction);
+    bool ResetNodeGroup(const std::wstring& parent_key);
     // key: "h:{CLSID}" of a handler the host reported hung. Returns true if
     // prefs changed.
     bool RecordComTiming(const std::wstring& key, uint32_t elapsed_ms);
@@ -102,6 +137,7 @@ struct ContextMenuPrefs {
     bool FromJson(const std::wstring& json);
     bool Load();
     bool Save() const;
+    bool SaveAsync() const;
 
 private:
     void CoalesceCompressCatalog();

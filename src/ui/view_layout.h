@@ -108,8 +108,8 @@ inline constexpr float IconGridNameBlockDip(int lines) noexcept {
 float IconGridNameWidth(ViewMode mode, float scale, float icon_dip = 0.0f) noexcept;
 // Name lines for a whole folder from the lines each sampled name needs: one
 // only when 95% fit on one line, otherwise what 75% need, kept to 2..4.
-// Folders show their size on the last line, so a folder holding subfolders
-// keeps at least two. Sorts `needed`.
+// Folders show their size on an additional last line, so a folder holding
+// subfolders keeps at least two name lines plus one size line. Sorts `needed`.
 int AutoIconNameLines(std::vector<int>& needed, bool has_folders) noexcept;
 
 // Photo wall (P2): justified rows of one height, each item as wide as its
@@ -132,15 +132,37 @@ struct WallRows {
 // last one keeps row_px unless filling it stretches less than 1.25x.
 WallRows BuildWallRows(const std::vector<float>& aspects, float width, float row_px, float scale, const std::atomic<uint64_t>* generation = nullptr, uint64_t expected = 0);
 
+// List view sized like File Explorer: each column as wide as its own longest
+// name (icon and paddings included), between the min and the max; a longer
+// name is cut with an ellipsis. Until names are measured: the default width.
+inline constexpr float kListRowDip = 24.0f;
+inline constexpr float kListColumnDefaultDip = 220.0f;
+inline constexpr float kListColumnMinDip = 72.0f;
+inline constexpr float kListColumnMaxDip = 800.0f;
+inline constexpr float kListItemChromeDip = 48.0f;  // icon, paddings and the gap to the next column
+// Rows of one List column for a viewport this tall (what ViewLayout uses).
+int ListRowsPerColumn(float viewport_height, float scale) noexcept;
+struct ListColumns {
+    int rows_per_column = 0;   // the split these columns were built for
+    std::vector<float> left;   // content x of each column; back(): content width (columns + 1 values)
+};
+// Columns for view rows whose names are text_px wide, rows_per_column per column.
+ListColumns BuildListColumns(const std::vector<float>& text_px, int rows_per_column, float scale);
+
 // Size inputs of a pane's layout; a plain row height converts implicitly.
 struct ViewLayoutParams {
-    ViewLayoutParams(float row_height = 0.0f, float icon = 0.0f) noexcept
-        : row_height_dip(row_height), icon_dip(icon) {}
+    ViewLayoutParams(float row_height = 0.0f, float icon = 0.0f,
+                     float name_line = kIconGridNameLineDip) noexcept
+        : row_height_dip(row_height), icon_dip(icon), icon_name_line_dip(name_line) {}
     // >0: Details row height override; icon grids: name block (IconGridNameBlockDip)
     float row_height_dip;
     float icon_dip;  // icon grids: thumbnail width in DIP (0 = the mode's preset)
+    float icon_name_line_dip; // icon grids: enough height for the current UI font
     // Icon grids shown as a photo wall: its rows (for this item count), else null.
     const WallRows* wall = nullptr;
+    // List view: measured columns; used only when built for this viewport's
+    // rows per column and item count, else every column keeps the default width.
+    const ListColumns* list_columns = nullptr;
 };
 
 struct ViewLayoutMetrics {
@@ -162,6 +184,7 @@ struct ViewLayoutMetrics {
     float pitch_x = 0.0f;
     float pitch_y = 0.0f;
     int name_lines = kIconGridNameLines;  // icon grids
+    float name_line_px = 0.0f;
 };
 
 // Pure, O(1) virtual geometry. Coordinates returned by ItemRect are in the
@@ -215,6 +238,10 @@ private:
     int GroupedIndexAt(float local_y, bool last) const noexcept;
     int VisibleOrdinal(int index) const noexcept;
     int IndexFromOrdinal(int ordinal) const noexcept;
+    // List view: the column under content x (clamped), and a column's span.
+    int ListColumnAt(float content_x) const noexcept;
+    float ListColumnLeft(int column) const noexcept;
+    float ListColumnWidth(int column) const noexcept;
     ViewMode mode_ = ViewMode::Details;
     D2D1_RECT_F viewport_{};
     size_t count_ = 0;
@@ -233,6 +260,7 @@ private:
     float band_bottom_ = 0.0f;
     int visible_rows_ = 0;           // rows outside collapsed groups
     const WallRows* wall_ = nullptr; // photo wall rows (icon grids), not owned
+    const std::vector<float>* list_left_ = nullptr; // measured List columns, not owned
 };
 
 } // namespace pulse::ui

@@ -34,10 +34,18 @@ bool NeedsLinkResolution(const fs::DirEntry& entry) {
     return _wcsicmp(suffix, L".lnk") == 0 || _wcsicmp(suffix, L".url") == 0;
 }
 
+bool EntryQueryConfirmedAbsent() {
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
 } // namespace
 
 bool FillDirEntry(const std::wstring& dir, const std::wstring& name, fs::DirEntry& out) {
-    if (name.empty() || name.find_first_of(L"\\/") != std::wstring::npos) return false;
+    if (name.empty() || name.find_first_of(L"\\/") != std::wstring::npos) {
+        SetLastError(ERROR_INVALID_NAME);
+        return false;
+    }
     const std::wstring full = fs::NormalizePath(ChildPath(dir, name));
     WIN32_FIND_DATAW data{};
     const HANDLE find = FindFirstFileExW(full.c_str(), FindExInfoBasic, &data,
@@ -81,21 +89,26 @@ NotifyPatch ApplyDirNotify(std::vector<fs::DirEntry>& entries, const std::wstrin
             return NotifyPatch::NeedFullEnum;
         fs::DirEntry entry;
         if (!FillDirEntry(folder, event.name, entry)) {
+            // Access/sharing/provider failures do not establish that the file disappeared.
+            if (!EntryQueryConfirmedAbsent()) return NotifyPatch::NeedFullEnum;
             if (at >= 0) entries.erase(entries.begin() + at);
             return NotifyPatch::Applied;
         }
         if (NeedsLinkResolution(entry)) return NotifyPatch::NeedFullEnum;
-        // The renamed row keeps its place (#13); a row already holding the
-        // new name gives way to it.
-        int slot = at;
+        // An atomic overwrite replaces the target identity, then repositions it
+        // whenever its ordering key changed, just like a normal modification.
+        int slot = -1;
         const int dup = FindName(entries, event.name);
-        if (dup >= 0 && dup != at) {
+        if (dup >= 0 && dup == at) {
+            slot = at;
+        } else if (dup >= 0) {
+            slot = dup;
             if (at >= 0) {
-                entries.erase(entries.begin() + dup);
-                if (dup < at) --slot;
-            } else {
-                slot = dup;
+                entries.erase(entries.begin() + at);
+                if (at < slot) --slot;
             }
+        } else if (at >= 0) {
+            entries.erase(entries.begin() + at);
         }
         PlaceEntryHeld(entries, slot, std::move(entry), col, sort_dir);
         return NotifyPatch::Applied;
@@ -107,16 +120,13 @@ NotifyPatch ApplyDirNotify(std::vector<fs::DirEntry>& entries, const std::wstrin
             return NotifyPatch::NeedFullEnum;
         fs::DirEntry entry;
         if (!FillDirEntry(folder, event.name, entry)) {
+            // Access/sharing/provider failures do not establish that the file disappeared.
+            if (!EntryQueryConfirmedAbsent()) return NotifyPatch::NeedFullEnum;
             if (at >= 0) entries.erase(entries.begin() + at);
             return NotifyPatch::Applied;
         }
         if (NeedsLinkResolution(entry)) return NotifyPatch::NeedFullEnum;
-        if (at >= 0 && !SameEntrySortPosition(entries[static_cast<size_t>(at)], entry, col, sort_dir)) {
-            entries.erase(entries.begin() + at);
-            InsertAtGroupEnd(entries, std::move(entry), col, sort_dir);
-        } else {
-            PlaceEntryHeld(entries, at, std::move(entry), col, sort_dir);
-        }
+        PlaceEntryHeld(entries, at, std::move(entry), col, sort_dir);
         return NotifyPatch::Applied;
     }
 
@@ -175,6 +185,10 @@ PreparedDirNotifyBatch PrepareDirNotifyBatch(const std::wstring& folder,
                 return prepared;
             }
             value = std::move(entry);
+        } else if (!EntryQueryConfirmedAbsent()) {
+            // Keep the whole snapshot intact; retry through the listing worker.
+            prepared.need_full_enum = true;
+            return prepared;
         }
         prepared.metadata.emplace(event.name, std::move(value));
     }
@@ -209,15 +223,19 @@ NotifyPatch ApplyPreparedDirNotifyBatch(std::vector<fs::DirEntry>& entries,
             ? event.old_name : event.name;
         const size_t at = find(old_name);
         if (at != kNone && NeedsLinkResolution(entries[at])) return NotifyPatch::NeedFullEnum;
+        if (event.action == FILE_ACTION_RENAMED_NEW_NAME) {
+            const size_t target = find(event.name);
+            if (target != kNone && NeedsLinkResolution(entries[target])) return NotifyPatch::NeedFullEnum;
+        }
         const auto& entry = stat(event.name);
         if (entry && NeedsLinkResolution(*entry)) return NotifyPatch::NeedFullEnum;
     }
 
-    // Replays the per-event rules on slots instead of a vector: rows keep
-    // their slot, and a row that has to move (new, or its sort key changed) gets
-    // a new slot after every original one. Appended slots are merged in at
-    // their sort position: a pasted or extracted item shows up where it
-    // belongs right away, while renamed rows stay put (#13).
+    // Replays the per-event rules on slots instead of a vector: a modified row
+    // keeps its slot only when its ordering key is equivalent. A changed key
+    // (including group/folder placement) gets a new slot after the originals.
+    // Appended slots are merged in at their sort position: a pasted, extracted
+    // or renamed item shows up where it belongs right away.
     struct Slot {
         fs::DirEntry entry;
         bool live = true;
@@ -226,16 +244,35 @@ NotifyPatch ApplyPreparedDirNotifyBatch(std::vector<fs::DirEntry>& entries,
     slots.reserve(entries.size() + events.size());
     for (auto& entry : entries) slots.push_back({std::move(entry), true});
     const size_t original = slots.size();
+    // Original rows dropped by this batch, by name. Only those rows: a batch
+    // touches a handful of names, the folder may hold 100k.
+    std::unordered_map<std::wstring, size_t, FoldedNameHash, FoldedNameEqual> dropped_original;
     const auto drop = [&](size_t slot) {
-        if (slot == kNone) return;
-        where.erase(slots[slot].entry.name);
+        if (slot == kNone || !slots[slot].live) return;
+        const auto it = where.find(slots[slot].entry.name);
+        if (it != where.end() && it->second == slot) where.erase(it);
         slots[slot].live = false;
+        if (slot < original) dropped_original.emplace(slots[slot].entry.name, slot);
     };
-    const auto place = [&](size_t slot, fs::DirEntry entry, bool renamed) {
-        if (slot != kNone && SameEntryGroup(slots[slot].entry, entry, col, sort_dir) &&
-            (renamed || SameEntrySortPosition(slots[slot].entry, entry, col, sort_dir))) {
-            where.erase(slots[slot].entry.name);
+    // Atomic saves replace an original row: REMOVED + ADDED/RENAMED, or
+    // RENAMED(target -> backup) + RENAMED(temp -> target). The saved file takes
+    // its own identity back; `place` still repositions changed ordering keys.
+    // A dropped slot still holds the row's last entry, which `place` compares.
+    const auto reclaim = [&](const std::wstring& name) -> size_t {
+        const auto it = dropped_original.find(name);
+        if (it == dropped_original.end() || slots[it->second].live) return kNone;
+        const size_t slot = it->second;
+        dropped_original.erase(it);
+        return slot;
+    };
+    const auto place = [&](size_t slot, fs::DirEntry entry) {
+        if (slot != kNone && SameEntrySortPosition(slots[slot].entry, entry, col, sort_dir)) {
+            if (slots[slot].live) {
+                const auto cur = where.find(slots[slot].entry.name);
+                if (cur != where.end() && cur->second == slot) where.erase(cur);
+            }
             slots[slot].entry = std::move(entry);
+            slots[slot].live = true;
             where[slots[slot].entry.name] = slot;
             return;
         }
@@ -255,18 +292,28 @@ NotifyPatch ApplyPreparedDirNotifyBatch(std::vector<fs::DirEntry>& entries,
                 drop(at);
                 continue;
             }
-            size_t slot = at;
             const size_t dup = find(event.name);
-            if (dup != kNone && dup != at) {
-                if (at != kNone) drop(dup);
-                else slot = dup;
+            size_t slot = kNone;  // a real rename: merged in at its sort position
+            if (dup != kNone && dup == at) {
+                slot = at;  // place checks the current ordering key
+            } else if (dup != kNone) {
+                drop(at);   // renamed over a row on screen (temp -> target save)
+                slot = dup;
+            } else {
+                drop(at);
+                slot = reclaim(event.name);  // over a row removed earlier in this batch
             }
-            place(slot, *entry, true);
+            place(slot, *entry);
             continue;
         }
         const auto& entry = stat(event.name);
-        if (!entry) drop(find(event.name));
-        else place(find(event.name), *entry, false);
+        size_t slot = find(event.name);
+        if (!entry) {
+            drop(slot);
+            continue;
+        }
+        if (slot == kNone) slot = reclaim(event.name);  // delete + recreate save
+        place(slot, *entry);
     }
 
     std::vector<size_t> appended;

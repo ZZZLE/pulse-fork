@@ -170,6 +170,7 @@ void MarkdownView::Clear() {
     toc_follow_ = true;
     scroll_ = 0.0f;
     scroll_x_ = 0.0f;
+    scrollbar_hover_ = 0;
     relayout_ = true;
     doc_height_ = 0.0f;
 }
@@ -232,8 +233,8 @@ bool MarkdownView::SetPayloadImpl(const std::wstring& payload, const std::wstrin
             toc_.push_back(std::move(entry));
         } else if (f[0] == L"M" && f.size() >= 2) {
             format_.assign(f[1]);
-            if (format_ == L"docx" && f.size() >= 3) words_ = ToU32(f[2]);
-            if (f.size() >= 3 && format_ != L"docx") doc_title_ = Unescape(f[2]);
+            if ((format_ == L"docx" || format_ == L"doc" || format_ == L"rtf") && f.size() >= 3) words_ = ToU32(f[2]);
+            if (f.size() >= 3 && format_ != L"docx" && format_ != L"doc" && format_ != L"rtf") doc_title_ = Unescape(f[2]);
             if (f.size() >= 4) doc_author_ = Unescape(f[3]);
         } else if (f[0] == L"I" && f.size() >= 3) {
             notebook_ = true;
@@ -732,6 +733,22 @@ bool MarkdownView::Draw(ID2D1DeviceContext* dc, IDWriteFactory2* factory, const 
     const bool repaint = DrawDocument(dc, factory, doc, theme, dark, scale, images, generation,
                                       sel_start, sel_end, matches);
     if (toc_rect_.right > toc_rect_.left) DrawToc(dc, toc_rect_, theme, dark);
+    if (!format_.empty() && !CurrentSectionHasContent() && brush_) {
+        const std::wstring message = pulse::l10n::Get(pulse::l10n::StringId::PreviewNativeDocumentEmpty);
+        const float width = (std::max)(1.0f, doc.right - doc.left - 48.0f * scale);
+        const float height = (std::max)(1.0f, doc.bottom - doc.top);
+        WrlPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(factory->CreateTextLayout(message.data(), static_cast<UINT32>(message.size()),
+                body_.Get(), width, height, &layout))) {
+            layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            brush_->SetColor(WithAlpha(theme.text, 0.7f));
+            dc->PushAxisAlignedClip(doc, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            dc->DrawTextLayout(D2D1::Point2F(doc.left + 24.0f * scale, doc.top), layout.Get(), brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            dc->PopAxisAlignedClip();
+        }
+    }
     return repaint;
 }
 
@@ -974,7 +991,8 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
         const float fy = oy + footer_y_;
         brush_->SetColor(line);
         dc->FillRectangle(R(origin_x_, fy, origin_x_ + W, fy + 1.0f * s), brush_.Get());
-        std::wstring label = pulse::l10n::Get(pulse::l10n::StringId::NextChapter).c_str();
+        std::wstring label = pulse::l10n::Get(format_ == L"ppt" || format_ == L"pptx"
+            ? pulse::l10n::StringId::PreviewNextSlide : pulse::l10n::StringId::NextChapter).c_str();
         const std::wstring& name = sections_[section_ + 1].name;
         if (!name.empty()) label += L"  ·  " + name.substr(0, 60);
         label += L"  ›";
@@ -995,8 +1013,10 @@ bool MarkdownView::DrawDocument(ID2D1DeviceContext* dc, IDWriteFactory2* factory
     for (bool horizontal : {false, true}) {
         const auto bar = Scrollbar(horizontal);
         if (bar.maximum <= 0.0f) continue;
-        brush_->SetColor(WithAlpha(theme.text, 0.25f));
-        dc->FillRoundedRectangle(D2D1::RoundedRect(bar.thumb, 1.5f * s, 1.5f * s), brush_.Get());
+        const int axis = horizontal ? 2 : 1;
+        const float alpha = scrollbar_drag_ == axis ? 0.45f : scrollbar_hover_ == axis ? 0.36f : 0.25f;
+        brush_->SetColor(WithAlpha(theme.text, alpha));
+        dc->FillRoundedRectangle(D2D1::RoundedRect(bar.thumb, 2.0f * s, 2.0f * s), brush_.Get());
     }
     dc->PopAxisAlignedClip();
     return repaint;
@@ -1016,18 +1036,19 @@ MarkdownView::ScrollbarGeometry MarkdownView::Scrollbar(bool horizontal) const {
     if (extent <= viewport + 1.0f) return bar;
     const bool other = horizontal ? doc_height_ > height + 1.0f : extent_x > width + 1.0f;
     const float start = (horizontal ? view_.left : view_.top) + 4.0f * scale_;
-    const float track = (std::max)(0.0f, viewport - (other ? 16.0f : 8.0f) * scale_);
+    const float track = (std::max)(0.0f, viewport - (other ? 18.0f : 8.0f) * scale_);
     const float thumb = (std::min)(track, (std::max)(24.0f * scale_, track * viewport / extent));
     bar.maximum = extent - viewport;
     bar.travel = track - thumb;
     const float position = horizontal ? scroll_x_ : scroll_;
     const float offset = start + bar.travel * std::clamp(position / bar.maximum, 0.0f, 1.0f);
+    // Keep the painted thumb clear of Quick Look's outer 3 DIP resize edge.
     if (horizontal) {
-        bar.hit = R(start, (std::max)(view_.top, view_.bottom - 12.0f * scale_), start + track, view_.bottom);
-        bar.thumb = R(offset, view_.bottom - 6.0f * scale_, offset + thumb, view_.bottom - 3.0f * scale_);
+        bar.hit = R(start, (std::max)(view_.top, view_.bottom - 14.0f * scale_), start + track, view_.bottom);
+        bar.thumb = R(offset, view_.bottom - 9.0f * scale_, offset + thumb, view_.bottom - 5.0f * scale_);
     } else {
-        bar.hit = R((std::max)(view_.left, view_.right - 12.0f * scale_), start, view_.right, start + track);
-        bar.thumb = R(view_.right - 6.0f * scale_, offset, view_.right - 3.0f * scale_, offset + thumb);
+        bar.hit = R((std::max)(view_.left, view_.right - 14.0f * scale_), start, view_.right, start + track);
+        bar.thumb = R(view_.right - 9.0f * scale_, offset, view_.right - 5.0f * scale_, offset + thumb);
     }
     return bar;
 }
@@ -1039,6 +1060,27 @@ bool MarkdownView::OverScrollbar(float x, float y) const {
             y >= bar.hit.top && y < bar.hit.bottom) return true;
     }
     return false;
+}
+
+bool MarkdownView::ScrollbarHover(float x, float y) {
+    int hit = 0;
+    for (bool horizontal : {false, true}) {
+        const auto bar = Scrollbar(horizontal);
+        if (bar.maximum > 0.0f && x >= bar.hit.left && x < bar.hit.right &&
+            y >= bar.hit.top && y < bar.hit.bottom) {
+            hit = horizontal ? 2 : 1;
+            break;
+        }
+    }
+    if (hit == scrollbar_hover_) return false;
+    scrollbar_hover_ = hit;
+    return true;
+}
+
+bool MarkdownView::Leave() {
+    if (scrollbar_hover_ == 0) return false;
+    scrollbar_hover_ = 0;
+    return true;
 }
 
 bool MarkdownView::ScrollbarMouseDown(float x, float y) {
@@ -1166,6 +1208,15 @@ std::wstring MarkdownView::LinkAt(float x, float y) const {
         if ((run.flags & kLink) && m.textPosition >= run.start && m.textPosition < run.start + run.length)
             return run.target;
     return {};
+}
+
+bool MarkdownView::CurrentSectionHasContent() const noexcept {
+    for (const auto& block : blocks_) {
+        if (block.image) return true;
+        for (const wchar_t c : block.text)
+            if (c != L' ' && c != L'\t' && c != L'\r' && c != L'\n' && c != 0x3000) return true;
+    }
+    return false;
 }
 
 void MarkdownView::Reveal(uint32_t offset) {

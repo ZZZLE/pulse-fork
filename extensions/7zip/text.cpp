@@ -1,6 +1,8 @@
 #include "text.h"
 #include <windows.h>
 #include <array>
+#include <atomic>
+#include <string>
 
 namespace text {
 namespace {
@@ -60,6 +62,7 @@ constexpr Row kRows[] = {
     {Id::ErrCommit, "无法把结果交给 Pulse 发布。", "無法把結果交給 Pulse 發佈。", "Cannot hand the result to Pulse."},
     {Id::ErrLinks, "已跳过 {name} 个链接（不会解压符号链接或硬链接）。", "已略過 {name} 個連結（不會解壓縮符號連結或硬連結）。", "Skipped {name} link(s): symbolic and hard links are not extracted."},
     {Id::ErrSkipped, "已跳过 {name} 个链接或连接点（不会跟随）。", "已略過 {name} 個連結或連接點（不會跟隨）。", "Skipped {name} link(s) or junction(s); they are not followed."},
+    {Id::ErrUnsafePath, "压缩包里有不安全的路径，已停止以免写到目标文件夹之外：", "壓縮檔中有不安全的路徑，已停止以免寫到目標資料夾之外：", "The archive contains a path that could write outside the destination, so it was stopped: "},
     {Id::WaitingHost, "等待确认并写入文件…", "等待確認並寫入檔案…", "Waiting for confirmation and writing files…"},
     {Id::TestOk, "测试通过，没有发现错误。", "測試通過，沒有發現錯誤。", "Test passed; no errors found."},
     {Id::SettingsTitle, "7-Zip", "7-Zip", "7-Zip"},
@@ -137,8 +140,119 @@ constexpr Row kRows[] = {
     {Id::RememberTitle, "记住本次输入的密码", "記住本次輸入的密碼", "Remember passwords this session"},
     {Id::RememberDesc, "解压时先自动尝试，只保存在内存中，退出 Pulse 即清除", "解壓縮時先自動嘗試，只保存在記憶體中，結束 Pulse 即清除", "Tried first when extracting; kept in memory only and cleared when Pulse exits"},
     {Id::RarNote, "RAR 只能解压：7-Zip 不提供 RAR 压缩。", "RAR 只能解壓縮：7-Zip 不提供 RAR 壓縮。", "RAR can be extracted only: 7-Zip cannot create RAR archives."},
+    {Id::MenuSection, "右键菜单", "右鍵選單", "Context menu"},
+    {Id::PlacementTitle, "菜单位置", "選單位置", "Placement"},
+    {Id::PlacementDesc, "7-Zip 命令在右键菜单里的位置", "7-Zip 命令在右鍵選單中的位置", "Where the 7-Zip commands appear in the context menu"},
+    {Id::PlacementTop, "直接显示在第一层", "直接顯示在第一層", "Right in the menu"},
+    {Id::PlacementTopDesc, "常用命令一步可达，标题下方说明结果", "常用命令一步可達，標題下方說明結果", "One click away, with the result shown under each command"},
+    {Id::PlacementSub, "收进“7-Zip”子菜单", "收進「7-Zip」子選單", "In a 7-Zip submenu"},
+    {Id::PlacementSubDesc, "菜单更短，多一步点击", "選單更短，多一步點擊", "A shorter menu, one more click"},
+    {Id::CommandsTitle, "显示的命令", "顯示的命令", "Commands shown"},
+    {Id::CommandsDesc, "关闭的命令不再出现在右键菜单里；选中的文件不适用时命令本来就不会出现", "關閉的命令不再出現在右鍵選單中；選取的檔案不適用時命令本來就不會出現", "Commands turned off leave the context menu; a command only appears when the selection suits it anyway"},
+    {Id::CmdExtractSwitch, "解压（按上方选择的方式）", "解壓縮（依上方選擇的方式）", "Extract (as chosen above)"},
+    {Id::CmdQuickSwitch, "快速压缩（按上方的格式和等级）", "快速壓縮（依上方的格式與等級）", "Quick compress (format and level above)"},
+    {Id::HintSmart, "解压到 {stem}\\，单层直接放出", "解壓縮到 {stem}\\，單層直接放出", "To {stem}\\, or as is if single"},
+    {Id::HintFolder, "解压到 {stem}\\", "解壓縮到 {stem}\\", "To {stem}\\"},
+    {Id::HintHere, "解压到当前文件夹", "解壓縮到目前資料夾", "Into this folder"},
+    {Id::HintFixed, "解压到 {name}\\{stem}\\", "解壓縮到 {name}\\{stem}\\", "To {name}\\{stem}\\"},
+    {Id::HintFixedHere, "解压到 {name}", "解壓縮到 {name}", "Into {name}"},
+    {Id::HintQuick, "保存为 {base}{name} · {count}", "儲存為 {base}{name} · {count}", "Saves {base}{name} · {count}"},
+    {Id::HintTar, "保存为 {base}.tar", "儲存為 {base}.tar", "Saves {base}.tar"},
+    {Id::DialogCaption, "Pulse · 7-Zip", "Pulse · 7-Zip", "Pulse · 7-Zip"},
+    {Id::StepUnpack, "解压到临时位置", "解壓縮到暫存位置", "Unpack to a temporary folder"},
+    {Id::StepWrite, "写入目标 · 可撤销", "寫入目標 · 可復原", "Write to the destination · undoable"},
+    {Id::NoteUnpack, "解压完成前目标文件夹不会改动", "解壓縮完成前目標資料夾不會變動", "The destination stays unchanged until unpacking finishes"},
+    {Id::NoteWrite, "写入后可以撤销", "寫入後可以復原", "You can undo this once it is written"},
+    {Id::NoteCompress, "取消后不会留下不完整的压缩包", "取消後不會留下不完整的壓縮檔", "Cancelling leaves no partial archive behind"},
+    {Id::SafeUnchanged, "目标文件夹没有任何改动，临时文件已清理。", "目標資料夾沒有任何變動，暫存檔已清除。", "Nothing in the destination changed, and temporary files were removed."},
+    {Id::SafeNoArchive, "没有留下不完整的压缩包，临时文件已清理。", "沒有留下不完整的壓縮檔，暫存檔已清除。", "No partial archive was left behind, and temporary files were removed."},
+    {Id::DetailWrongPassword, "可以重新输入，或者检查大小写和输入法。", "可以重新輸入，或檢查大小寫和輸入法。", "Try again, and check Caps Lock and the input method."},
+    {Id::DetailDamaged, "数据和记录的校验值不一致，可能下载不完整或磁盘出错。", "資料和記錄的校驗值不一致，可能下載不完整或磁碟出錯。", "The data does not match its recorded checksum; the download may be incomplete or the disk may have errors."},
+    {Id::ActionRetry, "重试", "重試", "Retry"},
+    {Id::ActionPassword, "重新输入密码", "重新輸入密碼", "Enter password again"},
+    {Id::RememberSwitch, "记住本次输入的密码", "記住本次輸入的密碼", "Remember this password"},
+    {Id::ResultExtracted, "已解压到 {name}", "已解壓縮到 {name}", "Extracted to {name}"},
+    {Id::ResultCompressed, "已压缩为 {name}", "已壓縮為 {name}", "Compressed to {name}"},
+    {Id::ResultItems, "{count} 个项目", "{count} 個項目", "{count} items"},
+    {Id::ResultTook, "用时 {count} 秒", "用時 {count} 秒", "took {count} s"},
+    {Id::TestOkDetail, "{count} 个文件全部读出，校验值一致。", "{count} 個檔案全部讀出，校驗值一致。", "All {count} files read back with matching checksums."},
+    {Id::StatFiles, "文件", "檔案", "Files"},
+    {Id::StatUnpacked, "解压后", "解壓縮後", "Unpacked"},
+    {Id::StatRatio, "压缩率", "壓縮率", "Ratio"},
+    {Id::StatFormat, "格式", "格式", "Format"},
+    {Id::StatTime, "用时", "用時", "Time"},
+    {Id::StatCount, "{count} 个", "{count} 個", "{count}"},
+    {Id::StatRatioValue, "压缩到 {count}%", "壓縮到 {count}%", "{count}% of original"},
+    {Id::StatSeconds, "{count} 秒", "{count} 秒", "{count} s"},
+    {Id::Done, "完成", "完成", "Done"},
+    {Id::RememberSwitchDesc, "本次运行期间，同一密码的其他压缩包自动解开", "本次執行期間，同一密碼的其他壓縮檔自動解開", "Until Pulse exits, other archives with this password open by themselves"},
+    {Id::ErrWorkerCrashed, "7-Zip 工作进程意外退出，Pulse 未受影响。", "7-Zip 工作行程意外結束，Pulse 未受影響。", "The 7-Zip worker stopped unexpectedly. Pulse was not affected."},
+    {Id::ErrWorkerTimedOut, "7-Zip 工作进程响应超时，已安全终止。", "7-Zip 工作行程回應逾時，已安全終止。", "The 7-Zip worker stopped responding and was safely terminated."},
+    {Id::ErrWorkerMemory, "压缩包所需内存超出安全上限，已终止工作进程。", "壓縮檔所需記憶體超出安全上限，已終止工作行程。", "The archive exceeded the worker memory limit and was safely stopped."},
+    {Id::DetailWorkerIsolated, "解码在独立受限进程中运行；Pulse 主程序未受影响，可按需重试。", "解碼在獨立受限行程中執行；Pulse 主程式未受影響，可按需重試。", "Decoding runs in an isolated worker process; Pulse was not affected and you can retry."},
+    {Id::TakeFailed, "无法写入文件关联，请稍后重试", "無法寫入檔案關聯，請稍後重試", "Could not write the file associations. Try again later."},
+    {Id::TypeArchive, "{name} 压缩文件", "{name} 壓縮檔", "{name} archive"},
+    {Id::TypeBundle, "{name} 归档文件", "{name} 封存檔", "{name} archive"},
+    {Id::TypeCab, "CAB 安装包", "CAB 安裝套件", "CAB package"},
+    {Id::VerbPreview, "在 Pulse 中打开", "在 Pulse 中開啟", "Open in Pulse"},
+    {Id::AppDescription, "用 Pulse 和 7-Zip 解压与预览压缩包", "用 Pulse 和 7-Zip 解壓縮與預覽壓縮檔", "Extract and preview archives with Pulse and 7-Zip"},
+    {Id::CmdBrowseArchive, "打开浏览", "開啟瀏覽", "Open archive"},
+    {Id::CmdBrowseDetail, "在当前标签页浏览压缩包内文件", "在目前分頁瀏覽壓縮檔內檔案", "Browse archive contents in Pulse"},
+    {Id::TabGeneral, "常规设置", "一般設定", "General"},
+    {Id::TabFormats, "支持格式", "支援格式", "Formats"},
+    {Id::FormatsRwTitle, "读取与写入", "讀取與寫入", "Read & write"},
+    {Id::FormatsRoTitle, "只读浏览与解压", "唯讀瀏覽與解壓", "Read-only"},
+    {Id::SidePreviewTitle, "右键菜单效果", "右鍵選單效果", "Menu preview"},
+    {Id::SidePreviewDetail, "示例：backup.zip", "範例：backup.zip", "Sample: backup.zip"},
+    {Id::VfsUnavailable, "当前无法打开虚拟目录，请改用提取功能。", "目前無法開啟虛擬目錄，請改用解壓縮功能。", "Archive browsing is unavailable right now."},
+    {Id::TakeSection, "接管压缩包", "接管壓縮檔", "Archive files"},
+    {Id::TakeTitle, "接管压缩包", "接管壓縮檔", "Open archives with Pulse"},
+    {Id::TakeDesc, "双击压缩包直接用 Pulse 解压，压缩包换上按格式区分的图标。别的压缩软件正在打开的格式不动，点下面的格式可以单独开关。关掉时恢复原来的关联。", "按兩下壓縮檔直接用 Pulse 解壓，壓縮檔換上依格式區分的圖示。其他壓縮軟體正在開啟的格式不動，點下面的格式可以單獨開關。關閉時還原原來的關聯。", "Double-click an archive to extract it with Pulse, and give archives an icon for each format. Formats another archiver opens are left alone; click a format below to include or skip it. Turning this off restores the previous associations."},
+    {Id::TakeBusy, "正在注册图标和关联，并通知资源管理器刷新图标…", "正在註冊圖示和關聯，並通知檔案總管重新整理圖示…", "Registering icons and associations, and asking File Explorer to refresh…"},
+    {Id::TakeWinSettings, "在 Windows 里一次设好", "在 Windows 裡一次設好", "Set them all in Windows"},
+    {Id::TakeConfirmEach, "逐个确认", "逐一確認", "Confirm one by one"},
+    {Id::TakeAskSet, "设为 Pulse…", "設為 Pulse…", "Use Pulse…"},
+    {Id::TakeAskChange, "改为 Pulse…", "改為 Pulse…", "Switch to Pulse…"},
+    {Id::DblTitle, "双击压缩包时", "按兩下壓縮檔時", "When you double-click an archive"},
+    {Id::DblDesc, "右键菜单里的命令不变", "右鍵選單裡的命令不變", "Context menu commands stay the same"},
+    {Id::DblOpen, "在 Pulse 里打开", "在 Pulse 裡開啟", "Open in Pulse"},
+    {Id::DblOpenDesc, "先看里面有什么，不解压", "先看裡面有什麼，不解壓", "See what is inside without extracting"},
+    {Id::TakeStatusExtract, "Pulse 智能解压", "Pulse 智慧解壓", "Pulse smart extract"},
+    {Id::TakeStatusOpen, "在 Pulse 中打开", "在 Pulse 中開啟", "Opens in Pulse"},
+    {Id::TakeStatusOther, "现在由「{name}」打开", "現在由「{name}」開啟", "Opens with {name} now"},
+    {Id::TakeStatusExcluded, "不接管", "不接管", "Not taken over"},
+    {Id::TakeStatusExcludedWho, "不接管 · 由「{name}」打开", "不接管 · 由「{name}」開啟", "Not taken over · opens with {name}"},
+    {Id::TakeStatusOff, "未接管", "未接管", "Not taken over"},
+    {Id::TakeStatusOffWho, "未接管 · 由「{name}」打开", "未接管 · 由「{name}」開啟", "Not taken over · opens with {name}"},
+    {Id::TakeStatusFree, "没有程序打开", "沒有程式開啟", "No program opens it"},
+    {Id::TakeStatusUnknown, "关联状态未确认", "關聯狀態未確認", "Association not confirmed"},
+    {Id::TakeOffHint, "打开后，下面这些格式双击就用 Pulse 解压，并换上压缩包图标。", "開啟後，下面這些格式按兩下就用 Pulse 解壓，並換上壓縮檔圖示。", "When on, these formats extract with Pulse on double-click and get archive icons."},
+    {Id::TakeSummaryAsk, "已接管 {count} 种 · {name} 还要在 Windows 里确认一次", "已接管 {count} 種 · {name} 還要在 Windows 裡確認一次", "{count} taken over · {name} still need confirming once in Windows"},
+    {Id::TakeSummaryDone, "已接管 {count} 种 · 全部完成", "已接管 {count} 種 · 全部完成", "{count} taken over · all done"},
+    {Id::Recommended, "推荐", "推薦", "Recommended"},
+    {Id::IconSection, "压缩包图标", "壓縮檔圖示", "Archive icons"},
+    {Id::IconTitle, "图标样式", "圖示樣式", "Icon style"},
+    {Id::IconDesc, "接管的格式用这套图标；切换后资源管理器和桌面会刷新图标，不影响关联和双击行为。", "接管的格式使用這套圖示；切換後檔案總管和桌面會重新整理圖示，不影響關聯和按兩下行為。", "Formats Pulse opens use this icon set. Switching refreshes icons in File Explorer and on the desktop; associations and double-click stay the same."},
+    {Id::IconOffHint, "打开「接管压缩包」后可选。", "開啟「接管壓縮檔」後可選。", "Available when \"Open archives with Pulse\" is on."},
+    {Id::IconDocument, "文档", "文件", "Document"},
+    {Id::IconDocumentDesc, "白色文件页加格式色标签，和 Windows 11 的文件图标一致", "白色檔案頁加格式色標籤，和 Windows 11 的檔案圖示一致", "A white page with a label in the format's colour, like Windows 11 file icons"},
+    {Id::IconFolder, "拉链文件夹", "拉鍊資料夾", "Zipper folder"},
+    {Id::IconFolderDesc, "格式色的文件夹加一条短拉链，简单好认", "格式色的資料夾加一條短拉鍊，簡單好認", "A folder in the format's colour with a short zipper, easy to spot"},
+    {Id::IconColor, "彩色文件", "彩色檔案", "Colour page"},
+    {Id::IconColorDesc, "格式色的文件页加一条短拉链，保留文件的形状", "格式色的檔案頁加一條短拉鍊，保留檔案的形狀", "A page in the format's colour with a short zipper, keeping the file shape"},
+    {Id::MenuDetailSmart, "单项直接放出 · 多项建同名文件夹", "單項直接放出 · 多項建同名資料夾", "One item lands as is · several get a folder"},
+    {Id::MenuDetailFolder, "放进同名文件夹", "放進同名資料夾", "Into a folder named after the archive"},
+    {Id::MenuDetailHere, "内容放在压缩包旁边", "內容放在壓縮檔旁邊", "Contents land next to the archive"},
+    {Id::MenuDetailFixed, "放进 {name}", "放進 {name}", "Into {name}"},
+    {Id::MenuDetailQuick, "{name} · {count}", "{name} · {count}", "{name} · {count}"},
+    {Id::MenuSettings, "设置", "設定", "Settings"},
+    {Id::PreviewArchive, "右键压缩包时", "右鍵壓縮檔時", "Right-click an archive"},
+    {Id::PreviewFile, "右键普通文件时", "右鍵一般檔案時", "Right-click any other file"},
+    {Id::ListSeparator, "、", "、", ", "},
 };
-int Language() {
+std::atomic<int> g_host_language{-1};
+
+int OsLanguage() {
     static const int language = [] {
         const LANGID id = GetUserDefaultUILanguage();
         if (PRIMARYLANGID(id) != LANG_CHINESE) return 2;
@@ -149,9 +263,38 @@ int Language() {
 }
 } // namespace
 
+void SetHostLanguage(std::string_view language_tag) noexcept {
+    if (language_tag.empty()) {
+        g_host_language.store(-1, std::memory_order_release);
+        return;
+    }
+    char lowered[32]{};
+    const size_t limit = language_tag.size() < sizeof(lowered) ? language_tag.size() : sizeof(lowered) - 1;
+    for (size_t i = 0; i < limit; ++i) {
+        const unsigned char c = static_cast<unsigned char>(language_tag[i]);
+        lowered[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : static_cast<char>(c);
+    }
+    const std::string_view tag(lowered, limit);
+    int resolved = 2; // MenuLanguage::EnUS
+    if (tag.starts_with("zh-tw") || tag.starts_with("zh-hk") || tag.starts_with("zh-mo") || tag.starts_with("zh-hant")) {
+        resolved = 1; // MenuLanguage::ZhTW
+    } else if (tag == "zh" || tag.starts_with("zh-")) {
+        resolved = 0; // MenuLanguage::ZhCN
+    }
+    g_host_language.store(resolved, std::memory_order_release);
+}
+
+MenuLanguage CurrentLanguage() noexcept {
+    const int override_lang = g_host_language.load(std::memory_order_acquire);
+    return static_cast<MenuLanguage>(override_lang >= 0 ? override_lang : OsLanguage());
+}
+
 const char* Get(Id id) {
+    return Get(id, CurrentLanguage());
+}
+const char* Get(Id id, MenuLanguage language) {
     for (const auto& row : kRows)
-        if (row.id == id) return Language() == 0 ? row.zh : Language() == 1 ? row.tw : row.en;
+        if (row.id == id) return language == MenuLanguage::ZhCN ? row.zh : language == MenuLanguage::ZhTW ? row.tw : row.en;
     return "";
 }
 std::string Format(Id id, const std::string& name, const std::string& count) {

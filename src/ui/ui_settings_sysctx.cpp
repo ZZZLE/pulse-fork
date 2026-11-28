@@ -19,6 +19,16 @@ bool IsDark(const Theme& theme) {
 
 } // namespace
 
+// The fixture calls this same geometry decision; keep the title's 120 DIP
+// minimum independent of localized status width and nested-row indentation.
+bool SystemCtxReadOnlyStatusGeometry(float text_left, float note_right, float note_width,
+                                     float scale, float& badge_right) {
+    badge_right = note_right - note_width - 30 * scale;
+    if (badge_right - 6 * scale - text_left >= 120 * scale) return false;
+    badge_right = note_right;
+    return true;
+}
+
 IDWriteTextFormat* MainRenderer::SysCtxTitleFormat() {
     const float s = scale_;
     if (sysctx_title_scale_ != s || !sysctx_title_format_.get()) {
@@ -35,38 +45,119 @@ IDWriteTextFormat* MainRenderer::SysCtxTitleFormat() {
     return sysctx_title_format_.get() ? sysctx_title_format_.get() : compositor_->TextFormat();
 }
 
+// The two layer cards (context_menu_mockup.html, 范围卡片): a small scene of where the
+// menu shows, its name, one line, and three facts (when it takes effect, permission,
+// undo). The current one has an accent ring and a check; the other is the way there.
 void MainRenderer::DrawCtxLayerCards(const D2D1_RECT_F& pulse, const D2D1_RECT_F& system, bool system_current,
-                                     bool other_hovered, const Theme& theme) {
+                                     bool other_hovered, int system_pending, const Theme& theme) {
+    using I = l10n::StringId;
     const float s = scale_;
     const bool dark = IsDark(theme);
-    const D2D1_COLOR_F subtle = WithAlpha(theme.text, dark ? 0.06f : 0.05f);
+    const bool hc = IsHighContrast();
+    const D2D1_COLOR_F track = WithAlpha(theme.text, dark ? 0.06f : 0.05f);
+    const D2D1_COLOR_F faint = WithAlpha(theme.text_secondary, 0.45f);
     IDWriteTextFormat* title_format = SysCtxTitleFormat();
-    auto layer = [&](const D2D1_RECT_F& r, const wchar_t* glyph, const wchar_t* title, const wchar_t* caption,
-                     const wchar_t* tag, bool current, bool hover) {
-        if (r.right <= r.left) return;
-        painter_.FillRoundedRect(r, 10 * s, current ? WithAlpha(theme.accent, 0.14f) : hover ? theme.fill_input_hover
-                                                                                             : theme.fill_input);
-        painter_.StrokeRoundedRect(r, 10 * s, current ? WithAlpha(theme.accent, 0.55f) : theme.stroke_card, 1);
-        const float mid = (r.top + r.bottom) * 0.5f;
-        const auto box = D2D1::RectF(r.left + 14 * s, mid - 15 * s, r.left + 44 * s, mid + 15 * s);
-        painter_.FillRoundedRect(box, 8 * s, subtle);
-        DrawIconText(box.left + 7 * s, box.top + 7 * s, 16 * s, 16 * s, glyph, L"", theme.text, 0.8f);
-        const float tag_w = CellTextWidth(tag, true) + 8 * s;
-        const float text_right = r.right - 14 * s - tag_w;
-        painter_.DrawText(title, D2D1::RectF(box.right + 12 * s, mid - 19 * s, text_right, mid + 1 * s),
-                          title_format, theme.text);
-        painter_.DrawText(caption, D2D1::RectF(box.right + 12 * s, mid + 1 * s, text_right, mid + 19 * s),
-                          compositor_->SmallFormat(), theme.text_secondary);
-        painter_.DrawText(tag, D2D1::RectF(text_right, r.top, r.right - 14 * s, r.bottom), compositor_->SmallFormat(),
-                          theme.text_secondary, fluent::HorizontalAlignment::Right);
+    // Scene in a 96x64 box: shapes in that grid, scaled to `box`.
+    auto scene = [&](const D2D1_RECT_F& box, bool windows, bool current) {
+        const float u = (box.right - box.left) / 96.0f;
+        auto rect = [&](float x, float y, float w, float h) { return D2D1::RectF(box.left + x * u, box.top + y * u, box.left + (x + w) * u, box.top + (y + h) * u); };
+        auto bar = [&](float x, float y, float w, D2D1_COLOR_F c) { painter_.FillRoundedRect(rect(x, y, w, 3.5f), 1.75f * u, c); };
+        painter_.FillRoundedRect(box, 9 * s, current && !hc ? WithAlpha(theme.accent, dark ? 0.16f : 0.09f) : track);
+        auto window = [&](float x, float y, float w, float h) {
+            painter_.FillRoundedRect(rect(x, y, w, h), 4.5f * u, theme.surface_flyout);
+            painter_.StrokeRoundedRect(rect(x, y, w, h), 4.5f * u, theme.stroke_divider, 1);
+        };
+        auto menu = [&](float x, float y, float w, bool accent_first) {
+            painter_.FillRoundedRect(rect(x, y, w, 27), 4 * u, theme.surface_flyout);
+            painter_.StrokeRoundedRect(rect(x, y, w, 27), 4 * u, WithAlpha(theme.text, dark ? 0.16f : 0.12f), 1);
+            painter_.FillRoundedRect(rect(x + 3, y + 3, w - 6, 6), 2 * u, accent_first ? WithAlpha(theme.accent, 0.85f) : faint);
+            bar(x + 3, y + 12, w - 12, faint);
+            bar(x + 3, y + 19, w - 9, faint);
+        };
+        if (!windows) {
+            // Pulse's own window (its dark title strip) with its menu open.
+            window(8, 9, 58, 44);
+            painter_.FillRoundedRect(rect(8, 9, 58, 9), 4.5f * u, D2D1::ColorF(0x2B2B2B));
+            painter_.FillRoundedRect(rect(8, 14, 58, 4), 0, D2D1::ColorF(0x2B2B2B));
+            painter_.FillRoundedRect(rect(11.5f, 11.5f, 4, 4), 1 * u, D2D1::ColorF(0x8CC2B1));
+            bar(13, 23, 18, faint); bar(13, 29, 26, WithAlpha(theme.accent, 0.55f)); bar(13, 35, 22, faint); bar(13, 41, 16, faint);
+            menu(46, 27, 40, true);
+        } else {
+            // The desktop, File Explorer and another app, sharing one menu.
+            painter_.FillRoundedRect(rect(6, 30, 44, 28), 4 * u, WithAlpha(D2D1::ColorF(0x3E7BD6), 0.85f));
+            window(14, 7, 44, 30);
+            painter_.FillRoundedRect(rect(19, 19, 12, 8), 1.5f * u, D2D1::ColorF(0xF2C14E));
+            bar(34, 21, 18, faint); bar(34, 27, 13, faint);
+            window(62, 5, 28, 22);
+            painter_.FillRoundedRect(rect(66, 10, 8, 8), 2 * u, WithAlpha(D2D1::ColorF(0x7B5CC4), 0.75f));
+            bar(77, 11, 9, faint);
+            menu(46, 31, 42, false);
+        }
     };
-    // The current page's card is accented; the other one is the way there.
-    layer(pulse, L"\xE8FD", sysctx_text::LocalTitle(), sysctx_text::LocalCaption(),
-          system_current ? sysctx_text::LocalTag() : sysctx_text::Current(), !system_current,
-          system_current && other_hovered);
-    layer(system, L"\xE7F4", sysctx_text::SystemTitle(), sysctx_text::SystemCaption(),
-          system_current ? sysctx_text::Current() : sysctx_text::LocalTag(), system_current,
-          !system_current && other_hovered);
+    struct Fact { StoreIcon icon; I text; };
+    auto layer = [&](const D2D1_RECT_F& r, bool windows, bool current, bool hover, int pending) {
+        if (r.right <= r.left) return;
+        const D2D1_COLOR_F fill = current && !hc ? MixColor(theme.surface_card, theme.accent, dark ? 0.08f : 0.05f)
+                                : hover ? theme.fill_input_hover : theme.fill_input;
+        painter_.FillRoundedRect(r, 12 * s, fill);
+        if (current) painter_.StrokeRoundedRect(D2D1::RectF(r.left + 0.75f * s, r.top + 0.75f * s, r.right - 0.75f * s, r.bottom - 0.75f * s),
+                                                12 * s, theme.accent, 1.5f * s);
+        else painter_.StrokeRoundedRect(r, 12 * s, hover ? WithAlpha(theme.text, dark ? 0.16f : 0.14f) : theme.stroke_card, 1);
+        const float mid = (r.top + r.bottom) * 0.5f;
+        // The scene shrinks away on narrow cards; the text keeps its room.
+        const bool room = r.right - r.left >= 360 * s;
+        const auto box = D2D1::RectF(r.left + 12 * s, mid - 32 * s, r.left + 108 * s, mid + 32 * s);
+        if (room) scene(box, windows, current);
+        const float tx = room ? box.right + 16 * s : r.left + 16 * s;
+        // Top right: the pending changes, then the check of the current card.
+        float right = r.right - 12 * s;
+        if (current) {
+            const auto tick = D2D1::RectF(right - 18 * s, r.top + 10 * s, right, r.top + 28 * s);
+            painter_.FillRoundedRect(tick, 9 * s, theme.accent);
+            DrawStoreIcon(compositor_->Dc(), StoreIcon::Check, D2D1::RectF(tick.left + 4 * s, tick.top + 4 * s, tick.right - 4 * s, tick.bottom - 4 * s),
+                          theme.accent_text, 1.6f);
+            right = tick.left - 6 * s;
+        }
+        if (pending > 0) {
+            std::wstring text = l10n::Get(I::CtxLayerPending);
+            if (const auto at = text.find(L"{n}"); at != std::wstring::npos) text.replace(at, 3, std::to_wstring(pending));
+            fluent::BadgeSpec badge{};
+            badge.text = text;
+            badge.kind = fluent::BadgeKind::Accent;
+            const float bw = painter_.MeasureBadgeWidth(text);
+            badge.bounds = D2D1::RectF(right - bw, r.top + 8 * s, right, r.top + 30 * s);
+            painter_.DrawBadge(badge);
+            right = badge.bounds.left - 6 * s;
+        }
+        painter_.DrawText(l10n::Get(windows ? I::CtxLayerSystemTitle : I::CtxLayerPulseTitle),
+                          D2D1::RectF(tx, r.top + 12 * s, right, r.top + 34 * s), title_format,
+                          current && !hc ? (dark ? MixColor(theme.accent, D2D1::ColorF(0xFFFFFF), 0.3f) : theme.accent) : theme.text);
+        painter_.DrawText(l10n::Get(windows ? I::CtxLayerSystemWhat : I::CtxLayerPulseWhat),
+                          D2D1::RectF(tx, r.top + 33 * s, r.right - 12 * s, r.top + 51 * s), compositor_->SmallFormat(),
+                          theme.text_secondary);
+        // Facts: chips on one line, as many as fit.
+        static constexpr Fact pulse_facts[] = {{StoreIcon::Sparkle, I::CtxFactInstant}, {StoreIcon::Check, I::CtxFactNoAdmin},
+                                               {StoreIcon::Undo, I::CtxFactRestore}};
+        static constexpr Fact system_facts[] = {{StoreIcon::Check, I::CtxFactApply}, {StoreIcon::Shield, I::CtxFactBackup},
+                                                {StoreIcon::Lock, I::CtxFactAdmin}};
+        float x = tx;
+        const float cy = r.top + 58 * s;
+        for (const auto& fact : windows ? system_facts : pulse_facts) {
+            const auto& text = l10n::Get(fact.text);
+            const float w = 8 * s + 12 * s + 5 * s + CellTextWidth(text, true) + 8 * s;
+            if (x + w > r.right - 12 * s) break;
+            const auto chip = D2D1::RectF(x, cy, x + w, cy + 22 * s);
+            painter_.FillRoundedRect(chip, 6 * s, current && !hc ? theme.surface_card : track);
+            if (current && !hc) painter_.StrokeRoundedRect(chip, 6 * s, theme.stroke_card, 1);
+            DrawStoreIcon(compositor_->Dc(), fact.icon, D2D1::RectF(chip.left + 8 * s, cy + 5 * s, chip.left + 20 * s, cy + 17 * s),
+                          theme.text_secondary, 1.2f);
+            painter_.DrawText(text, D2D1::RectF(chip.left + 25 * s, chip.top, chip.right - 4 * s, chip.bottom),
+                              compositor_->SmallFormat(), theme.text_secondary);
+            x = chip.right + 6 * s;
+        }
+    };
+    layer(pulse, false, !system_current, system_current && other_hovered, 0);
+    layer(system, true, system_current, !system_current && other_hovered, system_pending);
 }
 
 void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT_F& rect, const Theme& theme) {
@@ -139,12 +230,17 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
         painter_.DrawText(text, D2D1::RectF(r.left + 24 * s, r.top, r.right - 4 * s, r.bottom), compositor_->SmallFormat(),
                           color);
     };
+    button(o.tree_button, l10n::Get(l10n::StringId::ContextTreeTitle), L"\xE8A5", kSysCtxTree, true);
+    button(o.extension_button, l10n::Get(l10n::StringId::ContextTreeOtherType), L"\xE8A5", kSysCtxOtherType, ready);
+    painter_.DrawWrappedCaption(l10n::Get(l10n::StringId::ContextTreeScope),
+        D2D1::Point2F(o.tree_note.left, o.tree_note.top),
+        o.tree_note.right - o.tree_note.left, theme.text_secondary);
     head_button(o.undo, sysctx_text::Undo(), L"\xE7A7", kSysCtxUndo, ready && v->undo_steps > 0);
     head_button(o.log, sysctx_text::Log(), L"\xE81C", kSysCtxLog, true);
     head_button(o.restore, sysctx_text::RestoreAll(), L"\xE777", kSysCtxRestoreAll, ready && v->undo_steps > 0);
 
     // ---- layer cards ----------------------------------------------------------
-    DrawCtxLayerCards(o.local_card, o.system_card, true, hovered(kSysCtxLocalLayer), theme);
+    DrawCtxLayerCards(o.local_card, o.system_card, true, hovered(kSysCtxLocalLayer), v ? v->pending : 0, theme);
     if (!v) return;
 
     // ---- result of the last batch --------------------------------------------
@@ -478,7 +574,7 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                 painter_.FillRoundedRect(r, 8 * s, theme.fill_selected);
                 painter_.StrokeRoundedRect(r, 8 * s, theme.stroke_card, 1);
             } else if (hovered(kSysCtxSelectBase + static_cast<int>(i)) || hovered(kSysCtxRowBase + static_cast<int>(i)) ||
-                       hovered(kSysCtxMoreBase + static_cast<int>(i)) || hovered(kSysCtxRemoveBase + static_cast<int>(i))) {
+                       hovered(kSysCtxMoreBase + static_cast<int>(i)) || hovered(kSysCtxPulseBase + static_cast<int>(i)) || hovered(kSysCtxRemoveBase + static_cast<int>(i))) {
                 painter_.FillRoundedRect(r, 8 * s, theme.fill_hover);
             }
             if (row.pending)
@@ -493,6 +589,8 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                 state.hovered = hovered(kSysCtxMoreBase + static_cast<int>(i));
                 painter_.DrawButton({o.more[i], {}, L"\xE712", fluent::ButtonKind::Transparent, state, true});
             }
+            const float text_left = r.left + (50 + (std::min)(row.depth, uint16_t{3}) * 12) * s;
+            const wchar_t* second_line_status = nullptr;
             float badge_right = o.switches[i].left - 10 * s;
             if (row.deletable && i < o.removes.size()) {
                 // Leftover: 删除 (red) in the switch's place; 撤回 once queued.
@@ -510,6 +608,12 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                              !ready ? theme.text_disabled : row.deleting ? theme.text : D2D1::ColorF(D2D1::ColorF::White),
                              0.62f);
                 badge_right = b.left - 10 * s;
+            } else if (SysCtxPulseOnlyAction(row) && i < o.pulse_buttons.size()) {
+                fluent::ControlState state{};
+                state.enabled = ready;
+                state.hovered = ready && hovered(kSysCtxPulseBase + static_cast<int>(i));
+                painter_.DrawButton({o.pulse_buttons[i], SysCtxPulseActionText(row), L"", fluent::ButtonKind::Standard, state});
+                badge_right = o.pulse_buttons[i].left - 10 * s;
             } else if (SysCtxSwitchable(row)) {
                 fluent::ControlState state{};
                 state.checked = row.on;
@@ -521,13 +625,16 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                                                  : sysctx_text::ReadOnly();
                 const float w = CellTextWidth(note, true);
                 const float note_right = o.switches[i].right;
-                painter_.DrawText(note, D2D1::RectF(note_right - w - 2 * s, r.top, note_right + 2 * s, r.top + rh),
-                                  compositor_->SmallFormat(), theme.text_secondary);
-                DrawIconText(note_right - w - 20 * s, mid - 8 * s, 16 * s, 16 * s, row.locked ? L"\xE72E" : L"\xE946", L"",
-                             theme.text_secondary, 0.7f);
-                badge_right = note_right - w - 30 * s;
+                if (SystemCtxReadOnlyStatusGeometry(text_left, note_right, w, s, badge_right)) {
+                    // The full source and protection explanation remain in Details.
+                    second_line_status = note;
+                } else {
+                    painter_.DrawText(note, D2D1::RectF(note_right - w - 2 * s, r.top, note_right + 2 * s, r.top + rh),
+                                      compositor_->SmallFormat(), theme.text_secondary);
+                    DrawIconText(note_right - w - 20 * s, mid - 8 * s, 16 * s, 16 * s, row.locked ? L"\xE72E" : L"\xE946", L"",
+                                 theme.text_secondary, 0.7f);
+                }
             }
-            const float text_left = r.left + 50 * s;
             auto badge = [&](std::wstring_view text, fluent::BadgeKind kind) {
                 const float w = painter_.MeasureBadgeWidth(text);
                 if (badge_right - w < text_left + 120 * s) return;  // the title keeps priority
@@ -538,7 +645,8 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                 painter_.DrawBadge(spec);
                 badge_right -= w + 6 * s;
             };
-            if (row.machine) badge(sysctx_text::Admin(), fluent::BadgeKind::Warning);
+            if (SysCtxPulseOnlyAction(row)) badge(sysctx_text::ReadOnly(), fluent::BadgeKind::Neutral);
+            else if (row.machine) badge(sysctx_text::Admin(), fluent::BadgeKind::Warning);
             else if (SysCtxSwitchable(row)) badge(sysctx_text::NoAdmin(), fluent::BadgeKind::Success);
             // Queued state first: it must not be the badge that runs out of room.
             if (row.deleting) badge(sysctx_text::WillDelete(), fluent::BadgeKind::Danger);
@@ -552,8 +660,10 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
             const float text_right = (std::max)(text_left + 40 * s, badge_right - 6 * s);
             const D2D1_COLOR_F title_color = row.deleting ? theme.text_secondary : row.missing ? red
                                            : row.on ? theme.text : theme.text_secondary;
-            painter_.DrawText(row.title, D2D1::RectF(text_left, r.top + 7 * s, text_right, mid + 2 * s),
-                              compositor_->TextFormat(), title_color);
+            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> text_brush;
+            dc->CreateSolidColorBrush(title_color, &text_brush);
+            DrawTextEndEllipsis(compositor_, compositor_->TextFormat(), text_brush.Get(), row.title,
+                                text_left, r.top + 7 * s, text_right - text_left, mid + 2 * s - (r.top + 7 * s));
             if (row.deleting) {
                 // Struck through until 应用更改 removes it.
                 const float tw = (std::min)(CellTextWidth(row.title, false), text_right - text_left);
@@ -561,8 +671,10 @@ void MainRenderer::DrawSettingsSysCtx(const WindowViewModel& vm, const D2D1_RECT
                 painter_.FillRoundedRect(D2D1::RectF(text_left, ty - 0.5f * s, text_left + tw, ty + 0.5f * s), 0,
                                          theme.text_secondary);
             }
-            painter_.DrawText(row.subtitle, D2D1::RectF(text_left, mid + 1 * s, text_right, r.top + rh - 6 * s),
-                              compositor_->SmallFormat(), theme.text_secondary);
+            if (text_brush) text_brush->SetColor(theme.text_secondary);
+            DrawTextEndEllipsis(compositor_, compositor_->SmallFormat(), text_brush.Get(),
+                                second_line_status ? std::wstring(second_line_status) : row.subtitle,
+                                text_left, mid + 1 * s, text_right - text_left, r.top + rh - 6 * s - (mid + 1 * s));
             if (!o.wide && static_cast<int>(i) == v->selected) {
                 divider(r.left + 46 * s, r.right - 12 * s, r.top + rh);
                 draw_detail(row);

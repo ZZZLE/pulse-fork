@@ -84,6 +84,7 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         }
         l.nav_row[6] = {};
         l.nav_row[kSettingsPageAi] = {};
+        l.nav_row[kSettingsPageNativeExtensions] = {};
     }
     const float pad = 20.0f * scale;
     auto label_btn_w = [&](std::wstring_view label) {
@@ -102,7 +103,8 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         return l;
     }
     float y = l.content_origin + pad;
-    y += 36.0f * scale;
+    l.page_heading=D2D1::RectF(l.content.left+pad,y,l.content.right-pad,y+36.0f*scale);
+    y = l.page_heading.bottom;
     y += 8.0f * scale;
     if (IsGeneralSettingsPage(vm.settings_page)) {
         y = LayoutSettingsGeneral(l, vm, scale, y, painter);
@@ -142,6 +144,8 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             y += h*scale;
         }
         l.global_search_apps_row = D2D1::RectF(card_left, y, card_right, y + 68*scale);
+        y += 68*scale;
+        l.global_search_apps_first_row = D2D1::RectF(card_left, y, card_right, y + 68*scale);
         y += 68*scale;
         l.search_pinyin_row = D2D1::RectF(card_left, y, card_right, y + 68*scale);
         y += 68*scale;
@@ -289,10 +293,10 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
             const float intro_h=painter ? (std::max)(18*scale,painter->MeasureWrappedCaptionHeight(intro,cr-cl)) : 18*scale;
             l.ctx_intro=D2D1::RectF(cl,y,cr,y+intro_h);
             y+=(std::max)(intro_h,32*scale)+14*scale;
-            const float gap=10*scale,card_w=(cr-cl-gap)*0.5f;
-            l.ctx_layer[0]=D2D1::RectF(cl,y,cl+card_w,y+58*scale);
-            l.ctx_layer[1]=D2D1::RectF(cl+card_w+gap,y,cr,y+58*scale);
-            y+=58*scale+12*scale;
+            const float gap=12*scale,card_w=(cr-cl-gap)*0.5f;
+            l.ctx_layer[0]=D2D1::RectF(cl,y,cl+card_w,y+kCtxLayerCardDip*scale);
+            l.ctx_layer[1]=D2D1::RectF(cl+card_w+gap,y,cr,y+kCtxLayerCardDip*scale);
+            y+=kCtxLayerCardDip*scale+12*scale;
         }
         l.context_rows.resize(vm.settings_items.size());
         {
@@ -543,7 +547,59 @@ SettingsLayout MakeSettingsLayout(const WindowViewModel& vm, const D2D1_RECT_F& 
         const float right = (std::max)(left, l.content.right - pad);
         const float intro = painter ? painter->MeasureWrappedCaptionHeight(l10n::Get(l10n::StringId::NativeExtensionSettingsIntro), (std::max)(1.0f, right-left)) : 36.0f*scale;
         const float bottom = (std::max)(l.content.top, l.content.bottom - pad);
-        const float top = (std::min)(bottom, l.content.top + 60.0f*scale + intro + 18.0f*scale);
+        if (vm.native_settings_header.present) {
+            // One package's page: the header of its store detail page (as 7-Zip's), then its own page.
+            const auto& h = vm.native_settings_header;
+            auto& d = l.native_head;
+            const float font = static_cast<float>(vm.settings_ui_font_scale) / 100;
+            float hy = LayoutExtensionDetailHeader(d, h.enabled, h.official, h.version, h.summary,
+                left, right, l.content.top + 16.0f*scale, scale, font, painter, h.installed, h.action_label, h.status_text);
+            l.native_store_crumb = d.crumb;
+            {
+                using I = l10n::StringId;
+                std::wstring titles[SettingsLayout::DetailHeader::kMaxTabs];
+                int actions[SettingsLayout::DetailHeader::kMaxTabs]{};
+                int count = 0;
+                const int base = static_cast<int>(PackAction::NativeTabBase);
+                titles[count] = l10n::Get(I::SzTabSettings);
+                actions[count++] = base + 0;
+                // 右键菜单 right after 常用设置: the plugin's own extra tabs (支持格式, ...) follow it.
+                if (h.has_menu_tab && count < SettingsLayout::DetailHeader::kMaxTabs) {
+                    titles[count] = l10n::Get(I::SzTabMenu);
+                    actions[count++] = base + 1;
+                }
+                const int custom_base = static_cast<int>(PackAction::NativeCustomTabBase);
+                for (size_t k = 0; k < h.extra_tabs.size() && count < SettingsLayout::DetailHeader::kMaxTabs; ++k) {
+                    if (count + (h.has_about_tab ? 2 : 0) >= SettingsLayout::DetailHeader::kMaxTabs) break;
+                    titles[count] = h.extra_tabs[k];
+                    actions[count++] = custom_base + static_cast<int>(k);
+                }
+                if (h.has_about_tab) {
+                    if (count < SettingsLayout::DetailHeader::kMaxTabs) {
+                        titles[count] = l10n::Get(I::StoreDetailTabOverview);
+                        actions[count++] = base + 2;
+                    }
+                    if (count < SettingsLayout::DetailHeader::kMaxTabs) {
+                        titles[count] = l10n::Get(I::SzTabAbout);
+                        actions[count++] = base + 3;
+                    }
+                }
+                hy = LayoutExtensionDetailTabsCustom(d, titles, actions, count, left, right, hy, scale, font, painter);
+            }
+            // The docked panel insets its tree 24 DIP at the sides and 12 at the top (ExtensionPanel::TreeBounds):
+            // widen it by that so the plugin's cards line up with the header, as 7-Zip's do.
+            const float tree_x = 24.0f*scale, tree_y = 12.0f*scale;
+            l.native_settings_content = D2D1::RectF(left - tree_x, (std::min)(bottom, hy - tree_y), right + tree_x, bottom);
+            l.content_h = l.content.bottom - l.content.top;
+            return l;
+        }
+        // "‹ 扩展商店": this page is the store's settings view, so a way back leads it.
+        const float crumb_w = (painter ? painter->MeasureButtonWidth(l10n::Get(l10n::StringId::StoreTitle)) : 96.0f*scale) + 8.0f*scale;
+        l.native_store_crumb = D2D1::RectF(left - 6.0f*scale, l.content.top + 58.0f*scale,
+                                           (std::min)(right, left + crumb_w), l.content.top + 84.0f*scale);
+        // One package's page has no intro line: its content starts under the crumb.
+        const float top = (std::min)(bottom, l.content.top + 88.0f*scale +
+            (vm.native_settings_title.empty() ? intro + 18.0f*scale : 12.0f*scale));
         l.native_settings_content = D2D1::RectF(left, top, right, bottom);
         l.content_h = l.content.bottom - l.content.top;
         return l;

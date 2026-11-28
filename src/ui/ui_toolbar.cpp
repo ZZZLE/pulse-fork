@@ -1,5 +1,6 @@
 #include "ui_renderer_internal.h"
 #include "toolbar_layout.h"
+#include "snack_style.h"
 #include "pane_header_icons.h"
 #include "toolbar_pin_drag.h"
 #include "toolbar_picker.h"
@@ -238,7 +239,7 @@ std::wstring SelectionChipLabel(int count) {
 }
 float MainRenderer::SelectionChipLabelWidth(float width, int selected) const {
     // Narrow windows show the buttons only, as in the prototype.
-    if (selected <= 0 || width-EffectiveSidebarWidth(width) < 700*scale_ || !compositor_ || !compositor_->SmallFormat())
+    if (selected <= 0 || width-ToolbarLeft(width) < 700*scale_ || !compositor_ || !compositor_->SmallFormat())
         return 0.0f;
     return std::ceil(typography::MeasureLine(compositor_,compositor_->SmallFormat(),SelectionChipLabel(selected)));
 }
@@ -357,9 +358,29 @@ void MainRenderer::DrawToolbarApps(const WindowViewModel& vm, const ToolbarLayou
     }
 }
 
+// ui_modes_mockup .fchip: centred 18 DIP above the list's bottom edge, the
+// same label / quick actions / pin / more / clear as the docked chip.
+ToolbarSelectionChip MainRenderer::FloatingSelectionChip(float w, float h, int selected, int action_count) const {
+    if (selected <= 0 || !SelectionChipFloats()) return {};
+    const D2D1_RECT_F content=ContentRect(w,h);
+    const float room=content.right-content.left-48*scale_;
+    if (room <= 0.0f) return {};
+    const float cy=content.bottom-(18+20)*scale_;
+    ToolbarLayout l;
+    l.create={0.0f,cy-16*scale_,0.0f,cy+16*scale_};
+    l.overflow={room+23*scale_,l.create.top,room+23*scale_,l.create.bottom};   // limit: chip right <= 13 + room
+    ToolbarSelectionChip out=MakeToolbarSelectionChip(l,scale_,SelectionChipLabelWidth(w,selected),action_count);
+    if (out.chip.right <= out.chip.left) return out;
+    const float dx=(content.left+content.right)*0.5f-(out.chip.left+out.chip.right)*0.5f;
+    const auto shift=[dx](D2D1_RECT_F& r) { if (r.right > r.left) { r.left+=dx; r.right+=dx; } };
+    shift(out.chip);
+    shift(out.label);
+    for (auto& b : out.buttons) shift(b);
+    return out;
+}
 ToolbarSelectionChip MainRenderer::SelectionChipAt(const ToolbarLayout& layout, float width, int selected,
                                                    int action_count) const {
-    if (selected <= 0 || embedded_) return {};
+    if (selected <= 0 || embedded_ || !CommandRowShown()) return {};
     return MakeToolbarSelectionChip(layout,scale_,SelectionChipLabelWidth(width,selected),action_count);
 }
 D2D1_COLOR_F MainRenderer::PrepareIconTones(const Theme& theme, bool dark) {
@@ -395,8 +416,8 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     // command colour. Pressed, toggled-on, disabled and dragged buttons, and
     // the accent-filled New button, draw the whole icon in one colour.
     const D2D1_COLOR_F ink=IsHighContrast() ? theme.text_secondary : PrepareIconTones(theme,vm.dark);
-    const float left = EffectiveSidebarWidth(rect.right);
-    const bool compact = rect.right-left < 600*scale_;
+    const float left = ToolbarLeft(rect.right);
+    const bool compact = ToolbarCompact(rect.right);
     auto layout = ToolbarLayoutAt(rect.right,NewButtonWidthPx(compact),vm.pane.filter_expand);
     const bool searchOverlay=vm.address_searching && layout.merged_search;
     ToolbarMotion& tm=ToolbarMotionFor(this);
@@ -643,7 +664,10 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                               : WithAlpha(theme.text_secondary, 0.85f), brText_);
                 // Width measured exactly; let the ink use the right padding as slack
                 // so the trailing glyph is not shaved by the clip rect.
-                DrawTextEndEllipsis(compositor_, compositor_->AddressFormat(), brText_.get(), seg.text,
+                IDWriteTextFormat* crumb_fmt = EmbeddedPickerLayout()
+                    ? (i + 1 == placed.size() ? compositor_->TabActiveFormat() : compositor_->FileNameFormat())
+                    : compositor_->AddressFormat();
+                DrawTextEndEllipsis(compositor_, crumb_fmt, brText_.get(), seg.text,
                     text_left, seg.rc.top, (std::max)(0.0f, seg.rc.right - text_left),
                     seg.rc.bottom - seg.rc.top);
             }
@@ -662,10 +686,25 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             }
             if (placed.empty() && !vm.pane.path.empty()) {
                 MakeBrush(dc, theme.text, brText_);
-                DrawTextRect(dc, compositor_->AddressFormat(), brText_.get(), vm.pane.path,
+                DrawTextRect(dc, EmbeddedPickerLayout() ? compositor_->FileNameFormat() : compositor_->AddressFormat(), brText_.get(), vm.pane.path,
                     addrRc.left + 12.0f * scale_, addrRc.top,
                     addrRc.right - addrRc.left - 18.0f * scale_,
                     addrRc.bottom - addrRc.top);
+            }
+            if (EmbeddedPickerLayout() && !vm.address_searching && !placed.empty() && strip.overflow <= 0.0f) {
+                const auto text = pulse::l10n::Get(pulse::l10n::StringId::PickerTypeToJump);
+                const float key_width = painter_.MeasureBadgeWidth(L"Ctrl L");
+                const float text_width = MeasureTextWidth(compositor_->DwriteFactory(), compositor_->SmallFormat(), text);
+                const float right = addrRc.right - (FavoritesButtonShown() ? 36.0f : 10.0f) * scale_;
+                const float hint_left = right - key_width - 6.0f * scale_ - text_width;
+                // Only use genuinely empty breadcrumb space; long paths keep their full viewport.
+                if (placed.back().rc.right + 26.0f * scale_ <= hint_left) {
+                    painter_.DrawText(text, D2D1::RectF(hint_left, addrRc.top, right - key_width - 6.0f * scale_, addrRc.bottom),
+                        compositor_->SmallFormat(), theme.text_secondary);
+                    const float top = (addrRc.top + addrRc.bottom - 18.0f * scale_) * 0.5f;
+                    painter_.DrawBadge({D2D1::RectF(right - key_width, top, right, top + 18.0f * scale_),
+                        L"Ctrl L", fluent::BadgeKind::Keycap});
+                }
             }
         }
         if (FavoritesButtonShown() && !vm.address_editing && !vm.address_searching) {
@@ -683,10 +722,31 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
         dc->PopAxisAlignedClip();
     }
     DrawAddressSearchChrome(vm, rect.right, theme);
+    if (layout.tab_list.right > layout.tab_list.left) {
+        const D2D1_RECT_F& tl = layout.tab_list;
+        const bool hot = IsHovered(vm, HitTestResult::TabScroll, 0);
+        if (hot) painter_.FillRoundedRect(tl, theme.radius_control * scale_, theme.fill_hover);
+        int count = 0;
+        for (const auto& tab : vm.tabs) count += tab.hidden ? 0 : 1;
+        const float h = tl.bottom - tl.top;
+        DrawIconText(tl.left + 8 * scale_, tl.top, 16 * scale_, h, L"\xF5C7", L"", theme.text_secondary, kIconField);  // kGlyphTabStrip
+        painter_.DrawText(std::to_wstring(count), D2D1::RectF(tl.left + 28 * scale_, tl.top, tl.right - 18 * scale_, tl.bottom),
+                          compositor_->TextFormat(), theme.text);
+        DrawIconText(tl.right - 18 * scale_, tl.top, 12 * scale_, h, L"\xE70D", L"", theme.text_secondary, kIconSmall);
+    }
     MakeBrush(dc,theme.stroke_divider,brStrokeDivider_);
-    FillRect(dc,brStrokeDivider_.get(),left+margin_,title_bar_height_+44*scale_,rect.right-left-2*margin_,scale_);
-    // Embedded hosts (the file picker) keep the address row only.
-    if (embedded_) return;
+    // Under the address row, or under the command row when the address row
+    // moved into the title bar (nothing to separate when both are gone).
+    if (embedded_ || !TitleAddress() || ui_chrome_.command_row)
+        FillRect(dc,brStrokeDivider_.get(),left+margin_,title_bar_height_+NavigationHeightDip()*scale_,rect.right-left-2*margin_,scale_);
+    // Embedded hosts (the file picker) keep the address row only; 命令行 off
+    // (界面布局) drops the command row.
+    if (embedded_ || (!ui_chrome_.command_row && !InlineCommands())) return;
+    if (InlineCommands() && layout.create.right > layout.create.left) {
+        // .vd: the divider between the search field and the commands.
+        FillRect(dc,brStrokeDivider_.get(),layout.create.left-5*scale_,layout.create.top+6*scale_,scale_,
+                 layout.create.bottom-layout.create.top-12*scale_);
+    }
     // The command row's plate: the file and pane commands, overflow, pinned
     // commands and apps, Sort / Filter / Group.
     const bool filter_field=!(vm.pane.filter_expand <= 0.015f && !vm.filter_editing);
@@ -791,14 +851,16 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     }
     // Pinned commands (自定义工具栏), after a divider.
     const ToolbarPinDragState& pin_drag=PinDragFor(this);
+    bool first_pin=true;
     for (size_t i=0;i<layout.pins.size() && i<vm.toolbar_pins.size();++i) {
         const D2D1_RECT_F slot=layout.pins[i];
         if (slot.right <= slot.left) continue;
         const SelectionChipAction& pin=vm.toolbar_pins[i];
         const bool split_pin=pin.glyph==kToolbarSplitGlyph;
-        if (i==0) {
+        if (first_pin) {
             MakeBrush(dc,theme.stroke_divider,brStrokeDivider_);
             FillRect(dc,brStrokeDivider_.get(),slot.left-7*scale_,slot.top+7*scale_,scale_,18*scale_);
+            first_pin=false;
         }
         const bool dragged=pin_drag.index==static_cast<int>(i);
         if (dragged) {
@@ -852,6 +914,22 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             else DrawIconText(b.left,b.top,b.right-b.left,b.bottom-b.top,pin.glyph,L"",fg);
             icon_tones_=false;
         }
+        if (!preview && pin.badge_count > 0) {
+            // The same count pill as More's folded count below (16 DIP, accent,
+            // overhanging the top-right corner), so the toolbar has one badge.
+            const std::wstring btxt = pin.badge_count > 99 ? std::wstring(L"99+") : std::to_wstring(pin.badge_count);
+            const float bh = 16.0f * scale_;
+            const float bw = btxt.size() == 1 ? bh : btxt.size() == 2 ? 22.0f * scale_
+                : (std::max)(22.0f * scale_, std::ceil(MeasureTextWidth(compositor_->DwriteFactory(),
+                                                                         compositor_->SmallFormat(), btxt) + 9.0f * scale_));
+            const D2D1_RECT_F badge_rc = D2D1::RectF(b.right - bw + 3.0f * scale_, b.top - 2.0f * scale_,
+                                                     b.right + 3.0f * scale_, b.top - 2.0f * scale_ + bh);
+            painter_.FillRoundedRect(badge_rc, bh * 0.5f, pin.enabled ? theme.accent : theme.text_disabled);
+            painter_.DrawText(btxt, D2D1::RectF(badge_rc.left, badge_rc.top - 3.0f * scale_, badge_rc.right,
+                                                badge_rc.bottom + 3.0f * scale_),
+                              compositor_->SmallFormat(), theme.accent_text, fluent::HorizontalAlignment::Center,
+                              pin.enabled ? theme.accent : theme.text_disabled);
+        }
     }
     DrawToolbarApps(vm,layout,theme);
     if (pin_drag.out) {
@@ -891,8 +969,10 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     if (layout.overflow.right > layout.overflow.left) {
         const size_t total=vm.toolbar_pins.size()+vm.toolbar_apps.size();
         int folded=0;
-        for (size_t i=0;i<total;++i)
+        for (size_t i=0;i<total;++i) {
+            if (i<vm.toolbar_pins.size() && !vm.toolbar_pins[i].visible) continue;
             if (i>=layout.pins.size() || layout.pins[i].right <= layout.pins[i].left) ++folded;
+        }
         if (folded!=tm.folded) {
             if (folded>tm.folded && tm.pins.primed && tm.animations) tm.folded_born=motion_now_ ? motion_now_ : 1;
             tm.folded=folded;
@@ -1068,7 +1148,23 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
     // while something is selected and folds away with the selection.
     const ToolbarSelectionChip sel=SelectionChipAt(layout,rect.right,vm.toolbar_drop_mode ? 0 : vm.pane.selected_count,
         static_cast<int>(vm.selection_actions.size()));
-    if (sel.chip.right > sel.chip.left) {
+    DrawSelectionChip(vm,sel,theme,false);
+}
+void MainRenderer::DrawSelectionChip(const WindowViewModel& vm, const ToolbarSelectionChip& sel, const Theme& theme,
+                                     bool floating) {
+    ID2D1DeviceContext* dc=compositor_->Dc();
+    if (sel.chip.right <= sel.chip.left) return;
+    // Floating: the capsule plate the snack notifications and the dragged tab
+    // use (snack_style), with 8 DIP corners and half its key shadow.
+    SnackPalette pal=MakeSnackPalette(theme,IsHighContrast());
+    pal.shadow_key.a*=0.5f;
+    pal.shadow_ambient.a*=0.7f;
+    struct TextBackground { D2D1_COLOR_F& ref; D2D1_COLOR_F saved; ~TextBackground() { ref=saved; } }
+        text_bg{text_background_,text_background_};
+    if (floating) {
+        DrawSnackPlate(dc,FloatingSelectionCard(sel.chip),8*scale_,pal,scale_,IsHighContrast());
+        text_background_=pal.plate;
+    } else {
         FillRect(dc,brStrokeDivider_.get(),sel.chip.left-7*scale_,sel.chip.top+7*scale_,scale_,18*scale_);
         D2D1_COLOR_F fill=theme.accent;
         fill.a*=0.10f;
@@ -1082,14 +1178,18 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
             dc->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(sel.chip.left+h,sel.chip.top+h,
                 sel.chip.right-h,sel.chip.bottom-h),7*scale_,7*scale_),edge_brush.get(),scale_);
         }
+    }
+    {
         D2D1_COLOR_F hot=theme.accent;
         hot.a*=0.22f;
+        if (floating) hot=pal.hover;
         if (sel.label.right > sel.label.left) {
             // The count opens the selection menu: it lights up like a button.
             if (IsHovered(vm,HitTestResult::ToolbarSelAction,kSelChipLabel))
                 painter_.FillRoundedRect(D2D1::RectF(sel.label.left-6*scale_,sel.label.top+2*scale_,
                     sel.label.right+4*scale_,sel.label.bottom-2*scale_),5*scale_,hot);
-            painter_.DrawText(SelectionChipLabel(vm.pane.selected_count),sel.label,compositor_->SmallFormat(),theme.accent);
+            painter_.DrawText(SelectionChipLabel(vm.pane.selected_count),sel.label,compositor_->SmallFormat(),
+                              floating ? pal.accent : theme.accent);
         }
         int last_action=-1;
         for (int i=0;i<kSelChipSlots;++i) {
@@ -1102,7 +1202,7 @@ void MainRenderer::DrawToolbar(const WindowViewModel& vm, const D2D1_RECT_F& rec
                 : i==kSelChipClear ? std::wstring(kIconCloseSmall)
                 : action ? vm.selection_actions[static_cast<size_t>(i)].glyph : std::wstring();
             DrawButton(b,theme,IsHovered(vm,HitTestResult::ToolbarSelAction,i) ? hot : kTransparent,
-                glyph,L"",theme.accent,true,true,i==kSelChipClear ? kIconSmall : 1.0f);
+                glyph,L"",floating ? pal.text : theme.accent,true,true,i==kSelChipClear ? kIconSmall : 1.0f);
             if (action && vm.selection_actions[static_cast<size_t>(i)].situational) {
                 // Offered because of the moment: an accent underline.
                 const float cx=(b.left+b.right)*0.5f;
@@ -1142,7 +1242,7 @@ void SetToolbarPinDrag(const void* renderer, const ToolbarPinDragState& state) {
 // 收藏栏 (toolbar redesign §8): the row under the command row, as wide as the
 // toolbar; icons only when the toolbar is narrower than 820 DIP.
 FavoritesBarLayout MainRenderer::FavoritesBarLayoutAt(const WindowViewModel& vm, float w) const {
-    const float left=EffectiveSidebarWidth(w);
+    const float left=ToolbarLeft(w);
     const float bottom=title_bar_height_+toolbar_height_;
     const D2D1_RECT_F band=D2D1::RectF(left+margin_-10*scale_,bottom-kFavoritesBarHeightDip*scale_,
                                        w-margin_+8*scale_,bottom);
@@ -1182,7 +1282,7 @@ void MainRenderer::DrawFavoritesBar(const WindowViewModel& vm, const D2D1_RECT_F
     }
     if (vm.favorites_bar.empty()) {
         // Nothing starred yet: say how to add something.
-        const float x=EffectiveSidebarWidth(rect.right)+margin_;
+        const float x=ToolbarLeft(rect.right)+margin_;
         const float h=30*scale_;
         const float text_right=lay.dock.right>lay.dock.left ? lay.dock.left-6*scale_ : rect.right-margin_;
         DrawIconText(x,top,20*scale_,h,L"\xE734",L"",theme.text_secondary,kIconField);
@@ -1306,7 +1406,7 @@ void MainRenderer::DrawFavoritesBar(const WindowViewModel& vm, const D2D1_RECT_F
     tm.favorites.moving=false;
     if (vm.favorites_bar_drop_add) {
         // Items over the bar's empty part: where they would land, after the last.
-        float x=EffectiveSidebarWidth(rect.right)+8*scale_;
+        float x=ToolbarLeft(rect.right)+8*scale_;
         for (const auto& item : lay.items) if (item.right>item.left) x=std::max(x,item.right);
         painter_.FillRoundedRect(D2D1::RectF(x+3*scale_,top+7*scale_,x+5*scale_,top+27*scale_),scale_,theme.accent);
     }

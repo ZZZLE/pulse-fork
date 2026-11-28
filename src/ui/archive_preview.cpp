@@ -4,6 +4,7 @@
 #include "ui_compositor.h"
 #include "ui_renderer_internal.h"
 #include "typography.h"
+#include "icon_size_slider.h"
 #include "../common/localization.h"
 #include "../common/text_format.h"
 
@@ -65,6 +66,30 @@ bool IsDarkTheme(const Theme& theme) {
 
 D2D1_RECT_F R(float l, float t, float r, float b) { return D2D1::RectF(l, t, r, b); }
 
+bool Inside(const D2D1_RECT_F& r, float x, float y) noexcept {
+    return r.right > r.left && x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+// List or thumbnails: the last choice, for every archive previewed next (UI thread).
+bool g_grid_default = false;
+// Sort order and thumbnail size: likewise kept for the next archive.
+ArchivePreview::SortKey g_sort_key = ArchivePreview::SortKey::Name;
+bool g_sort_desc = false;
+float g_icon_dip = 0.0f;  // thumbnail side in DIP (the main view's icon size); 0: Large icons
+
+// Explorer's order: case-insensitive, digits by value ("2" before "10").
+int CompareName(const std::wstring& a, const std::wstring& b) {
+    const int r = CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS,
+                                  a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()),
+                                  nullptr, nullptr, 0);
+    return r == CSTR_LESS_THAN ? -1 : r == CSTR_GREATER_THAN ? 1 : 0;
+}
+
+std::wstring LowerExt(const std::wstring& name) {
+    const size_t dot = name.find_last_of(L'.');
+    return dot == std::wstring::npos || dot == 0 ? std::wstring{} : Lower(name.substr(dot + 1));
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- model
@@ -86,6 +111,9 @@ void ArchivePreview::Clear() {
     folder_ = counting_ = false;
     scroll_ = 0.0f;
     hover_ = selected_ = -1;
+    grid_dir_ = -1;
+    scrollbar_drag_ = false;
+    scrollbar_hover_ = false;
 }
 
 bool ArchivePreview::SetPayload(const std::shared_ptr<const std::wstring>& payload, const std::wstring& file_name, uint64_t file_size) {
@@ -113,6 +141,10 @@ bool ArchivePreview::SetPayloadImpl(const std::wstring& payload, const std::wstr
         file_size_ = file_size;
         return true;
     }
+    // A refreshed listing of the same file (a folder's full count) keeps the
+    // thumbnail view in its folder.
+    const bool same_file = parsed_ && file_name == file_name_;
+    const std::wstring keep_dir = same_file ? GridFolderPath() : std::wstring{};
     Clear();
     if (payload.rfind(L"PULSEARC\t1\t", 0) != 0) return false;
     StorePayload(payload, std::move(owner));
@@ -261,17 +293,184 @@ bool ArchivePreview::SetPayloadImpl(const std::wstring& payload, const std::wstr
             for (int k : nodes_[roots_[0]].kids) if (nodes_[k].dir && nodes_[k].kids.size() <= 24) nodes_[k].open = true;
     }
 
+    if (!same_file) grid_ = g_grid_default;
+    if (!keep_dir.empty())
+        for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
+            if (nodes_[i].dir && NodePath(i) == keep_dir) { grid_dir_ = i; break; }
     parsed_ = true;
+    SortNodes();
     RebuildVisible();
     return true;
 }
 
-std::wstring ArchivePreview::SelectedPath() const {
-    if (selected_ < 0 || selected_ >= static_cast<int>(visible_.size())) return {};
+// ---------------------------------------------------------------- sorting / size
+
+bool ArchivePreview::NodeLess(int a, int b) const {
+    const Node& x = nodes_[a];
+    const Node& y = nodes_[b];
+    if (x.dir != y.dir) return x.dir;  // folders first, in either direction
+    int c = 0;
+    switch (g_sort_key) {
+    case SortKey::Size: c = x.size < y.size ? -1 : x.size > y.size ? 1 : 0; break;
+    case SortKey::Date: c = x.date.compare(y.date); c = c < 0 ? -1 : c > 0 ? 1 : 0; break;
+    case SortKey::Type: if (!x.dir) c = CompareName(LowerExt(x.name), LowerExt(y.name)); break;
+    case SortKey::Name: break;
+    }
+    if (c == 0) c = CompareName(x.name, y.name);
+    if (c == 0) return a < b;
+    return g_sort_desc ? c > 0 : c < 0;
+}
+
+void ArchivePreview::SortNodes() {
+    const auto less = [this](int a, int b) { return NodeLess(a, b); };
+    std::sort(roots_.begin(), roots_.end(), less);
+    for (Node& n : nodes_)
+        if (n.dir && n.kids.size() > 1) std::sort(n.kids.begin(), n.kids.end(), less);
+}
+
+bool ArchivePreview::SetSort(SortKey key, bool descending) {
+    if (key == g_sort_key && descending == g_sort_desc) return false;
+    g_sort_key = key;
+    g_sort_desc = descending;
+    if (!parsed_) return true;
+    SortNodes();
+    RebuildVisible();
+    RevealSelection();
+    return true;
+}
+
+ArchivePreview::SortKey ArchivePreview::Sort() const noexcept { return g_sort_key; }
+bool ArchivePreview::SortDescending() const noexcept { return g_sort_desc; }
+
+float ArchivePreview::IconSizeDip() const noexcept {
+    return g_icon_dip > 0.0f ? g_icon_dip : IconPresetDip(ViewMode::LargeIcons, scale_);
+}
+
+// A tile is the picture square plus the label margin, as in the main grid.
+float ArchivePreview::TileSizeDip() const noexcept { return IconSizeDip() + kTileMarginDip; }
+
+bool ArchivePreview::Zoom(float wheel_steps) {
+    const int step = static_cast<int>(std::lround(wheel_steps));
+    if (step == 0) return false;
+    const float before = IconSizeDip();
+    // The main list's Ctrl+wheel steps (2^(1/4), stopping on presets), kept
+    // inside the slider's range: the smallest size does not turn into Details.
+    float next = ZoomIconDip(before, step, scale_);
+    if (!(next > 0.0f)) next = kMinIconDip;
+    next = (std::clamp)(next, kMinIconDip, kMaxIconDip);
+    if (next == before) return false;
+    g_icon_dip = next;
+    return true;
+}
+
+bool ArchivePreview::SetTileFromX(float x) {
+    if (slider_track_.right <= slider_track_.left) return false;
+    const float next = IconSizeSliderValueAt(slider_track_, x, scale_, scale_);
+    if (!(next > 0.0f) || next == IconSizeDip()) return false;
+    g_icon_dip = next;
+    return true;
+}
+
+bool ArchivePreview::TakeSortMenuRequest(D2D1_RECT_F* anchor) {
+    if (!sort_menu_request_) return false;
+    sort_menu_request_ = false;
+    if (anchor) *anchor = sort_chip_;
+    return true;
+}
+
+bool ArchivePreview::DragItem(std::wstring* member, uint64_t* bytes) const {
+    if (folder_ || selected_ < 0 || selected_ >= static_cast<int>(visible_.size())) return false;
+    const int node = visible_[selected_];
+    if (member) *member = NodePath(node);
+    if (bytes) *bytes = nodes_[node].size;
+    return true;
+}
+
+std::wstring ArchivePreview::DropFolderAt(float x, float y) {
+    drop_hover_ = -1;
+    const int row = RowAt(x, y);
+    if (row >= 0) {
+        const int node = visible_[row];
+        if (nodes_[node].dir) {
+            drop_hover_ = row;
+            return NodePath(node);
+        }
+        if (!grid_) return nodes_[node].parent >= 0 ? NodePath(nodes_[node].parent) : std::wstring{};
+    }
+    return grid_ && filter_.empty() ? GridFolderPath() : std::wstring{};
+}
+
+bool ArchivePreview::Release(float x, float y) {
+    const int node = pending_;
+    pending_ = -1;
+    if (node < 0 || node >= static_cast<int>(nodes_.size())) return false;
+    const int row = RowAt(x, y);
+    if (row < 0 || visible_[row] != node) return false;
+    if (grid_) return EnterGridFolder(node);
+    if (!filter_.empty()) return false;
+    nodes_[node].open = !nodes_[node].open;
+    RebuildVisible();
+    return true;
+}
+
+std::wstring ArchivePreview::NodePath(int index) const {
     std::wstring path;
-    for (int i = visible_[selected_]; i >= 0; i = nodes_[i].parent)
+    for (int i = index; i >= 0 && i < static_cast<int>(nodes_.size()); i = nodes_[i].parent)
         path = path.empty() ? nodes_[i].name : nodes_[i].name + L"\\" + path;
     return path;
+}
+
+std::wstring ArchivePreview::SelectedPath() const {
+    if (selected_ < 0 || selected_ >= static_cast<int>(visible_.size())) return {};
+    return NodePath(visible_[selected_]);
+}
+
+std::wstring ArchivePreview::GridFolderPath() const {
+    return grid_dir_ >= 0 ? NodePath(grid_dir_) : std::wstring{};
+}
+
+bool ArchivePreview::SetGridMode(bool on) {
+    if (grid_ == on) return false;
+    const int keep = (selected_ >= 0 && selected_ < static_cast<int>(visible_.size())) ? visible_[selected_] : -1;
+    grid_ = on;
+    g_grid_default = on;
+    // Thumbnails open on the selected item's folder; the tree opens down to
+    // the folder the thumbnails showed.
+    if (on && keep >= 0 && filter_.empty()) grid_dir_ = nodes_[keep].parent;
+    if (!on) for (int p = grid_dir_; p >= 0; p = nodes_[p].parent) nodes_[p].open = true;
+    scroll_ = 0.0f;
+    hover_ = -1;
+    RebuildVisible();
+    RevealSelection();
+    return true;
+}
+
+bool ArchivePreview::CanGoUp() const noexcept {
+    if (grid_dir_ < 0 || !filter_.empty()) return false;
+    // A lone top folder is where the thumbnails start: nothing above it.
+    return !(nodes_[grid_dir_].parent < 0 && roots_.size() == 1);
+}
+
+bool ArchivePreview::EnterGridFolder(int index) {
+    if (index < 0 || !nodes_[index].dir || !filter_.empty()) return false;
+    grid_dir_ = index;
+    selected_ = hover_ = -1;
+    scroll_ = 0.0f;
+    RebuildVisible();
+    return true;
+}
+
+bool ArchivePreview::GridUp() {
+    if (!CanGoUp()) return false;
+    const int from = grid_dir_;
+    grid_dir_ = nodes_[from].parent;
+    selected_ = hover_ = -1;
+    scroll_ = 0.0f;
+    RebuildVisible();
+    const auto it = std::find(visible_.begin(), visible_.end(), from);
+    if (it != visible_.end()) selected_ = static_cast<int>(it - visible_.begin());
+    RevealSelection();
+    return true;
 }
 
 std::wstring ArchivePreview::StateNote() const {
@@ -304,13 +503,28 @@ void ArchivePreview::RebuildVisible() {
     const int keep = (selected_ >= 0 && selected_ < static_cast<int>(visible_.size()))
         ? visible_[selected_] : -1;
     visible_.clear();
-    for (int r : roots_) AppendVisible(r);
+    if (grid_) {
+        // Thumbnails: the current folder's items; a search lists every match.
+        if (!filter_.empty()) {
+            for (int i = 0; i < static_cast<int>(nodes_.size()); ++i)
+                if (nodes_[i].self_match) visible_.push_back(i);
+            std::stable_sort(visible_.begin(), visible_.end(), [this](int a, int b) { return NodeLess(a, b); });
+        } else {
+            if (grid_dir_ >= static_cast<int>(nodes_.size()) || (grid_dir_ >= 0 && !nodes_[grid_dir_].dir)) grid_dir_ = -1;
+            if (grid_dir_ < 0 && roots_.size() == 1 && nodes_[roots_[0]].dir) grid_dir_ = roots_[0];
+            const auto& items = grid_dir_ >= 0 ? nodes_[grid_dir_].kids : roots_;
+            visible_.assign(items.begin(), items.end());
+        }
+    } else {
+        for (int r : roots_) AppendVisible(r);
+    }
     selected_ = -1;
     if (keep >= 0) {
         const auto it = std::find(visible_.begin(), visible_.end(), keep);
         if (it != visible_.end()) selected_ = static_cast<int>(it - visible_.begin());
     }
     hover_ = -1;
+    scrollbar_drag_ = false;
     ClampScroll();
 }
 
@@ -343,9 +557,20 @@ float ArchivePreview::RowHeight() const noexcept {
     return (large_ ? 30.0f : 26.0f) * scale_;
 }
 
+float ArchivePreview::TileHeight() const noexcept {
+    return (std::min)(tile_w_, TileSizeDip() * scale_) + 24.0f * scale_;
+}
+
+float ArchivePreview::ContentHeight() const noexcept {
+    if (!grid_) return RowHeight() * static_cast<float>(visible_.size());
+    const int cols = (std::max)(1, grid_cols_);
+    const int rows = (static_cast<int>(visible_.size()) + cols - 1) / cols;
+    return TileHeight() * static_cast<float>(rows);
+}
+
 void ArchivePreview::ClampScroll() {
     const float view = tree_rect_.bottom - tree_rect_.top;
-    const float content = RowHeight() * static_cast<float>(visible_.size());
+    const float content = ContentHeight();
     const float max_scroll = (std::max)(0.0f, content - view);
     scroll_ = (std::clamp)(scroll_, 0.0f, max_scroll);
 }
@@ -361,12 +586,88 @@ bool ArchivePreview::Scroll(float wheel_steps) {
     return ScrollPixels(-wheel_steps * RowHeight() * 3.0f);
 }
 
+ArchivePreview::ScrollbarGeometry ArchivePreview::Scrollbar() const noexcept {
+    ScrollbarGeometry bar;
+    const float view = tree_rect_.bottom - tree_rect_.top;
+    const float content = ContentHeight();
+    if (!parsed_ || visible_.empty() || view <= 0.0f || content <= view + 0.5f) return bar;
+    const float start = tree_rect_.top + 2.0f * scale_;
+    const float track = (std::max)(0.0f, view - 4.0f * scale_);
+    const float thumb = (std::min)(track, (std::max)(24.0f * scale_, track * view / content));
+    bar.maximum = content - view;
+    bar.travel = track - thumb;
+    const float ty = start + bar.travel * std::clamp(scroll_ / bar.maximum, 0.0f, 1.0f);
+    bar.thumb = R(tree_rect_.right - 7.0f * scale_, ty, tree_rect_.right - 3.0f * scale_, ty + thumb);
+    const float hit_right = large_ ? tree_rect_.right + 2.0f * scale_ : (std::max)(tree_rect_.right, view_rect_.right);
+    bar.hit = R((std::max)(tree_rect_.left, tree_rect_.right - 14.0f * scale_), start, hit_right, start + track);
+    return bar;
+}
+
+bool ArchivePreview::OverScrollbar(float x, float y) const noexcept {
+    const auto bar = Scrollbar();
+    return bar.maximum > 0.0f && x >= bar.hit.left && x < bar.hit.right &&
+        y >= bar.hit.top && y < bar.hit.bottom;
+}
+
+bool ArchivePreview::ScrollbarMouseDown(float x, float y) {
+    scrollbar_drag_ = false;
+    slider_drag_ = false;
+    if (grid_ && Inside(slider_hit_, x, y)) {
+        slider_drag_ = true;
+        pending_ = -1;
+        SetTileFromX(x);
+        return true;
+    }
+    const auto bar = Scrollbar();
+    if (bar.maximum <= 0.0f || x < bar.hit.left || x >= bar.hit.right ||
+        y < bar.hit.top || y >= bar.hit.bottom)
+        return false;
+    if (y >= bar.thumb.top && y < bar.thumb.bottom && bar.travel > 0.0f) {
+        scrollbar_drag_ = true;
+        scrollbar_press_ = y;
+        scrollbar_start_ = scroll_;
+    } else {
+        const float view = tree_rect_.bottom - tree_rect_.top;
+        scroll_ += (y < bar.thumb.top ? -1.0f : 1.0f) * view * 0.9f;
+        ClampScroll();
+    }
+    return true;
+}
+
+bool ArchivePreview::ScrollbarMouseMove(float x, float y) {
+    if (slider_drag_) return SetTileFromX(x);
+    if (!scrollbar_drag_) return false;
+    const auto bar = Scrollbar();
+    if (bar.travel <= 0.0f) { scrollbar_drag_ = false; return false; }
+    const float before = scroll_;
+    scroll_ = scrollbar_start_ + (y - scrollbar_press_) * bar.maximum / bar.travel;
+    ClampScroll();
+    return scroll_ != before;
+}
+
+void ArchivePreview::DrawScrollbar(ID2D1DeviceContext* dc, const Theme& theme) {
+    const auto bar = Scrollbar();
+    if (bar.maximum <= 0.0f) return;
+    const float alpha = scrollbar_drag_ ? 0.45f : scrollbar_hover_ ? 0.36f : 0.25f;
+    Fill(dc, bar.thumb, 2.0f * scale_, WithAlpha(theme.text, alpha));
+}
+
 bool ArchivePreview::Contains(float x, float y) const noexcept {
     return x >= view_rect_.left && x < view_rect_.right && y >= view_rect_.top &&
            y < view_rect_.bottom;
 }
 
+int ArchivePreview::TileAt(float x, float y) const {
+    if (!Inside(tree_rect_, x, y) || tile_w_ <= 0.0f) return -1;
+    const int col = static_cast<int>((x - tree_rect_.left) / tile_w_);
+    const int row = static_cast<int>((y - tree_rect_.top + scroll_) / TileHeight());
+    if (col < 0 || col >= grid_cols_ || row < 0) return -1;
+    const int index = row * grid_cols_ + col;
+    return index < static_cast<int>(visible_.size()) ? index : -1;
+}
+
 int ArchivePreview::RowAt(float x, float y) const {
+    if (grid_) return TileAt(x, y);
     if (x < tree_rect_.left || x >= tree_rect_.right || y < tree_rect_.top ||
         y >= tree_rect_.bottom)
         return -1;
@@ -386,41 +687,84 @@ bool ArchivePreview::SelectAt(float x, float y) {
 }
 
 bool ArchivePreview::Click(float x, float y) {
+    pending_ = -1;
+    if (Inside(toggle_list_, x, y)) { SetGridMode(false); return true; }
+    if (Inside(toggle_grid_, x, y)) { SetGridMode(true); return true; }
+    if (Inside(sort_chip_, x, y)) { sort_menu_request_ = true; return true; }
+    // Column headers sort the tree; a second click reverses.
+    const auto by = [this](SortKey key) {
+        const bool desc = g_sort_key == key ? !g_sort_desc : (key == SortKey::Size || key == SortKey::Date);
+        SetSort(key, desc);
+        return true;
+    };
+    if (!grid_ && Inside(head_name_, x, y)) return by(SortKey::Name);
+    if (!grid_ && Inside(head_size_, x, y)) return by(SortKey::Size);
+    if (!grid_ && Inside(head_date_, x, y)) return by(SortKey::Date);
+    if (grid_ && Inside(crumb_up_, x, y)) return GridUp();
     const int row = RowAt(x, y);
     if (row < 0) return false;
     selected_ = row;
-    Node& n = nodes_[visible_[row]];
-    if (n.dir && filter_.empty()) {
-        n.open = !n.open;
-        RebuildVisible();
-    }
+    // A folder opens (thumbnails) or toggles (tree) on release (Release), so
+    // pressing it can start a drag-out instead.
+    if (nodes_[visible_[row]].dir) pending_ = visible_[row];
     return true;
 }
 
 bool ArchivePreview::Hover(float x, float y) {
-    const int row = RowAt(x, y);
-    if (row == hover_) return false;
+    const bool over_bar = OverScrollbar(x, y);
+    const bool over_slider = grid_ && Inside(slider_hit_, x, y);
+    const int row = over_bar || over_slider ? -1 : RowAt(x, y);
+    if (row == hover_ && over_bar == scrollbar_hover_ && over_slider == slider_hover_) return false;
     hover_ = row;
+    scrollbar_hover_ = over_bar;
+    slider_hover_ = over_slider;
     return true;
 }
 
 bool ArchivePreview::Leave() {
-    if (hover_ < 0) return false;
+    if (hover_ < 0 && !scrollbar_hover_ && !slider_hover_) return false;
     hover_ = -1;
+    scrollbar_hover_ = false;
+    slider_hover_ = false;
     return true;
 }
 
 void ArchivePreview::RevealSelection() {
     if (selected_ < 0) return;
-    const float h = RowHeight();
-    const float top = selected_ * h;
+    const float h = grid_ ? TileHeight() : RowHeight();
+    const float top = grid_ ? static_cast<float>(selected_ / (std::max)(1, grid_cols_)) * h : selected_ * h;
     const float view = tree_rect_.bottom - tree_rect_.top;
     if (top < scroll_) scroll_ = top;
     else if (top + h > scroll_ + view) scroll_ = top + h - view;
     ClampScroll();
 }
 
+bool ArchivePreview::GridKey(UINT vk) {
+    if (vk == VK_BACK) return GridUp();
+    if (visible_.empty()) return false;
+    const int last = static_cast<int>(visible_.size()) - 1;
+    const int cols = (std::max)(1, grid_cols_);
+    const int page = (std::max)(1, static_cast<int>((tree_rect_.bottom - tree_rect_.top) / TileHeight())) * cols;
+    switch (vk) {
+    case VK_RIGHT: selected_ = selected_ < 0 ? 0 : (std::min)(last, selected_ + 1); break;
+    case VK_LEFT: selected_ = selected_ < 0 ? 0 : (std::max)(0, selected_ - 1); break;
+    case VK_DOWN: selected_ = selected_ < 0 ? 0 : (std::min)(last, selected_ + cols); break;
+    case VK_UP: selected_ = selected_ < 0 ? 0 : (std::max)(0, selected_ - cols); break;
+    case VK_NEXT: selected_ = (std::min)(last, (std::max)(0, selected_) + page); break;
+    case VK_PRIOR: selected_ = (std::max)(0, selected_ - page); break;
+    case VK_HOME: selected_ = 0; break;
+    case VK_END: selected_ = last; break;
+    case VK_RETURN:
+        if (selected_ < 0 || !nodes_[visible_[selected_]].dir) return false;
+        return EnterGridFolder(visible_[selected_]);
+    default: return false;
+    }
+    RevealSelection();
+    return true;
+}
+
 bool ArchivePreview::Key(UINT vk) {
+    if (grid_) return GridKey(vk);
     if (visible_.empty()) return false;
     const int last = static_cast<int>(visible_.size()) - 1;
     const int page = (std::max)(1, static_cast<int>((tree_rect_.bottom - tree_rect_.top) / RowHeight()) - 1);
@@ -478,7 +822,7 @@ void ArchivePreview::EnsureResources(ID2D1DeviceContext* dc, Compositor* composi
     if (factory == factory_ && scale == format_scale_ && body_) return;
     factory_ = factory;
     format_scale_ = scale;
-    body_.Reset(); small_.Reset(); chip_.Reset(); value_.Reset(); title_.Reset(); icon_.Reset();
+    body_.Reset(); small_.Reset(); chip_.Reset(); value_.Reset(); title_.Reset(); icon_.Reset(); tile_chip_.Reset();
     if (!factory) return;
     using typography::FontRole;
     auto make = [&](FontRole role, float size, DWRITE_FONT_WEIGHT weight,
@@ -502,6 +846,7 @@ void ArchivePreview::EnsureResources(ID2D1DeviceContext* dc, Compositor* composi
     make(FontRole::Text, 17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, value_);
     make(FontRole::Text, 14.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, title_);
     make(FontRole::Icon, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, icon_);
+    make(FontRole::Text, 12.0f, DWRITE_FONT_WEIGHT_BOLD, tile_chip_);
 }
 
 void ArchivePreview::DrawText(ID2D1DeviceContext* dc, IDWriteTextFormat* format,
@@ -714,7 +1059,7 @@ void ArchivePreview::DrawTree(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, c
         const float top = rect.top + row * rowH - scroll_;
         const D2D1_RECT_F rowRect = R(rect.left, top, rect.right, top + rowH);
         const float cy = top + rowH * 0.5f;
-        if (row == selected_) Fill(dc, R(rowRect.left + 2.0f * s, top + 1.0f * s, rowRect.right - 2.0f * s, rowRect.bottom - 1.0f * s), 5.0f * s, theme.fill_selected);
+        if (row == selected_ || row == drop_hover_) Fill(dc, R(rowRect.left + 2.0f * s, top + 1.0f * s, rowRect.right - 2.0f * s, rowRect.bottom - 1.0f * s), 5.0f * s, theme.fill_selected);
         else if (row == hover_) Fill(dc, R(rowRect.left + 2.0f * s, top + 1.0f * s, rowRect.right - 2.0f * s, rowRect.bottom - 1.0f * s), 5.0f * s, theme.fill_hover);
 
         // Indent guides.
@@ -793,15 +1138,148 @@ void ArchivePreview::DrawTree(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, c
     dc->PopAxisAlignedClip();
 
     // Overlay scrollbar.
-    const float content = rowH * visible_.size();
-    const float view = rect.bottom - rect.top;
-    if (content > view + 0.5f) {
-        const float trackH = view - 4.0f * s;
-        const float thumbH = (std::max)(24.0f * s, trackH * view / content);
-        const float t = scroll_ / (content - view);
-        const float ty = rect.top + 2.0f * s + (trackH - thumbH) * t;
-        Fill(dc, R(rect.right - 5.0f * s, ty, rect.right - 2.0f * s, ty + thumbH), 1.5f * s, theme.scrollbar_thumb);
+    DrawScrollbar(dc, theme);
+}
+
+// ---------------------------------------------------------------- thumbnail view
+
+// Two-segment list / thumbnails switch. Returns its right edge.
+float ArchivePreview::DrawViewToggle(ID2D1DeviceContext* dc, float left, float cy, const Theme& theme) {
+    const float s = scale_;
+    const float bw = 28.0f * s, bh = 22.0f * s, pad = 2.0f * s;
+    const D2D1_RECT_F whole = R(left, cy - bh * 0.5f - pad, left + bw * 2.0f + pad * 2.0f, cy + bh * 0.5f + pad);
+    Fill(dc, whole, 6.0f * s, theme.fill_hover);
+    toggle_list_ = R(whole.left + pad, whole.top + pad, whole.left + pad + bw, whole.bottom - pad);
+    toggle_grid_ = R(toggle_list_.right, toggle_list_.top, toggle_list_.right + bw, toggle_list_.bottom);
+    Fill(dc, grid_ ? toggle_grid_ : toggle_list_, 4.5f * s, theme.fill_selected);
+    DrawText(dc, icon_.Get(), L"\uE8FD", toggle_list_, grid_ ? theme.text_secondary : theme.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+    DrawText(dc, icon_.Get(), L"\uF0E2", toggle_grid_, grid_ ? theme.text : theme.text_secondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    return whole.right;
+}
+
+// The sort button (its menu is the host's). Returns its right edge.
+float ArchivePreview::DrawSortChip(ID2D1DeviceContext* dc, float left, float cy, const Theme& theme) {
+    const float s = scale_;
+    sort_chip_ = R(left, cy - 13.0f * s, left + 28.0f * s, cy + 13.0f * s);
+    const bool custom = g_sort_key != SortKey::Name || g_sort_desc;
+    Fill(dc, sort_chip_, 6.0f * s, custom ? theme.fill_selected : theme.fill_hover);
+    DrawText(dc, icon_.Get(), L"\uE8CB", sort_chip_, custom ? theme.text : theme.text_secondary, DWRITE_TEXT_ALIGNMENT_CENTER);
+    return sort_chip_.right;
+}
+
+// Thumbnail size slider, right-aligned at `right`. Returns its left edge.
+float ArchivePreview::DrawSlider(ID2D1DeviceContext* dc, float right, float cy, const Theme& theme) {
+    // The main pane header's size slider (small and large icon marks, track,
+    // presets, thumb): the same control, not a look-alike.
+    const float s = scale_;
+    slider_track_ = R(right - kIconSizeSliderWidth * s, cy - 12.0f * s, right, cy + 12.0f * s);
+    slider_hit_ = R(slider_track_.left - 2.0f * s, slider_track_.top, slider_track_.right + 2.0f * s, slider_track_.bottom);
+    DrawIconSizeSlider(dc, brush_.Get(), slider_track_, IconSizeDip(), s, s, theme, slider_drag_ || slider_hover_);
+    return slider_track_.left;
+}
+
+// Back button and where the thumbnails are ("folder > sub"), or the match count.
+void ArchivePreview::DrawCrumb(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme) {
+    const float s = scale_;
+    const float cy = (rect.top + rect.bottom) * 0.5f;
+    float x = rect.left;
+    crumb_up_ = {};
+    if (CanGoUp()) {
+        crumb_up_ = R(x, cy - 11.0f * s, x + 24.0f * s, cy + 11.0f * s);
+        Fill(dc, crumb_up_, 5.0f * s, theme.fill_hover);
+        DrawText(dc, icon_.Get(), L"\uE72B", crumb_up_, theme.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+        x = crumb_up_.right + 8.0f * s;
     }
+    std::wstring label;
+    if (!filter_.empty()) {
+        label = Fmt(StringId::ArcItems, static_cast<int>(visible_.size()));
+    } else if (grid_dir_ >= 0) {
+        for (const wchar_t ch : NodePath(grid_dir_)) {
+            if (ch == L'\\') label += L"  \x203A  ";
+            else label += ch;
+        }
+    } else {
+        label = file_name_;
+    }
+    DrawText(dc, small_.Get(), label, R(x, rect.top, rect.right, rect.bottom), theme.text_secondary);
+}
+
+// The tree's folder glyph, scaled to the tile.
+void ArchivePreview::DrawFolderArt(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect) {
+    const float cx = (rect.left + rect.right) * 0.5f, cy = (rect.top + rect.bottom) * 0.5f;
+    const float u = (rect.right - rect.left) / 34.0f;
+    Fill(dc, R(cx - 12.0f * u, cy - 10.0f * u, cx - 1.0f * u, cy - 4.0f * u), 2.0f * u, HexColor(kFolderGold));
+    Fill(dc, R(cx - 12.0f * u, cy - 7.0f * u, cx + 12.0f * u, cy + 9.0f * u), 3.0f * u, HexColor(kFolderGold));
+    Fill(dc, R(cx - 12.0f * u, cy - 3.5f * u, cx + 12.0f * u, cy + 9.0f * u), 3.0f * u, HexColor(0xF5C542));
+}
+
+void ArchivePreview::DrawGrid(ID2D1DeviceContext* dc, const D2D1_RECT_F& rect, const Theme& theme) {
+    const float s = scale_;
+    tree_rect_ = rect;
+    const float width = (std::max)(1.0f, rect.right - rect.left - 10.0f * s);  // room for the scrollbar
+    grid_cols_ = (std::max)(1, static_cast<int>(width / (TileSizeDip() * s)));
+    tile_w_ = width / static_cast<float>(grid_cols_);
+    ClampScroll();
+    if (visible_.empty()) {
+        const std::wstring msg = pulse::l10n::Get(!filter_.empty() ? StringId::ArcNoMatch
+                                                       : folder_ ? StringId::EmptyFolder : StringId::ArcEmpty);
+        DrawText(dc, body_.Get(), msg, rect, theme.text_disabled, DWRITE_TEXT_ALIGNMENT_CENTER);
+        return;
+    }
+    const float tileH = TileHeight();
+    // Picture square: the chosen icon size; spare width only spaces the tiles.
+    const float side = (std::min)(tile_w_, TileSizeDip() * s) - kTileMarginDip * s;
+    dc->PushAxisAlignedClip(rect, D2D1_ANTIALIAS_MODE_ALIASED);
+    const int first_row = (std::max)(0, static_cast<int>(scroll_ / tileH));
+    const int last_row = static_cast<int>((scroll_ + (rect.bottom - rect.top)) / tileH);
+    for (int row = first_row; row <= last_row; ++row) {
+        for (int col = 0; col < grid_cols_; ++col) {
+            const int index = row * grid_cols_ + col;
+            if (index >= static_cast<int>(visible_.size())) break;
+            const int node = visible_[index];
+            const Node& n = nodes_[node];
+            const float left = rect.left + col * tile_w_;
+            const float top = rect.top + row * tileH - scroll_;
+            const float pad = (tile_w_ - side - kTileMarginDip * s) * 0.5f;  // spare width, both sides
+            const D2D1_RECT_F cell = R(left + pad + 3.0f * s, top + 3.0f * s, left + tile_w_ - pad - 3.0f * s, top + tileH - 3.0f * s);
+            if (index == selected_ || index == drop_hover_) Fill(dc, cell, 8.0f * s, theme.fill_selected);
+            else if (index == hover_) Fill(dc, cell, 8.0f * s, theme.fill_hover);
+            const D2D1_RECT_F art = R(left + (tile_w_ - side) * 0.5f, top + 9.0f * s,
+                                      left + (tile_w_ + side) * 0.5f, top + 9.0f * s + side);
+            // The main list's shell icon (folders, file types) where no
+            // picture thumbnail exists, at about the main grid's proportion.
+            const float acx = (art.left + art.right) * 0.5f, acy = (art.top + art.bottom) * 0.5f;
+            const float icon = std::round(side * (n.dir ? 0.78f : 0.66f));
+            const D2D1_RECT_F icon_rect = R(std::round(acx - icon * 0.5f), std::round(acy - icon * 0.5f),
+                                            std::round(acx - icon * 0.5f) + icon, std::round(acy - icon * 0.5f) + icon);
+            if (n.dir) {
+                if (!type_icon_ || !type_icon_(dc, icon_rect, n.name, true)) DrawFolderArt(dc, art);
+            } else if ((!tile_art_ || !tile_art_(dc, art, NodePath(node), n.size)) &&
+                       (!type_icon_ || !type_icon_(dc, icon_rect, n.name, false))) {
+                // Type tile: a page in the family colour with the extension.
+                const float ph = side * 0.66f, pw = ph * 0.8f;
+                const float cx = acx, cy = acy;
+                const D2D1_RECT_F page = R(cx - pw * 0.5f, cy - ph * 0.5f, cx + pw * 0.5f, cy + ph * 0.5f);
+                Fill(dc, page, 6.0f * s, HexColor(n.rgb, 0.14f));
+                Fill(dc, R(page.left, page.bottom - 4.0f * s, page.right, page.bottom), 2.0f * s, HexColor(n.rgb, 0.55f));
+                DrawText(dc, tile_chip_.Get(), n.chip, page, HexColor(n.rgb), DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+            if (n.encrypted && !n.dir)
+                DrawText(dc, icon_.Get(), L"\uE72E", R(art.right - 16.0f * s, art.top, art.right, art.top + 16.0f * s),
+                         HexColor(0xD97706), DWRITE_TEXT_ALIGNMENT_CENTER);
+            const float ty = art.bottom + 3.0f * s;
+            DrawText(dc, small_.Get(), n.name, R(cell.left + 4.0f * s, ty, cell.right - 4.0f * s, ty + 17.0f * s),
+                     theme.text, DWRITE_TEXT_ALIGNMENT_CENTER);
+            const std::wstring sub = n.dir
+                ? Fmt(StringId::ArcItems, static_cast<int>(folder_ && n.kids.empty() ? n.packed : n.kids.size()))
+                : pulse::format::ByteSize(n.size);
+            DrawText(dc, chip_.Get(), sub, R(cell.left + 4.0f * s, ty + 16.0f * s, cell.right - 4.0f * s, ty + 30.0f * s),
+                     theme.text_disabled, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+    }
+    dc->PopAxisAlignedClip();
+
+    DrawScrollbar(dc, theme);
 }
 
 float ArchivePreview::StateNoteHeight(float width) const {
@@ -827,11 +1305,17 @@ void ArchivePreview::DrawStateNote(ID2D1DeviceContext* dc, const D2D1_RECT_F& re
 void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const D2D1_RECT_F& rect,
                           const Theme& theme, float scale, bool large) {
     if (!dc || !parsed_) return;
-    scale_ = scale > 0.0f ? scale : 1.0f;
+    const float next_scale = scale > 0.0f ? scale : 1.0f;
+    if (rect.left != view_rect_.left || rect.top != view_rect_.top ||
+        rect.right != view_rect_.right || rect.bottom != view_rect_.bottom ||
+        next_scale != scale_)
+        scrollbar_drag_ = false;
+    scale_ = next_scale;
     const float s = scale_;
     EnsureResources(dc, compositor, s);
     if (!brush_ || !body_) return;
     view_rect_ = rect;
+    sort_chip_ = slider_track_ = slider_hit_ = head_name_ = head_size_ = head_date_ = {};
     const float width = rect.right - rect.left;
     // Quick Look collapses to the compact layout when the window is narrow.
     large_ = large && width >= 640.0f * s;
@@ -842,7 +1326,14 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         D2D1_RECT_F r = R(rect.left + pad, rect.top + pad, rect.right - pad, rect.bottom - pad);
         const float h = r.bottom - r.top;
         float y = r.top;
-        y += DrawHeader(dc, R(r.left, y, r.right, r.bottom), theme, false) + 10.0f * s;
+        // The list / thumbnails switch at the header's right.
+        // The sort button sits just before it.
+        const float toggle_w = 60.0f * s;
+        const float sort_left = r.right - toggle_w - 34.0f * s;
+        const float header_h = DrawHeader(dc, R(r.left, y, sort_left - 8.0f * s, r.bottom), theme, false);
+        DrawViewToggle(dc, r.right - toggle_w, y + header_h * 0.5f, theme);
+        DrawSortChip(dc, sort_left, y + header_h * 0.5f, theme);
+        y += header_h + 10.0f * s;
         if (h > 220.0f * s && !mix_.empty()) y += DrawMix(dc, R(r.left, y, r.right, r.bottom), theme, 4) + 6.0f * s;
         Fill(dc, R(r.left, y, r.right, y + 1.0f), 0.0f, theme.stroke_divider);
         y += 4.0f * s;
@@ -852,7 +1343,16 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
             DrawStateNote(dc, R(r.left, bottom - note_height, r.right, bottom), theme);
             bottom -= note_height;
         }
-        DrawTree(dc, R(rect.left + 4.0f * s, y, rect.right - 4.0f * s, bottom), theme, false);
+        crumb_up_ = {};
+        if (grid_) {
+            float crumb_right = r.right;
+            if (r.right - r.left > 220.0f * s)
+                crumb_right = DrawSlider(dc, r.right, y + 14.0f * s, theme) - 8.0f * s;
+            DrawCrumb(dc, R(r.left, y, crumb_right, y + 28.0f * s), theme);
+            DrawGrid(dc, R(rect.left + 4.0f * s, y + 30.0f * s, rect.right - 4.0f * s, bottom), theme);
+        } else {
+            DrawTree(dc, R(rect.left + 4.0f * s, y, rect.right - 4.0f * s, bottom), theme, false);
+        }
         return;
     }
 
@@ -929,18 +1429,38 @@ void ArchivePreview::Draw(ID2D1DeviceContext* dc, Compositor* compositor, const 
         const bool showDate = w > 420.0f * s;
         float cx = right.right - 10.0f * s;
         const D2D1_RECT_F head = R(right.left, right.top, right.right, right.top + headH);
-        DrawText(dc, small_.Get(), pulse::l10n::Get(StringId::ArcColName), R(head.left + 12.0f * s, head.top, head.right, head.bottom), theme.text_secondary);
-        if (showDate) {
-            DrawText(dc, small_.Get(), pulse::l10n::Get(StringId::ArcColModified), R(cx - 118.0f * s, head.top, cx, head.bottom), theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            cx -= 118.0f * s;
+        // The list / thumbnails switch leads the header in both views.
+        const float hcy = (head.top + head.bottom) * 0.5f;
+        const float after_toggle = DrawSortChip(dc, DrawViewToggle(dc, head.left + 6.0f * s, hcy, theme) + 6.0f * s,
+                                                hcy, theme) + 10.0f * s;
+        crumb_up_ = {};
+        // The sorted column carries an arrow.
+        const auto label = [](StringId id, SortKey key) {
+            std::wstring text = pulse::l10n::Get(id);
+            if (g_sort_key == key) text += g_sort_desc ? L" \u2193" : L" \u2191";
+            return text;
+        };
+        if (grid_) {
+            const float slider_left = DrawSlider(dc, head.right - 10.0f * s, hcy, theme);
+            DrawCrumb(dc, R(after_toggle, head.top, slider_left - 10.0f * s, head.bottom), theme);
+        } else {
+            head_name_ = R(after_toggle, head.top, (std::min)(head.right, after_toggle + 160.0f * s), head.bottom);
+            DrawText(dc, small_.Get(), label(StringId::ArcColName, SortKey::Name), R(after_toggle, head.top, head.right, head.bottom), theme.text_secondary);
+            if (showDate) {
+                head_date_ = R(cx - 118.0f * s, head.top, cx, head.bottom);
+                DrawText(dc, small_.Get(), label(StringId::ArcColModified, SortKey::Date), head_date_, theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                cx -= 118.0f * s;
+            }
+            head_size_ = R(cx - 70.0f * s, head.top, cx, head.bottom);
+            DrawText(dc, small_.Get(), label(StringId::ArcColSize, SortKey::Size), head_size_, theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            cx -= 70.0f * s;
+            if (showPacked)
+                DrawText(dc, small_.Get(), pulse::l10n::Get(StringId::ArcColPacked), R(cx - 70.0f * s, head.top, cx, head.bottom), theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
-        DrawText(dc, small_.Get(), pulse::l10n::Get(StringId::ArcColSize), R(cx - 70.0f * s, head.top, cx, head.bottom), theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        cx -= 70.0f * s;
-        if (showPacked)
-            DrawText(dc, small_.Get(), pulse::l10n::Get(StringId::ArcColPacked), R(cx - 70.0f * s, head.top, cx, head.bottom), theme.text_secondary, DWRITE_TEXT_ALIGNMENT_TRAILING);
         Fill(dc, R(head.left, head.bottom - 1.0f, head.right, head.bottom), 0.0f, theme.stroke_divider);
     }
-    DrawTree(dc, R(right.left, right.top + headH + 2.0f * s, right.right, right.bottom - footH), theme, true);
+    if (grid_) DrawGrid(dc, R(right.left, right.top + headH + 4.0f * s, right.right, right.bottom - footH), theme);
+    else DrawTree(dc, R(right.left, right.top + headH + 2.0f * s, right.right, right.bottom - footH), theme, true);
     if (!state_note.empty() && footH > 0.0f) {
         Fill(dc, R(right.left, right.bottom - footH, right.right, right.bottom - footH + 1.0f), 0.0f, theme.stroke_divider);
         DrawStateNote(dc, R(right.left + 12.0f * s, right.bottom - footH + 4.0f * s, right.right - 10.0f * s, right.bottom), theme);

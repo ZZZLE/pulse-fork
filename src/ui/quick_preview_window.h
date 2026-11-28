@@ -18,14 +18,30 @@
 #include "quick_preview_command.h"
 #include "quick_preview_size_probe.h"
 #include "open_with_icons.h"
+#include "shell_icons.h"
+#include "drag_drop.h"
 
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <deque>
+#include <memory>
 
 namespace pulse::ui {
+
+// What an archive preview asks of the app (app_vfs_ops.cpp). owner is the
+// window's message owner. stage extracts archive members ("dir\\file") to a
+// staging folder while the button is held and returns the staged paths (empty:
+// cancelled or refused, the app says why); add puts files into the archive
+// folder dir ("" = root) and is true when the change started.
+struct QuickPreviewArchiveBridge {
+    std::vector<std::wstring> (*stage)(HWND owner, const std::wstring& archive,
+                                       const std::vector<std::wstring>& members, uint64_t bytes) = nullptr;
+    bool (*add)(HWND owner, const std::wstring& archive, const std::wstring& dir,
+                const std::vector<std::wstring>& files) = nullptr;
+};
+void SetQuickPreviewArchiveBridge(const QuickPreviewArchiveBridge& bridge);
 
 class QuickPreviewWindow {
 public:
@@ -41,13 +57,14 @@ public:
     QuickPreviewWindow& operator=(const QuickPreviewWindow&) = delete;
 
     bool Initialize(HWND owner, UINT navigate_message, UINT open_message,
-                    UINT command_message = 0);
+                    UINT command_message = 0, HWND message_receiver = nullptr, bool detached_popup = false);
     // zoom_from: screen point of the previewed item's icon; the window grows
     // out of it and shrinks back into it on Close (ui_motion.h rules).
     // activate false: the press-and-hold peek; focus and the mouse stay with
     // the owner and media start muted until Activate.
     void Show(const QuickPreviewItem& item, bool dark, WindowEffect effect, bool safe_mode,
-              const POINT* zoom_from = nullptr, bool activate = true);
+              const POINT* zoom_from = nullptr, bool activate = true,
+              const std::vector<RECT>* avoid_rects = nullptr);
     bool InitializeEmbedded(HWND owner, UINT navigate_message, UINT open_message, UINT command_message);
     void ShowEmbedded(const QuickPreviewItem& item, RECT bounds, bool dark, bool safe_mode);
     void SetEmbeddedBounds(RECT bounds);
@@ -57,6 +74,12 @@ public:
     bool embedded() const noexcept { return embedded_; }
     void Activate();
     void Update(const QuickPreviewItem& item);
+    // The archive at `path` changed (a file was added from this preview):
+    // reloads it when it is the item shown.
+    void ReloadIfShowing(const std::wstring& path);
+    // ReloadIfShowing on every live preview window (Quick Look, the details
+    // pane, pinned / detached previews).
+    static void ReloadEverywhere(const std::wstring& path);
     void SetStarred(bool starred);
     // Content-search highlights without opening the interactive find bar.
     void SetSearchQuery(const std::wstring& query);
@@ -64,7 +87,7 @@ public:
     void SetAccent(const D2D1_COLOR_F& accent);
     // Settings > 快速预览 > 预览窗口; call before Show. What the window changes
     // itself is reported with QuickPreviewAction::SaveOptions.
-    void SetOptions(const QuickPreviewOptions& options) { options_ = options; }
+    void SetOptions(const QuickPreviewOptions& options);
     const QuickPreviewOptions& options() const noexcept { return options_; }
     // The FFmpeg preview pack offer on the codec cards; repaints on change.
     void SetMediaPackOffer(const MediaPackOffer& offer);
@@ -77,6 +100,14 @@ public:
     void OnExtraPackInstalled();
     void Close();
     bool visible() const noexcept;
+    bool closing() const noexcept { return closing_; }
+    bool always_on_top() const noexcept { return always_on_top_; }
+    bool pinned() const noexcept { return pinned_detached_; }
+    void SetAlwaysOnTop(bool on_top);
+    void ToggleAlwaysOnTop();
+    void DetachAsIndependent(HWND new_message_receiver = nullptr, UINT new_open_message = 0,
+                             UINT new_command_message = 0);
+    void SetMessageReceiver(HWND receiver, UINT open_message = 0, UINT command_message = 0);
     HWND hwnd() const noexcept { return hwnd_; }
     const QuickPreviewItem& item() const noexcept { return item_; }
     bool TakeCommand(UINT_PTR token, QuickPreviewCommand& command) { return commands_.Take(token, command); }
@@ -84,6 +115,7 @@ public:
     std::wstring TakeOpenPath() { std::wstring path; path.swap(open_path_); return path; }
 
 private:
+    friend void ClipEmbeddedPreview(QuickPreviewWindow&, const D2D1_RECT_F&, const D2D1_RECT_F&);
     bool embedded_ = false;
     bool embedded_open_ = false;
     bool embedded_occluded_ = false;
@@ -94,17 +126,28 @@ private:
     friend struct DetailsPreviewProbe;
     friend struct NativePreviewProbe;
     friend struct QuickPreviewAuditTest;
+    friend struct QuickPreviewGalleryProbe;
     friend struct QuickPreviewPlaybackProbe;
+    friend struct AnimationAuxProbe;
     friend struct PreviewDeadlineProbe;
     // Pages: multi-page PDF / AI read as a continuous scroll (quick_preview_pages.cpp).
     enum class NativeKind { None, Bitmap, Text, Hex, Archive, Pages, Markdown, Table, Tree, Model };
-    enum class ChromeButton { None, Prev, Next, More, Open, Size };
+    enum class ChromeButton { None, Prev, Next, More, Open, Size, Pin, Rotate, Info };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     LRESULT HandleMessage(UINT message, WPARAM wparam, LPARAM lparam);
     void Render();
     void SchedulePreviewDeadline();
     uint64_t preview_deadline_ = 0;
+    struct FrameEvidence {
+        uint32_t phase = 0, route = 0, draw = 0, content = 0, flags = 0;
+        uint32_t end_draw = 0, present = 0;
+        bool operator==(const FrameEvidence&) const = default;
+    };
+    void RecordFrameEvidence(FrameEvidence evidence, uint64_t text_units);
+    FrameEvidence diagnostic_frame_{};
+    uint64_t diagnostic_generation_ = 0;
+    uint64_t diagnostic_view_id_ = 0;
     void Resize();
     void ResetView();
     void RecreateFormats();
@@ -145,6 +188,8 @@ private:
     void DrawFfmpegFrame(ID2D1DeviceContext* dc, const D2D1_RECT_F& frame, float radius);
     bool PlaybackHover(POINT client);             // true when hover state changed
     void SetPlaybackVolume(float value);
+    float PlaybackVolume() const noexcept { return static_cast<float>(options_.volume_percent) / 100.0f; }
+    void FinishPlaybackVolumeDrag();
     void DragPlaybackVolume(float x);
     std::vector<FluentMenuItem> PlaybackTrackItems(bool subtitles, const VideoPreview::State& state) const;
     void ShowPlaybackTracks(bool subtitles, POINT point);
@@ -180,6 +225,10 @@ private:
     void ResetTextState();
 
     // Paged documents (quick_preview_pages.cpp).
+    struct OverlayScrollbar {
+        D2D1_RECT_F hit{}, thumb{};
+        float travel = 0.0f, maximum = 0.0f;
+    };
     struct PagesLayout {
         D2D1_RECT_F strip{};   // thumbnail strip; empty when hidden
         D2D1_RECT_F view{};    // page area
@@ -189,6 +238,19 @@ private:
     };
     void ResetPages();
     PagesLayout ComputePagesLayout() const;
+    OverlayScrollbar PagesScrollbar() const;
+    bool OverPagesScrollbar(float x, float y) const;
+    bool PagesScrollbarMouseDown(float x, float y);
+    bool PagesScrollbarMouseMove(float y);
+    bool PagesScrollbarHover(float x, float y);
+    OverlayScrollbar TextScrollbar() const;
+    bool OverTextScrollbar(float x, float y) const;
+    bool TextScrollbarMouseDown(float x, float y);
+    bool TextScrollbarMouseMove(float y);
+    bool TextScrollbarHover(float x, float y);
+    bool OverPreviewScrollbar(float x, float y) const;
+    bool DraggingPreviewScrollbar() const noexcept;
+    void EndPreviewScrollbarDrags() noexcept;
     float PageAspect(uint32_t page) const noexcept;
     float PageTop(const PagesLayout& layout, uint32_t page) const;
     float PagesDocHeight(const PagesLayout& layout) const;
@@ -262,6 +324,12 @@ private:
     // Window size presets (Settings > 快速预览 > 预览窗口, the header's size
     // button, Ctrl+1/2/3, F).
     void ShowSizeMenu(POINT screen);
+    // Archive view: the sort button's menu, drag-out, drop-in.
+    void ShowArchiveSortMenu(const D2D1_RECT_F& anchor);
+    void AfterArchiveClick();
+    void StartArchiveDragOut();
+    void UpdateArchiveDropTarget();
+    DWORD ArchiveDragOver(const std::vector<std::wstring>& sources, POINT pt, DWORD allowed);
     void ChooseSizeMode(int mode);           // menu / Ctrl+1..3: also the new default
     // The rect for the current item: the remembered size, else the preset's
     // (适应内容 sets fit_pending_ when the size is only known after decoding).
@@ -305,7 +373,8 @@ private:
     // Unified header and footer (quick_preview_chrome.cpp).
     struct HeaderLayout {
         D2D1_RECT_F badge{}, name{}, meta{}, tools{}, separator{}, prev{}, counter{}, next{},
-            open{}, more{}, size{}, close{};
+            open{}, pin{}, size{}, more{}, close{}, rotate{}, info{};
+        bool nav_visible = true;      // detached/independent windows hide list navigation
         bool meta_visible = true;     // narrow windows drop the meta line first,
         bool tools_visible = true;    // then fold the type tools into the more menu,
         bool open_text = true;        // then show only the open button's icon,
@@ -400,6 +469,13 @@ private:
 
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
+    HWND message_owner_ = nullptr;
+    bool detached_popup_ = false;
+    bool always_on_top_ = false;
+    bool pinned_detached_ = false;
+    bool window_active_ = true;
+    void ApplyAlwaysOnTopWindowPos();
+    bool HasNavigation() const noexcept { return !pinned_detached_ && navigate_message_ != 0; }
     UINT navigate_message_ = 0;
     UINT open_message_ = 0;
     std::wstring open_path_;  // folder listing item for open_message_ (wParam 1)
@@ -410,6 +486,9 @@ private:
     // Room for a few full-window pictures (a 4K window's frame is ~32 MB).
     NativePreviewView native_preview_;
     ThumbnailCache thumbnails_{160ull * 1024ull * 1024ull, 192};
+    // Tiles of the archive / folder thumbnail view (ArchivePreview), kept
+    // apart so they never evict the previewed file itself.
+    ThumbnailCache tile_thumbs_{32ull * 1024ull * 1024ull, 256};
     PreviewHandlerHost handler_;
     VideoPreview video_;
     AudioWaveform waveform_;
@@ -424,8 +503,6 @@ private:
     ULONGLONG playback_last_seek_ms_ = 0;
     float playback_hover_x_ = -1.0f;   // pointer x over the seek track, or -1
     int playback_hover_button_ = -1;   // 0..2 transport, 3 volume, 4 speed, 5 audio, 6 subtitles
-    float playback_volume_ = 1.0f;     // session-wide
-    bool playback_muted_ = false;      // session-wide
     float playback_rate_ = 1.0f;       // per file
     std::wstring playback_note_;       // transient chip text (volume / speed)
     ULONGLONG playback_note_until_ = 0;
@@ -487,6 +564,73 @@ private:
     uint64_t pointer_tick_ = 0;
     POINT pointer_last_{};
     float PlaybackBarOpacity();
+    // Immersive photo viewer (quick_preview_gallery.cpp): pictures and videos on
+    // an ambient backdrop with edge arrows, a filter pill in the header and a
+    // floating filmstrip. options_.immersive; never in embedded previews.
+    static constexpr UINT_PTR kGalleryTimer = 77;
+    bool Immersive() const noexcept;
+    bool GalleryActive() const noexcept;
+    bool GalleryStripWanted() const noexcept;
+    bool GalleryMatches(int row) const noexcept;
+    int GalleryTarget(int dir) const noexcept;
+    int GalleryRank(int row) const noexcept;
+    bool GalleryNavEnd(int dir, bool fallback) const noexcept;
+    float GalleryPanelHeight() const noexcept;
+    float GalleryReserve() const noexcept;
+    float ImmersiveSide() const noexcept;
+    D2D1_RECT_F ImmersiveContentRect(const D2D1_RECT_F& content) const noexcept;
+    D2D1_RECT_F GalleryPanelRect() const noexcept;
+    void OnGalleryItem();
+    void PostGalleryJump(int row);
+    void SetGalleryFilter(int filter);
+    void ToggleImmersive();
+    void DrawImmersiveBackdrop(ID2D1DeviceContext* dc);
+    D2D1_RECT_F BeginImmersivePicture(ID2D1DeviceContext* dc, const D2D1_RECT_F& draw, bool allowed);
+    void EndImmersivePicture(ID2D1DeviceContext* dc);
+    void DrawImmersiveChrome(ID2D1DeviceContext* dc);
+    void DrawGalleryPanel(ID2D1DeviceContext* dc, float alpha);
+    float LayoutGalleryFilter(float left, float right, float cy);
+    void DrawGalleryFilter(ID2D1DeviceContext* dc);
+    void GalleryCounterText(std::wstring& text) const;
+    int GalleryHit(POINT client) const noexcept;
+    bool GalleryMouseDown(POINT client);
+    void GalleryMouseMove(POINT client);
+    void GalleryMouseLeave();
+    bool GalleryWheel(POINT client, float steps);
+    void StartGalleryTimer(UINT ms);
+    void TickGallery();
+    int media_kind_ = 0;                     // QuickPreviewMediaKind of the item
+    static inline int gallery_filter_ = 0;   // 0 all, 1 pictures, 2 videos (session-wide)
+    int gallery_cursor_ = -1;                // view row shown, or the row a jump heads to
+    int gallery_target_ = -1;
+    uint64_t gallery_target_at_ = 0;
+    int gallery_counts_[3]{};
+    int gallery_hover_ = 0;
+    int gallery_filter_ids_[3]{};
+    int gallery_filter_count_ = 0;
+    D2D1_RECT_F gallery_filter_rects_[3]{};
+    D2D1_RECT_F gallery_filter_pill_{};
+    D2D1_RECT_F gallery_edges_[2]{};
+    D2D1_RECT_F gallery_panel_{};
+    struct GalleryTile { D2D1_RECT_F rect{}; int row = -1; };
+    std::vector<GalleryTile> gallery_tiles_;
+    float gallery_scroll_ = 0.0f;
+    bool gallery_scroll_init_ = false;
+    float gallery_alpha_ = 1.0f;
+    float gallery_open_ = 1.0f;
+    uint64_t gallery_activity_ = 0;
+    uint64_t gallery_tick_ = 0;
+    POINT gallery_pointer_{};
+    POINT gallery_move_{-1, -1};
+    UINT gallery_timer_ms_ = 0;
+    uint64_t gallery_wheel_at_ = 0;
+    bool picture_layer_ = false;
+    ComPtr<ID2D1Bitmap1> ambient_, ambient_prev_;
+    std::wstring ambient_key_;
+    uint64_t ambient_fade_at_ = 0;
+    ComPtr<ID2D1Device> ambient_device_;
+    ComPtr<IDWriteTextFormat> gallery_badge_format_;
+    float gallery_badge_scale_ = 0.0f;
     // Shared by every Quick Look window of this session.
     static inline int image_backdrop_ = 0;   // 0 auto (checkerboard when translucent), 1 light, 2 dark, 3 checkerboard
     static inline bool info_open_ = false;
@@ -496,6 +640,12 @@ private:
     uint32_t source_h_ = 0;
     NativeKind native_kind_ = NativeKind::None;
     ArchivePreview archive_;
+    std::unique_ptr<ShellIconCache> archive_icons_;  // the main list's type icons, for archive tiles
+    bool archive_press_ = false;     // left button went down on an archive entry
+    POINT archive_press_at_{};
+    bool archive_dragging_ = false;  // our own drag-out is running
+    WindowDropTarget* archive_drop_ = nullptr;  // registered while an archive is shown
+    bool archive_drop_tried_ = false;
     MarkdownView markdown_;
     bool markdown_source_ = false;  // session-wide: Markdown shown as source
     bool markdown_shown_ = false;   // this frame drew a Markdown item (toggle visible)
@@ -506,16 +656,15 @@ private:
     TableView table_;
     uint32_t sheet_request_ = 0;
     bool table_source_ = false;   // session-wide: CSV shown as source
-    bool table_handler_ = false;  // session-wide: XLSX in the system preview handler
     TreeView tree_;
     bool tree_source_ = false;      // session-wide: JSON/XML shown as source
     bool notebook_source_ = false;  // session-wide: notebooks shown as source
-    bool doc_handler_ = false;      // session-wide: DOCX in the system preview handler
     uint32_t icon_request_ = 0;     // frame_index for .ico/.cur: 0 largest, k entry k-1
     std::vector<IconSize> icon_sizes_;
     int icon_selected_ = -1;
     std::vector<D2D1_RECT_F> icon_pill_rects_;
     bool& ToggleSecond() noexcept;  // the flag the title-bar pill switches
+    void SetToggleSecond(bool second);
     bool panning_ = false;
     POINT pan_anchor_{};
     float pan_start_x_ = 0.0f;
@@ -530,8 +679,8 @@ private:
     uint32_t loop_count_ = 0;
     uint32_t completed_loops_ = 0;
     bool animation_active_ = false;
-    // Prev / next slide (motion phase 6): direction asked for, and the slide
-    // of the item that answered it.
+    // Prev / next: track the requested direction and the answering item's
+    // short tonal transition.
     int pending_nav_dir_ = 0;
     uint64_t pending_nav_at_ = 0;   // motion::NowMs
     int nav_dir_ = 0;
@@ -547,6 +696,14 @@ private:
     float pages_strip_scroll_ = 0.0f;
     uint32_t pages_follow_ = UINT32_MAX; // strip auto-follows when the current page changes
     bool pages_strip_ = true;
+    bool pages_scrollbar_drag_ = false;
+    bool pages_scrollbar_hover_ = false;
+    float pages_scrollbar_press_ = 0.0f;
+    float pages_scrollbar_start_ = 0.0f;
+    bool text_scrollbar_drag_ = false;
+    bool text_scrollbar_hover_ = false;
+    float text_scrollbar_press_ = 0.0f;
+    float text_scrollbar_start_ = 0.0f;
 
     std::wstring preview_text_;
     PreviewTextIdentity preview_text_identity_;

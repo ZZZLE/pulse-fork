@@ -1,10 +1,11 @@
-﻿// ctx_menu_controller_test.cpp - ContextMenuController bookkeeping: the
+// ctx_menu_controller_test.cpp - ContextMenuController bookkeeping: the
 // per-menu timing record (ctx_menu_timing.h), static-verb re-reads, rows
 // painted from the cache while the live answer arrives in parts, and the
 // persistent layout with templated names (ctx_layout_cache.h), and the
 // per-handler shard merge driven by the host's handler states (C4b), and the
 // open menu's fixed shape: late rows greyed in place or put in 更多扩展 (R3).
 #include "../app/context_menu_controller.h"
+#include "../app/ctx_session_lease.h"
 #include "../app/ctx_layout_cache.h"
 #include "../app/ctx_menu_timing.h"
 
@@ -109,8 +110,62 @@ int RowIndex(const std::vector<pulse::ui::FluentMenuItem>& rows, const wchar_t* 
 
 #include "shell_action_routing_test.inc"
 #include "nested_menu_controller_test.inc"
+#include "shell_menu_icons_test.inc"
+#include "menu_cache_reuse_test.inc"
+#include "menu_tree_preferences_test.inc"
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--tree-cpu-bench") return MenuTreeCpuBench();
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--tree-prefs-only") return MenuTreePreferencesTests();
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--cache-reuse-only") return MenuCacheReuseTests();
+#ifndef PULSE_BASELINE_MENU_CONTROLLER
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--base-flyout-only") return BaseFlyoutReplacementTests();
+#endif
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--icons-only") return ShellMenuIconsTests();
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--cold-native-menu") {
+        using namespace pulse;
+        app::ContextMenuPrefs prefs;
+        app::ContextMenuController controller;
+        int resolves = 0;
+        bool changed = false;
+        controller.OpenMenu({MenuRow(1, L"Open"), MenuRow(2, L"Copy")});
+        const auto ready_rows = [&] {
+            ++resolves;
+            return std::vector{MenuRow(100, L"Quick compress to zip")};
+        };
+        controller.DeferBaseItems(ready_rows);
+        const auto first = controller.BuildOpenDisplay(prefs, controller.base_items(), changed);
+        Check(controller.may_grow_at_open() && resolves == 0 &&
+              std::none_of(first.begin(), first.end(), [](const auto& row) { return row.command == 100; }),
+              "cold menu opens without a default archive action or blocking for preferences");
+        Check(controller.AppendDeferredBaseItems(), "saved archive rows were added when ready");
+        Check(controller.AppendDeferredBaseItems() && resolves == 1,
+              "retries neither resolve the same menu twice nor duplicate archive rows");
+        const auto after = controller.ReconcileDisplay(prefs, changed, 1000);
+        Check(after.size() == first.size() + 1 &&
+              std::equal(first.begin(), first.end(), after.begin(), [](const auto& a, const auto& b) {
+                  return a.command == b.command && a.text == b.text;
+              }) && after.back().text == L"Quick compress to zip" && after.back().enabled,
+              "the first open menu gains the saved ZIP row without moving earlier commands");
+        controller.CommitDisplay(after);
+        Check(!controller.DeferredBaseItemsPending(), "successful paint stops the cold-menu update");
+        controller.DeferBaseItems(ready_rows);
+        controller.CloseMenu();
+        controller.OpenMenu({MenuRow(2, L"Copy")});
+        Check(!controller.AppendDeferredBaseItems() && resolves == 1,
+              "closing the popup discards an outstanding response");
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--session-lease") {
+        using pulse::app::CanReuseContextSession;
+        Check(!CanReuseContextSession(0, 1), "missing session start cannot be reused");
+        Check(CanReuseContextSession(1000, 1000), "fresh session is reusable");
+        Check(CanReuseContextSession(1000, 60999), "session inside renewal boundary is reusable");
+        Check(!CanReuseContextSession(1000, 61000), "renew session before host expiration");
+        Check(!CanReuseContextSession(1000, 121000), "expired host session is never reused");
+        Check(!CanReuseContextSession(1000, 999), "invalid elapsed clock does not reuse session");
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::wstring_view(argv[1]) == L"--nested-only") return NestedMenuControllerTests();
     if (argc == 2 && std::wstring_view(argv[1]) == L"--shell-actions") return ShellActionRoutingTests();
     using namespace pulse;
@@ -386,6 +441,61 @@ int wmain(int argc, wchar_t** argv) {
               "a registry flush empties the layout until it is read again");
     }
     {
+        // A file type never answered paints the rows every file shows.
+        app::ContextMenuController controller;
+        uint32_t token = 60;
+        app::ContextMenuController::ShellOperations operations;
+        operations.query = [&](std::vector<std::wstring>, HWND, bool, bool,
+                               std::vector<std::wstring>) { return ++token; };
+        controller.SetShellOperations(std::move(operations));
+        controller.StartQuery(prefs, nullptr, { L"C:\\f\\README" }, false, L"", false, {}, {});
+        controller.CompleteComQuery(token, { Row(3, L"{S}", L"sendto", L"Send to"),
+                                             Row(4, L"{L}", L"link", L"Create shortcut") },
+                                    100, false);
+        controller.StartQuery(prefs, nullptr, { L"C:\\f\\run.bat" }, false, L".bat", false, {}, {});
+        Check(controller.com_predicted() &&
+                  Texts(controller.com_items()) == L"Send to|Create shortcut|" &&
+                  Predicted(controller.com_items()[0].id),
+              "a new file type paints an extensionless file's rows with predicted ids");
+        controller.CompleteComQuery(token, { Row(7, L"{S}", L"sendto", L"Send to"),
+                                             Row(8, L"{L}", L"link", L"Create shortcut"),
+                                             Row(9, L"{N}", L"", L"Edit in Notepad") },
+                                    120, false);
+        Check(!controller.com_predicted() &&
+                  Texts(controller.com_items()) == L"Send to|Create shortcut|Edit in Notepad|",
+              "the live answer of the new type replaces the borrowed rows");
+        controller.StartQuery(prefs, nullptr, { L"C:\\f\\next.bat" }, false, L".bat", false, {}, {});
+        Check(Texts(controller.com_items()) == L"Send to|Create shortcut|Edit in Notepad|",
+              "from then on the type paints its own layout");
+        controller.StartQuery(prefs, nullptr, { L"C:\\f\\sub" }, false,
+                              std::wstring(ipc::kFolderVerbKey), false, {}, {});
+        Check(!controller.com_predicted(), "a folder never borrows a file layout");
+        controller.StartQuery(prefs, nullptr, { L"C:\\f" }, true, L"", false, {}, {});
+        Check(!controller.com_predicted(), "nor does the background");
+
+        app::ContextMenuController shared;
+        uint32_t shared_token = 70;
+        app::ContextMenuController::ShellOperations shared_ops;
+        shared_ops.query = [&](std::vector<std::wstring>, HWND, bool, bool,
+                               std::vector<std::wstring>) { return ++shared_token; };
+        shared.SetShellOperations(std::move(shared_ops));
+        shared.StartQuery(prefs, nullptr, { L"C:\\f\\a.exe" }, false, L".exe", false, {}, {});
+        shared.CompleteComQuery(shared_token, { Row(1, L"{P}", L"taskbarpin", L"Pin"),
+                                                Row(2, L"{S}", L"sendto", L"Send to") },
+                                100, false);
+        shared.StartQuery(prefs, nullptr, { L"C:\\f\\b.txt" }, false, L".txt", false, {}, {});
+        Check(!shared.com_predicted(), "one cached type is no evidence of the shared rows");
+        shared.CompleteComQuery(shared_token, { Row(5, L"{S}", L"sendto", L"Send to"),
+                                                Row(6, L"{N}", L"", L"Notepad") },
+                                100, false);
+        shared.StartQuery(prefs, nullptr, { L"C:\\f\\c.dwg" }, false, L".dwg", false, {}, {});
+        Check(shared.com_predicted() && Texts(shared.com_items()) == L"Send to|",
+              "without an extensionless layout the rows all types share are painted");
+        shared.StartQuery(prefs, nullptr, { L"C:\\f\\c.dwg", L"C:\\f\\d.dwg" }, false, L".dwg",
+                          false, {}, {});
+        Check(!shared.com_predicted(), "a multi-selection borrows only from multi-selections");
+    }
+    {
         // A menu closed before the complete answer still learns the layout.
         app::ContextMenuController controller;
         uint32_t token = 90;
@@ -525,9 +635,9 @@ int wmain(int argc, wchar_t** argv) {
                   parsed[L".dwg"].handlers[1].clsid == L"{S}" && !parsed[L".dwg"].handlers[1].done &&
                   parsed[L".dwg"].handlers[1].elapsed_ms == 5000,
               "the layout survives a round trip with its handler times");
-        Check(!app::ParseCtxLayout(bytes.data(), bytes.size(), L"1.1+other", parsed) &&
-                  parsed.empty(),
-              "a file written by another build is ignored");
+        Check(app::ParseCtxLayout(bytes.data(), bytes.size(), L"1.1+other", parsed) &&
+                  parsed.size() == 2 && parsed[L".dwg"].fingerprint == 11,
+              "a file written by another build is still read");
         Check(!app::ParseCtxLayout(bytes.data(), bytes.size() - 3, L"1.0+test", parsed),
               "a truncated file is rejected");
 
@@ -856,6 +966,224 @@ int wmain(int argc, wchar_t** argv) {
         int refreshed = 0;
         Check(controller.ExecuteShellCommand(app::CmdShellComLast, {}, [&] { ++refreshed; }) && refreshed == 1,
               "last reserved Shell ID remains handled, including stale tokens");
+    }
+
+    {
+        // Shared-verb COM children (WPS PDF合并 / PDF拆分 sharing "wps.pdf"):
+        // live click and predicted->live click both select the exact clicked child.
+        using namespace pulse;
+        app::ContextMenuPrefs wps_prefs;
+        wps_prefs.persist = false;
+        uint32_t token = 100;
+        uint32_t invoked_id = 0;
+        app::ContextMenuController controller;
+        app::ContextMenuController::ShellOperations ops;
+        ops.query = [&](auto, HWND, bool, bool, auto) { return ++token; };
+        ops.invoke = [&](uint32_t, uint32_t id, auto, auto) { invoked_id = id; };
+        controller.SetShellOperations(std::move(ops));
+
+        const std::vector<ops::ShellMenuItem> live_wps = {
+            Row(0, L"{WPS}", L"", L"PDF\x5408\x5e76/\x62c6\x5206", true, false),
+            Row(10, L"{WPS}", L"wps.pdf", L"PDF\x5408\x5e76", false, true),
+            Row(11, L"{WPS}", L"wps.pdf", L"PDF\x62c6\x5206", false, true),
+        };
+        controller.StartQuery(wps_prefs, nullptr, { L"C:\\f\\a.pdf", L"C:\\f\\b.pdf" },
+                              false, L".pdf", false, {}, {});
+        controller.CompleteComQuery(token, live_wps, 100, false);
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(static_cast<int>(app::CmdShellComBase + 10), {}, {});
+        Check(invoked_id == 10, "shared-verb COM live click on PDF merge invokes 10");
+
+        invoked_id = 0;
+        controller.StartQuery(wps_prefs, nullptr, { L"C:\\f\\a.pdf", L"C:\\f\\b.pdf" },
+                              false, L".pdf", false, {}, {});
+        controller.CompleteComQuery(token, live_wps, 150, false);
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(static_cast<int>(app::CmdShellComBase + 11), {}, {});
+        Check(invoked_id == 11, "shared-verb COM live click on PDF split invokes 11");
+
+        // Next popup paints from cache, predicted PDF合并 clicked before live arrives (IDs shifted 50/51).
+        invoked_id = 0;
+        controller.StartQuery(wps_prefs, nullptr, { L"C:\\f\\c.pdf", L"C:\\f\\d.pdf" },
+                              false, L".pdf", false, {}, {});
+        const uint32_t pred_merge_id = RowNamed(controller.com_items(), L"PDF\x5408\x5e76")
+            ? RowNamed(controller.com_items(), L"PDF\x5408\x5e76")->id : 0;
+        const std::vector<ops::ShellMenuItem> shifted_wps = {
+            Row(0, L"{WPS}", L"", L"PDF\x5408\x5e76/\x62c6\x5206", true, false),
+            Row(50, L"{WPS}", L"wps.pdf", L"PDF\x5408\x5e76", false, true),
+            Row(51, L"{WPS}", L"wps.pdf", L"PDF\x62c6\x5206", false, true),
+        };
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(
+            static_cast<int>(app::CmdShellComBase + pred_merge_id),
+            [&] { controller.CompleteComQuery(token, shifted_wps, 200, false); }, {});
+        Check(Predicted(pred_merge_id) && invoked_id == 50,
+              "shared-verb COM predicted click on PDF merge invokes shifted live ID 50, not split 51");
+    }
+
+    {
+        // Duplicate child label across two different COM handlers:
+        // {A} -> "ToolA" -> "Settings" (10), {B} -> "ToolB" -> "Settings" (20).
+        using namespace pulse;
+        app::ContextMenuPrefs dup_prefs;
+        dup_prefs.persist = false;
+        uint32_t token = 200;
+        uint32_t invoked_id = 0;
+        app::ContextMenuController controller;
+        app::ContextMenuController::ShellOperations ops;
+        ops.query = [&](auto, HWND, bool, bool, auto) { return ++token; };
+        ops.invoke = [&](uint32_t, uint32_t id, auto, auto) { invoked_id = id; };
+        controller.SetShellOperations(std::move(ops));
+
+        const std::vector<ops::ShellMenuItem> dup_live = {
+            Row(0, L"{A}", L"", L"ToolA", true, false),
+            Row(10, L"{A}", L"", L"Settings", false, true),
+            Row(0, L"{B}", L"", L"ToolB", true, false),
+            Row(20, L"{B}", L"", L"Settings", false, true),
+        };
+        controller.StartQuery(dup_prefs, nullptr, { L"C:\\f\\one.txt" }, false, L".txt", false, {}, {});
+        controller.CompleteComQuery(token, dup_live, 100, false);
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(static_cast<int>(app::CmdShellComBase + 20), {}, {});
+        Check(invoked_id == 20, "duplicate child label in different handlers routes live {B} Settings to 20");
+
+        // Predicted->live when IDs shift to 110 / 220.
+        invoked_id = 0;
+        controller.StartQuery(dup_prefs, nullptr, { L"C:\\f\\two.txt" }, false, L".txt", false, {}, {});
+        uint32_t pred_b_settings = 0;
+        for (const auto& item : controller.com_items())
+            if (item.clsid == L"{B}" && item.text == L"Settings") pred_b_settings = item.id;
+        const std::vector<ops::ShellMenuItem> shifted_dup = {
+            Row(0, L"{A}", L"", L"ToolA", true, false),
+            Row(110, L"{A}", L"", L"Settings", false, true),
+            Row(0, L"{B}", L"", L"ToolB", true, false),
+            Row(220, L"{B}", L"", L"Settings", false, true),
+        };
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(
+            static_cast<int>(app::CmdShellComBase + pred_b_settings),
+            [&] { controller.CompleteComQuery(token, shifted_dup, 200, false); }, {});
+        Check(invoked_id == 220, "duplicate child label predicted click routes {B} Settings to shifted 220");
+
+        // Disappeared {B} Settings must NOT misroute to {A} Settings.
+        invoked_id = 0;
+        controller.StartQuery(dup_prefs, nullptr, { L"C:\\f\\three.txt" }, false, L".txt", false, {}, {});
+        uint32_t pred_b_missing = 0;
+        for (const auto& item : controller.com_items())
+            if (item.clsid == L"{B}" && item.text == L"Settings") pred_b_missing = item.id;
+        const std::vector<ops::ShellMenuItem> b_gone = {
+            Row(0, L"{A}", L"", L"ToolA", true, false),
+            Row(110, L"{A}", L"", L"Settings", false, true),
+        };
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(
+            static_cast<int>(app::CmdShellComBase + pred_b_missing),
+            [&] { controller.CompleteComQuery(token, b_gone, 300, false); }, {});
+        Check(invoked_id == 0, "disappeared {B} child never misroutes to {A} same-label child");
+    }
+
+    {
+        // Static verb multi-select: DelegateExecute (top + child), DropTarget, MultiSelectModel=Single.
+        using namespace pulse;
+        app::ContextMenuPrefs ms_prefs;
+        ms_prefs.persist = false;
+        int shell_verb_calls = 0;
+        std::vector<std::wstring> sent_paths;
+        std::wstring sent_verb;
+        bool sent_bg = true;
+        app::ContextMenuController controller;
+        app::ContextMenuController::ShellOperations ops;
+        ops.query = [](auto, HWND, bool, bool, auto) { return 301u; };
+        ops.execute_shell_verb = [&](const std::vector<std::wstring>& paths,
+                                     const std::wstring& verb, bool bg) {
+            ++shell_verb_calls;
+            sent_paths = paths;
+            sent_verb = verb;
+            sent_bg = bg;
+        };
+        controller.SetShellOperations(std::move(ops));
+
+        app::StaticVerb del1;
+        del1.verb = L"merge";
+        del1.display = L"PDF Merge";
+        del1.delegate_clsid = L"{DEL1}";
+        del1.reg_root = 0;
+        del1.reg_key = L"SystemFileAssociations\\.pdf\\shell\\merge";
+
+        app::StaticVerb del2;
+        del2.verb = L"split";
+        del2.display = L"PDF Split";
+        del2.delegate_clsid = L"{DEL2}";
+        del2.reg_root = 2;
+        del2.reg_key = L"Software\\Classes\\.pdf\\shell\\split";
+
+        app::StaticVerb cascade;
+        cascade.verb = L"group";
+        cascade.display = L"PDF Group";
+        cascade.children.push_back(del2);
+
+        app::StaticVerb drop1;
+        drop1.verb = L"dropper";
+        drop1.display = L"Drop Action";
+        drop1.drop_target_clsid = L"{DRP1}";
+
+        app::StaticVerb single_only;
+        single_only.verb = L"oneshot";
+        single_only.display = L"Single Only";
+        single_only.command = L"tool.exe \"%1\"";
+        single_only.multi_select_model = 2;
+
+        controller.CompleteStaticVerbs(L".pdf", { del1, cascade, drop1, single_only },
+                                       controller.cache_generation());
+        const std::vector<std::wstring> six_pdfs = {
+            L"C:\\f\\1.pdf", L"C:\\f\\2.pdf", L"C:\\f\\3.pdf",
+            L"C:\\f\\4.pdf", L"C:\\f\\5.pdf", L"C:\\f\\6.pdf",
+        };
+        controller.StartQuery(ms_prefs, nullptr, six_pdfs, false, L".pdf", false, {}, {});
+        bool changed = false;
+        const auto multi_rows = controller.BuildOpenDisplay(ms_prefs, {}, changed);
+        Check(RowIndex(multi_rows, L"Single Only") == -1 && RowIndex(multi_rows, L"PDF Merge") >= 0,
+              "MultiSelectModel=Single static verb is hidden when 6 files are selected");
+
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(app::CmdShellStaticBase + 0 * ipc::kStaticVerbStride, {}, {});
+        Check(shell_verb_calls == 1 && sent_paths == six_pdfs && !sent_bg &&
+                  sent_verb == L"delegate:{DEL1}\nmerge\n0\nSystemFileAssociations\\.pdf\\shell\\merge",
+              "DelegateExecute static verb invokes once with all 6 paths");
+
+        shell_verb_calls = 0;
+        sent_paths.clear();
+        sent_verb.clear();
+        controller.StartQuery(ms_prefs, nullptr, six_pdfs, false, L".pdf", false, {}, {});
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(app::CmdShellStaticBase + 1 * ipc::kStaticVerbStride + 1, {}, {});
+        Check(shell_verb_calls == 1 && sent_paths == six_pdfs && !sent_bg &&
+                  sent_verb == L"delegate:{DEL2}\nsplit\n2\nSoftware\\Classes\\.pdf\\shell\\split",
+              "DelegateExecute cascade child invokes once with all 6 paths");
+
+        shell_verb_calls = 0;
+        sent_paths.clear();
+        sent_verb.clear();
+        controller.StartQuery(ms_prefs, nullptr, six_pdfs, false, L".pdf", false, {}, {});
+        controller.OpenMenu({});
+        controller.CloseMenu();
+        controller.ExecuteShellCommand(app::CmdShellStaticBase + 2 * ipc::kStaticVerbStride, {}, {});
+        Check(shell_verb_calls == 1 && sent_paths == six_pdfs && !sent_bg &&
+                  sent_verb == L"droptarget:{DRP1}",
+              "DropTarget static verb invokes once with all 6 paths");
+
+        controller.StartQuery(ms_prefs, nullptr, { L"C:\\f\\1.pdf" }, false, L".pdf", false, {}, {});
+        const auto single_rows = controller.BuildOpenDisplay(ms_prefs, {}, changed);
+        Check(RowIndex(single_rows, L"Single Only") >= 0,
+              "MultiSelectModel=Single static verb remains visible on single selection");
     }
 
     std::printf("%s\n", failures ? "FAILED" : "ALL PASSED");

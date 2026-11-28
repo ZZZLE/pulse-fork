@@ -5,6 +5,14 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <winternl.h>
+#include "recursive_eta_estimator.h"
 namespace pulse::ops::native_delete {
 #ifdef PULSE_NATIVE_DELETE_TEST
 inline bool fail_next_enumeration = false;
@@ -77,12 +85,27 @@ struct NativeDeleteOutcome {
     DWORD error = ERROR_SUCCESS;  // why the item it stopped at is still there
 };
 
+// Older consumers keep the two-argument callback. Statistics stay on the calling
+// thread and never substitute for the selected-root outcome or terminal state.
+template <typename Progress>
+void ReportProgress(Progress& progress, const std::wstring& path, const TransferWork& completed, bool known,
+                    const RecursiveWorkStats* discovery = nullptr) {
+    if constexpr (requires { progress(path, -1.0f, static_cast<const TransferWorkProgress*>(nullptr)); }) {
+        const TransferWorkProgress work{completed, completed, known, discovery};
+        progress(path, -1.0f, &work);
+    } else {
+        progress(path, -1.0f);
+    }
+}
+
 // Streaming postorder: one enumeration handle and path per active depth.
 // A parent is removed only after enumeration and every visited child succeed.
 template <typename Progress>
 NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& cancel, Progress&& progress,
                                  unsigned workers = 1) {
     NativeDeleteOutcome outcome;
+    constexpr bool reports_work = requires { progress(source, -1.0f, static_cast<const TransferWorkProgress*>(nullptr)); };
+    RecursiveWorkStats discovery;
     bool disposition_supported = true;
     if (source.size() <= 3 || source.starts_with(L"::") || source.find(L'/') != std::wstring::npos)
         return outcome;
@@ -96,6 +119,9 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
         WIN32_FIND_DATAW data{};
         bool opened = false;
         bool advance = false;
+        bool listed = false;
+        size_t depth = 0;
+        uint64_t direct_files = 0, direct_children = 0;
     };
     std::vector<Frame> stack;
     struct Cleanup {
@@ -108,6 +134,12 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
         }
     } cleanup{stack};
     stack.push_back({source, attributes});
+    if constexpr (reports_work) {
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            discovery.Root();
+            ReportProgress(progress, source, {}, false, &discovery);
+        }
+    }
     struct Ready { std::wstring path; DWORD attributes; };
     std::vector<Ready> ready;
     if (workers > 1) ready.reserve(32);
@@ -117,19 +149,24 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
     std::atomic<DWORD> failure{ERROR_SUCCESS};
     std::atomic<bool> changed{false};
     std::atomic<bool> supported{true};
+    std::atomic<uint64_t> batch_completed{0};
+    TransferWork completed;
     auto work = [&]() {
+        uint64_t removed = 0;
         while (!cancel.load() && failure.load() == ERROR_SUCCESS) {
             const size_t index = next.fetch_add(1);
             if (index >= ready.size()) break;
             bool capability = supported.load();
             const DWORD code = DeleteNativeItem(ready[index].path, ready[index].attributes, capability);
             if (!capability) supported.store(false);
-            if (code == ERROR_SUCCESS) changed.store(true);
+            if (code == ERROR_SUCCESS) { changed.store(true); ++removed; }
             else if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
                 DWORD expected = ERROR_SUCCESS;
                 failure.compare_exchange_strong(expected, code);
             }
         }
+        // One counter merge per batch worker, not an extra atomic per child.
+        if (removed) batch_completed.fetch_add(removed, std::memory_order_relaxed);
     };
     struct WorkOwner {
         PTP_WORK value = nullptr;
@@ -146,6 +183,7 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
         next = 0;
         failure = ERROR_SUCCESS;
         changed = false;
+        batch_completed = 0;
         supported = disposition_supported;
         const size_t count = (std::min)(ready.size(),
             static_cast<size_t>((std::min)(workers, 8u)));
@@ -172,8 +210,9 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
         outcome.mutated = outcome.mutated || changed.load();
         outcome.cancelled = cancel.load();
         outcome.error = failure.load();
+        completed.files += batch_completed.load(std::memory_order_relaxed);
         ready.clear();
-        if (changed.load()) progress(source, -1.0f);
+        if (changed.load()) ReportProgress(progress, source, completed, false, &discovery);
         outcome.cancelled = cancel.load();
         return !outcome.cancelled && outcome.error == ERROR_SUCCESS;
     };
@@ -211,6 +250,7 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
                 if (frame.find == INVALID_HANDLE_VALUE) {
                     const DWORD code = GetLastError();
                     if (code != ERROR_FILE_NOT_FOUND) { outcome.enumeration_failed = outcome.mutated; outcome.error = code; return outcome; }
+                    frame.listed = true;
                 }
             } else if (frame.advance && frame.find != INVALID_HANDLE_VALUE) {
                 frame.advance = false;
@@ -227,6 +267,7 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
                     FindClose(frame.find);
                     frame.find = INVALID_HANDLE_VALUE;
                     if (code != ERROR_NO_MORE_FILES) { outcome.enumeration_failed = true; outcome.error = code; return outcome; }
+                    frame.listed = true;
                 }
             }
             if (frame.find != INVALID_HANDLE_VALUE) {
@@ -234,6 +275,16 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
                 const wchar_t* name = frame.data.cFileName;
                 if (name[0] == L'.' && (name[1] == 0 || (name[1] == L'.' && name[2] == 0))) continue;
                 Frame child{JoinChild(frame.path, name), frame.data.dwFileAttributes};
+                child.depth = frame.depth + 1;
+                if constexpr (reports_work) {
+                    if ((child.attributes & FILE_ATTRIBUTE_DIRECTORY) && !(child.attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                        ++frame.direct_children;
+                        discovery.Child(frame.depth);
+                    } else {
+                        ++frame.direct_files;
+                        discovery.Files(frame.depth, 1);
+                    }
+                }
                 if (workers > 1 && !(child.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
                     ready.push_back({std::move(child.path), child.attributes});
                     if (ready.size() == 32 && !drain()) return outcome;
@@ -250,6 +301,8 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
             CloseHandle(frame.guard);
             frame.guard = INVALID_HANDLE_VALUE;
         }
+        if constexpr (reports_work)
+            if (directory) discovery.Listed(frame.depth, frame.direct_files, frame.direct_children, frame.listed);
         const DWORD code = DeleteNativeItem(frame.path, frame.attributes, disposition_supported);
         if (code != ERROR_SUCCESS && code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
             outcome.error = code;
@@ -257,18 +310,322 @@ NativeDeleteOutcome DeleteNative(const std::wstring& source, std::atomic<bool>& 
         }
         if (code == ERROR_SUCCESS) {
             outcome.mutated = true;
+            if (directory) ++completed.directories; else ++completed.files;
 #ifdef PULSE_NATIVE_DELETE_TEST
             if (after_mutation) after_mutation();
 #endif
         }
         const ULONGLONG now = GetTickCount64();
-        if (now - last_report >= 50) {
+        if (now - last_report >= 50 || (reports_work && stack.size() == 1)) {
             last_report = now;
-            progress(frame.path, -1.0f);
+            ReportProgress(progress, frame.path, completed, stack.size() == 1, &discovery);
         }
         stack.pop_back();
     }
     outcome.done = true;
+    return outcome;
+}
+// A folder tree on a local disk, several folders at once. Deleting is mostly
+// waiting on the file system's metadata reads and log writes; a few requests
+// in flight let the disk serve them in a better order. Each worker lists a
+// folder through its guard handle (which keeps the folder from being renamed
+// or replaced) and deletes the items in it relative to that handle, so no
+// path is parsed per file. A folder goes once its listing is done and its
+// subfolders are gone. `progress` is called only on the calling thread.
+// Same outcome contract as DeleteNative; a source that is not a plain folder,
+// or a system without the native calls, goes to DeleteNative.
+template <typename Progress>
+NativeDeleteOutcome DeleteNativeParallel(const std::wstring& source, std::atomic<bool>& cancel,
+                                         Progress&& progress, unsigned threads = 4) {
+    using OpenFile = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PIO_STATUS_BLOCK, ULONG, ULONG);
+    using SetInformationFile = LONG(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG, ULONG);
+    using StatusToError = ULONG(NTAPI*)(LONG);
+    static const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    static const auto open_file = ntdll ? reinterpret_cast<OpenFile>(GetProcAddress(ntdll, "NtOpenFile")) : nullptr;
+    static const auto set_information = ntdll
+        ? reinterpret_cast<SetInformationFile>(GetProcAddress(ntdll, "NtSetInformationFile")) : nullptr;
+    static const auto status_to_error = ntdll
+        ? reinterpret_cast<StatusToError>(GetProcAddress(ntdll, "RtlNtStatusToDosError")) : nullptr;
+    if (source.size() <= 3 || source.starts_with(L"::") || source.find(L'/') != std::wstring::npos)
+        return {};
+    const DWORD root_attributes = GetFileAttributesW(NativePath(source).c_str());
+    if (root_attributes == INVALID_FILE_ATTRIBUTES) return {};
+    if (threads < 2 || !open_file || !set_information || !status_to_error ||
+        !(root_attributes & FILE_ATTRIBUTE_DIRECTORY) || (root_attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return DeleteNative(source, cancel, progress, 1);
+
+    constexpr bool reports_work = requires { progress(source, -1.0f, static_cast<const TransferWorkProgress*>(nullptr)); };
+    RecursiveWorkStats discovery;
+    struct Folder {
+        std::wstring path;
+        Folder* parent = nullptr;
+        DWORD attributes = FILE_ATTRIBUTE_DIRECTORY;
+        std::atomic<int> pending{1};  // its own listing, plus each subfolder not yet gone
+        size_t depth = 0;
+    };
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<Folder*> queue;
+    std::vector<std::unique_ptr<Folder>> folders;
+    size_t listing = 0;
+    bool finished = false;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> mutated{false};
+    std::atomic<bool> enumeration_failed{false};
+    std::atomic<bool> root_gone{false};
+    std::atomic<DWORD> failure{ERROR_SUCCESS};
+    std::atomic<uint64_t> deleted_files{0}, deleted_directories{0};
+    // Learned once per root, as DeleteNative does: FAT/exFAT and older Windows
+    // have no POSIX delete, and probing it again for every file costs a call each.
+    std::atomic<bool> posix{true};
+    const auto fail = [&](DWORD code) {
+        DWORD expected = ERROR_SUCCESS;
+        failure.compare_exchange_strong(expected, code);
+        stop.store(true);
+        changed.notify_all();
+    };
+    const auto mutation = [&](bool directory = false) {
+        mutated.store(true);
+        ++(directory ? deleted_directories : deleted_files);
+#ifdef PULSE_NATIVE_DELETE_TEST
+        std::lock_guard lock(mutex);
+        if (after_mutation) after_mutation();
+#endif
+    };
+    // The folder's listing or one subfolder is done; the last one removes it.
+    const auto release = [&](Folder* folder) {
+        while (folder && --folder->pending == 0) {
+            if (stop.load() || cancel.load()) return;
+            bool capability = posix.load();
+            const DWORD code = DeleteNativeItem(folder->path, folder->attributes, capability);
+            if (!capability) posix.store(false);
+            if (code != ERROR_SUCCESS && code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) {
+                fail(code);
+                return;
+            }
+            if (code == ERROR_SUCCESS) mutation(true);
+            if (!folder->parent) root_gone.store(true);
+            folder = folder->parent;
+        }
+    };
+    // ERROR_SUCCESS, or why the item is still there.
+    const auto delete_child = [&](HANDLE directory, const Folder& folder, const wchar_t* name, USHORT bytes,
+                                  DWORD attributes) -> DWORD {
+        bool capability = false;
+        if (!posix.load())
+            return DeleteNativeItem(JoinChild(folder.path, std::wstring(name, bytes / sizeof(wchar_t)).c_str()),
+                                    attributes, capability);
+        UNICODE_STRING relative{bytes, bytes, const_cast<wchar_t*>(name)};
+        OBJECT_ATTRIBUTES object{};
+        // Exact case: the name is the listing's own, and a case-sensitive folder may hold both spellings.
+        InitializeObjectAttributes(&object, &relative, 0, directory, nullptr);
+        IO_STATUS_BLOCK io{};
+        HANDLE item = nullptr;
+        constexpr ULONG kOpenReparsePoint = 0x00200000, kOpenForBackupIntent = 0x00004000, kNonDirectory = 0x00000040;
+        const bool link = (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        LONG status = open_file(&item, DELETE | SYNCHRONIZE, &object, &io,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            kOpenReparsePoint | kOpenForBackupIntent | (link ? 0 : kNonDirectory));
+        if (status < 0) return status_to_error(status);
+        struct { DWORD flags; } info{kDispositionDelete | kDispositionPosixSemantics | kDispositionIgnoreReadonly};
+        constexpr ULONG kFileDispositionInformationEx = 64;
+#ifdef PULSE_NATIVE_DELETE_TEST
+        ++disposition_probes;
+        if (force_disposition_unsupported) status = static_cast<LONG>(0xC000000DL);  // STATUS_INVALID_PARAMETER
+        else
+#endif
+        status = set_information(item, &io, &info, sizeof(info), kFileDispositionInformationEx);
+        CloseHandle(item);
+        if (status >= 0) return ERROR_SUCCESS;
+        const DWORD code = status_to_error(status);
+        // POSIX delete not understood (older Windows, some file systems): the
+        // classic delete, read-only cleared and restored as DeleteNative does.
+        if (code != ERROR_INVALID_PARAMETER && code != ERROR_NOT_SUPPORTED && code != ERROR_INVALID_FUNCTION)
+            return code;
+        posix.store(false);
+        return DeleteNativeItem(JoinChild(folder.path, std::wstring(name, bytes / sizeof(wchar_t)).c_str()),
+                                attributes, capability);
+    };
+    struct ListingWork { uint64_t direct_files = 0, direct_children = 0, reported_files = 0; bool listed = false; };
+    const auto flush_discovery = [&]([[maybe_unused]] const Folder& folder, [[maybe_unused]] ListingWork& summary) {
+        if constexpr (reports_work) {
+            const uint64_t count = summary.direct_files - summary.reported_files;
+            if (count) {
+                std::lock_guard lock(mutex);
+                discovery.Files(folder.depth, count);
+                summary.reported_files = summary.direct_files;
+            }
+        }
+    };
+    const auto list_and_delete = [&](Folder& folder, std::vector<Folder*>& found, ListingWork& summary) {
+        struct FlushDiscovery {
+            const decltype(flush_discovery)& flush;
+            const Folder& folder;
+            ListingWork& summary;
+            ~FlushDiscovery() { flush(folder, summary); }
+        } flush_on_exit{flush_discovery, folder, summary};
+        HANDLE directory = CreateFileW(NativePath(folder.path).c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (directory == INVALID_HANDLE_VALUE) {
+            const DWORD code = GetLastError();
+            if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return;
+            enumeration_failed.store(mutated.load());
+            fail(code);
+            return;
+        }
+        struct Close { HANDLE h; ~Close() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); } } close{directory};
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(directory, &info)) { fail(GetLastError()); return; }
+        // Turned into a link since it was listed: the link goes, never what it points to.
+        if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CloseHandle(directory);
+            close.h = INVALID_HANDLE_VALUE;
+            bool capability = true;
+            const DWORD code = DeleteNativeItem(folder.path, info.dwFileAttributes, capability);
+            if (code == ERROR_SUCCESS) mutation();
+            else if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) fail(code);
+            if (!folder.parent) root_gone.store(code == ERROR_SUCCESS);
+            folder.pending.store(-1);  // never removed again as a folder
+            return;
+        }
+        alignas(8) unsigned char buffer[16 * 1024];
+        FILE_INFO_BY_HANDLE_CLASS page = FileIdBothDirectoryRestartInfo;
+        for (bool first = true;; first = false) {
+            if (stop.load() || cancel.load()) return;
+            BOOL listed = FALSE;
+#ifdef PULSE_NATIVE_DELETE_TEST
+            if (first && deny_first_enumeration) {
+                deny_first_enumeration = false;
+                SetLastError(ERROR_ACCESS_DENIED);
+            } else if (!first && fail_next_enumeration) {
+                fail_next_enumeration = false;
+                SetLastError(ERROR_READ_FAULT);
+            } else
+#endif
+            listed = GetFileInformationByHandleEx(directory, page, buffer, sizeof(buffer));
+            (void)first;
+            if (!listed) {
+                const DWORD code = GetLastError();
+                if (code == ERROR_NO_MORE_FILES || code == ERROR_FILE_NOT_FOUND) { summary.listed = true; return; }
+                enumeration_failed.store(true);
+                fail(code);
+                return;
+            }
+            page = FileIdBothDirectoryInfo;
+            for (auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer);;
+                 entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(
+                     reinterpret_cast<const unsigned char*>(entry) + entry->NextEntryOffset)) {
+                const USHORT bytes = static_cast<USHORT>(entry->FileNameLength);
+                const wchar_t* name = entry->FileName;
+                const bool dots = (bytes == 2 && name[0] == L'.') || (bytes == 4 && name[0] == L'.' && name[1] == L'.');
+                if (!dots) {
+                    if (stop.load() || cancel.load()) return;
+                    const DWORD attributes = entry->FileAttributes;
+                    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                        auto child = std::make_unique<Folder>();
+                        child->path = JoinChild(folder.path, std::wstring(name, bytes / sizeof(wchar_t)).c_str());
+                        child->parent = &folder;
+                        child->attributes = attributes;
+                        child->depth = folder.depth + 1;
+                        if constexpr (reports_work) ++summary.direct_children;
+                        ++folder.pending;
+                        found.push_back(child.get());
+                        std::lock_guard lock(mutex);
+                        if constexpr (reports_work) discovery.Child(folder.depth);
+                        folders.push_back(std::move(child));
+                    } else {
+                        if constexpr (reports_work) ++summary.direct_files;
+                        const DWORD code = delete_child(directory, folder, name, bytes, attributes);
+                        if (code == ERROR_SUCCESS) mutation();
+                        else if (code != ERROR_FILE_NOT_FOUND && code != ERROR_PATH_NOT_FOUND) { fail(code); return; }
+                    }
+                }
+                if (!entry->NextEntryOffset) break;
+            }
+            flush_discovery(folder, summary);
+        }
+    };
+    const auto worker = [&] {
+        for (;;) {
+            Folder* folder = nullptr;
+            {
+                std::unique_lock lock(mutex);
+                changed.wait(lock, [&] { return finished || stop.load() || cancel.load() || !queue.empty(); });
+                if (finished || stop.load() || cancel.load()) return;
+                folder = queue.front();
+                queue.pop_front();
+                ++listing;
+            }
+            std::vector<Folder*> found;
+            ListingWork summary;
+            list_and_delete(*folder, found, summary);
+            {
+                std::lock_guard lock(mutex);
+                // Depth first: few folders are open or pending at once.
+                for (auto it = found.rbegin(); it != found.rend(); ++it) queue.push_front(*it);
+                --listing;
+                if constexpr (reports_work) discovery.Listed(folder->depth, summary.direct_files, summary.direct_children, summary.listed);
+                if (queue.empty() && listing == 0) finished = true;
+            }
+            changed.notify_all();
+            release(folder->pending.load() >= 0 ? folder : folder->parent);
+        }
+    };
+    {
+        auto root = std::make_unique<Folder>();
+        root->path = source;
+        root->attributes = root_attributes;
+        if constexpr (reports_work) discovery.Root();
+        queue.push_back(root.get());
+        folders.push_back(std::move(root));
+    }
+    std::vector<std::thread> pool;
+    try {
+        for (unsigned i = 0; i < (std::min)(threads, 8u); ++i) pool.emplace_back(worker);
+    } catch (...) {
+        if (pool.empty()) return DeleteNative(source, cancel, progress, 1);
+    }
+    const auto join = [&] {
+        stop.store(true);
+        changed.notify_all();
+        for (auto& thread : pool) if (thread.joinable()) thread.join();
+    };
+    uint64_t reported = 0, reported_discovery = 0;
+    try {
+        for (;;) {
+            RecursiveWorkStats snapshot;
+            {
+                std::unique_lock lock(mutex);
+                changed.wait_for(lock, std::chrono::milliseconds(50),
+                                 [&] { return finished || stop.load() || cancel.load(); });
+                if (finished || stop.load() || cancel.load()) break;
+                if constexpr (reports_work) snapshot = discovery;
+            }
+            const TransferWork completed{0, deleted_files.load(), deleted_directories.load()};
+            if (const uint64_t now = completed.files + completed.directories; now != reported ||
+                (reports_work && snapshot.revision != reported_discovery)) {
+                reported = now;
+                reported_discovery = snapshot.revision;
+                ReportProgress(progress, source, completed, false, reports_work ? &snapshot : nullptr);
+            }
+        }
+    } catch (...) {
+        join();  // workers stop where they are; nothing more is deleted
+        throw;
+    }
+    changed.notify_all();
+    for (auto& thread : pool) thread.join();
+    NativeDeleteOutcome outcome;
+    outcome.mutated = mutated.load();
+    outcome.error = failure.load();
+    outcome.enumeration_failed = enumeration_failed.load();
+    outcome.cancelled = cancel.load() && !root_gone.load();
+    outcome.done = root_gone.load() && outcome.error == ERROR_SUCCESS;
+    if (outcome.mutated) {
+        const TransferWork completed{0, deleted_files.load(), deleted_directories.load()};
+        ReportProgress(progress, source, completed, outcome.done, reports_work ? &discovery : nullptr);
+    }
     return outcome;
 }
 }

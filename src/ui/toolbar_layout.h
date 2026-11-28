@@ -29,13 +29,13 @@ struct ToolbarPinOptions {
     float label_width = 0.0f;   // drop mode: "拖到软件上打开" / "固定到工具栏" ahead of the pins
     uint64_t separators = 0;    // bit i: the user's separator before pin i (app::ToolbarSeparatorMask)
     std::array<int, 3> view_order{0, 1, 2}; // sort, filter, group identities
+    uint64_t hidden = 0;        // saved slots that must not occupy space or take a hit
 };
 struct ToolbarLayout {
     std::array<D2D1_RECT_F, 4> navigation{};
     D2D1_RECT_F address{}, search{}, create{};
     D2D1_RECT_F sort{}, filter{}, overflow{};
     D2D1_RECT_F group{};   // "Group" button / active chip (empty when not offered)
-    D2D1_RECT_F open_app{}; // selection open button (left of the view labels; empty when off)
     std::array<D2D1_RECT_F, 8> commands{};
     std::array<D2D1_RECT_F, kToolbarPinSlots> pins{};   // pinned commands, then pinned apps
     D2D1_RECT_F pin_label{};   // drop mode only (ToolbarPinOptions::label_width)
@@ -45,6 +45,8 @@ struct ToolbarLayout {
     NavigationTier navigation_tier = NavigationTier::Full;
     bool refresh_inside = false;
     bool merged_search = false;
+    D2D1_RECT_F tab_list{};    // 标签页 off: the tab switcher in the title bar
+    D2D1_RECT_F open_app{};    // 选中时的「打开」: opens the selection with a program
 };
 
 inline float SelectionChipSpan(float scale, float label_width, int n);
@@ -53,8 +55,8 @@ inline float SelectionChipSpan(float scale, float label_width, int n);
 // edited, borrowing from the address bar but leaving it at least 120 DIP.
 inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, float margin, float create_width,
                                       float left, float filter_expand = 0.0f, float search_min_dip = 0.0f,
-                                      float group_width = 0.0f, float sort_width = 0.0f, float open_width = 0.0f,
-                                      float filter_width = 0.0f, int pin_count = 0,
+                                      float group_width = 0.0f, float sort_width = 0.0f,
+                                      float filter_width = 0.0f, float open_width = 0.0f, int pin_count = 0,
                                       float selection_span = 0.0f, const ToolbarPinOptions& pin_options = {},
                                       bool can_forward = true) {
     ToolbarLayout out;
@@ -103,7 +105,7 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
         !overflow && pin_options.view_slots[2]>=0 && group_width>0};
     const std::array<float,3> left_width{
         available>=700*scale ? (sort_width>0?sort_width:88*scale) : 32*scale,
-        available>=700*scale ? (filter_width>0?std::max(filter_width,64*scale):88*scale) : 32*scale,
+        available>=700*scale ? (filter_width>0?(filter_width<=32*scale?filter_width:std::max(filter_width,64*scale)):88*scale) : 32*scale,
         group_width};
     std::array<D2D1_RECT_F,3> left_rects{};
     const bool sort_shown = sort_width >= 0.0f && !left_view[0];
@@ -136,15 +138,21 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
                 px+=w+6*scale;left_end=px+8*scale;
             }
         };
+        bool pending_divider = false;
+        bool placed_pin = false;
         for (int i=0;i<count;++i) {
             insert_views(i);
+            pending_divider |= i > 0 && (pin_options.separators >> i & 1);
+            if (pin_options.hidden >> i & 1) continue;
             // The user's separators take the same 9 DIP as the gap before the apps.
-            const bool divider = i > 0 && i < 64 && (pin_options.separators >> i & 1);
-            const float lead = (gap && i == pin_options.app_from) || divider ? 9*scale : 0.0f;
+            const bool divider = placed_pin && pending_divider;
+            const float lead = (placed_pin && gap && i == pin_options.app_from) || divider ? 9*scale : 0.0f;
             if (px+lead+30*scale+8*scale+view_min > view_end) break;
             px += lead;
             if (divider) out.pin_dividers |= uint64_t{1} << i;
             out.pins[i] = {px,top+50*scale,px+30*scale,top+82*scale};
+            placed_pin = true;
+            pending_divider = false;
             px += 34*scale;
             left_end = px + 8*scale;
         }
@@ -156,18 +164,21 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
     // filter_width: measured "icon + label" width (0 = legacy 88 DIP); kept above the
     // 60 DIP icon-only threshold. Expanding grows the field to the left.
     float filter_base = !filter_shown ? 0.0f : available >= 700*scale
-        ? (filter_width > 0.0f ? std::max(filter_width, 64*scale) : 88*scale) : 32*scale;
+        ? (filter_width > 0.0f ? (filter_width <= 32*scale ? filter_width : std::max(filter_width, 64*scale))
+                               : 88*scale) : 32*scale;
     float group_w = group_width;
     // While something is selected the selection chip (prototype note 4) comes
     // before the view labels: they fold to icons first so the chip keeps its
     // quick actions. The chip itself shrinks into whatever is left.
     const float room = view_end - left_end - (overflow ? 0.0f : chip_span);
     // The shown buttons with 6 DIP between them (all three: sort+6+filter+6+group).
+    // 选中时的「打开」 leads that group (leftmost, right-aligned with it).
+    const bool open_shown = open_width > 0.0f && !overflow && !drop_mode;
     auto block_of = [&](float filter) {
-        return open_width + (sort_shown ? sort_w : 0.0f) + (filter_shown ? filter : 0.0f) +
+        const int n = (open_shown ? 1 : 0) + (sort_shown ? 1 : 0) + (filter_shown ? 1 : 0) + (group_w > 0.0f ? 1 : 0);
+        return (open_shown ? open_width : 0.0f) + (sort_shown ? sort_w : 0.0f) + (filter_shown ? filter : 0.0f) +
                (group_w > 0.0f ? group_w : 0.0f) +
-               (static_cast<float>((sort_shown ? 1 : 0) + (filter_shown ? 1 : 0) + (group_w > 0.0f ? 1 : 0) +
-                                  (open_width > 0.0f ? 1 : 0) - 1) * 6 * scale);
+               (n > 1 ? static_cast<float>(n-1)*6*scale : 0.0f);
     };
     // Priority collapse when the labels do not fit: icon-only sort / filter
     // first, then a narrower group chip (never below its icon).
@@ -191,6 +202,13 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
     std::array<D2D1_RECT_F*, 3> rects{&out.sort, &out.filter, &out.group};
     std::array<bool, 3> placed{};
     bool shown = false;
+    // 选中时的「打开」: the whole tile opens the selection with the program the
+    // chevron picked, so it leads the view group.
+    if (open_shown) {
+        out.open_app = {x, top+50*scale, x+open_width, top+82*scale};
+        x += open_width;
+        shown = true;
+    }
     const auto place = [&](int index) {
         if (index < 0 || index >= 3 || placed[index]) return;
         placed[index] = true;
@@ -200,12 +218,6 @@ inline ToolbarLayout MakeToolbarLayout(float width, float scale, float top, floa
         x += w;
         shown = shown || w > 0.0f;
     };
-    // Selection open button: leftmost of the right cluster, before the view labels.
-    if (open_width > 0.0f) {
-        out.open_app = {x, top+50*scale, x+open_width, top+82*scale};
-        x += open_width + 6*scale;
-        shown = true;
-    }
     for (int index : pin_options.view_order) place(index);
     for (int index = 0; index < 3; ++index) place(index);
     for(int i=0;i<3;++i) if(left_view[i]) *rects[i]=left_rects[i];
@@ -238,6 +250,8 @@ struct SelectionChipAction {
     bool enabled = true;
     bool checked = false; // toolbar toggle tools: the setting is on
     bool situational = false; // offered because of the moment (split, two folders, ...): accent underline
+    int badge_count = 0;
+    bool visible = true; // a hidden toolbar pin preserves its saved slot, not its geometry
 };
 // Four parts (toolbar redesign §5): the count (a click opens the selection
 // menu), up to 2 situational actions, up to 4 of the user's actions, then
@@ -271,7 +285,7 @@ inline ToolbarSelectionChip MakeToolbarSelectionChip(const ToolbarLayout& l, flo
     for (const D2D1_RECT_F& pin : l.pins) if (pin.right > pin.left) anchor = pin;
     // A moved view on the left participates in the same occupied span.
     float limit = l.overflow.left - 10*scale;
-    for(const auto& view : {l.sort,l.filter,l.group,l.open_app}) {
+    for(const auto& view : {l.sort,l.filter,l.group}) {
         if(view.right<=view.left)continue;
         if(view.left>=anchor.right)limit=std::min(limit,view.left-10*scale);
         else if(view.right>anchor.right)anchor=view;

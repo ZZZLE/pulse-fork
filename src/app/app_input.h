@@ -20,10 +20,16 @@ LRESULT HandleCaptureChanged(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LP
 LRESULT HandleRButtonDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleRButtonUp(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT HandleMouseWheel(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+enum class PaneFocusCycle { Default, FilePanesOnly };
 LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT HandleKeyDown(AppState* s, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, PaneFocusCycle cycle);
 bool UpdateSplitterDrag(AppState& s, int mx, int my);
 void ClearDropFeedback(AppState& s);
 bool TickDropEdgeScroll(AppState& s, POINT point);
+// 滚动到最后一项之后: a drag left the window or was cancelled; the panes it
+// scrolled glide back. TickDropScrollReturn steps them once per frame.
+void ReturnDropScrolls(AppState& s);
+bool TickDropScrollReturn(AppState& s);
 std::wstring BaseName(const std::wstring& path);
 bool PointOnPaneHeader(const AppState& s, const ui::WindowViewModel& vm,
                               int pane_index, float x, float y);
@@ -48,6 +54,7 @@ bool PointInList(const AppState& s, int mx, int my);
 bool BlankClickDeselect(AppState& s, POINT client, bool maximize = false);
 bool RestoreBlankDeselect(AppState& s, POINT client, bool maximizing = false);
 void CancelFileClick(AppState& s);
+void CancelButtonPress(AppState& s);
 // 悬停选中 (single click mode): resting on a row selects it. True when it did.
 bool TickHoverSelect(AppState& s, ULONGLONG now);
 bool PointInHitItemName(AppState& s, const ui::WindowViewModel& vm,

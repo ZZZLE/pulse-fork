@@ -11,12 +11,14 @@
 #include "../ui_tree.h"
 #include <optional>
 namespace pulse::extensions::native {
+class DiagnosticsSink;
 class UiAdapter {
   public:
     UiAdapter(HWND owner, bool dark, D2D1_COLOR_F accent, float scale, std::function<bool()> alive);
     ~UiAdapter();
     UiAdapter(const UiAdapter &) = delete;
     UiAdapter &operator=(const UiAdapter &) = delete;
+    void SetDiagnostics(std::shared_ptr<DiagnosticsSink> sink);
     PulseStatus QueryModel(uint32_t version, void *table, uint32_t size);
     PulseStatus QueryEvents(uint32_t version, void *table, uint32_t size);
     PulseStatus QueryData(uint32_t version, void *table, uint32_t size);
@@ -47,9 +49,14 @@ class UiAdapter {
     static bool SidebarOccupied(HWND owner);
     static void SetLegacySidebar(HWND owner, bool occupied);
     bool Embed();
-    bool ShowEmbedded(RECT bounds, bool dark, D2D1_COLOR_F accent, float scale);
+    bool ShowEmbedded(RECT bounds, bool dark, D2D1_COLOR_F accent, float scale, D2D1_COLOR_F wash = {0, 0, 0, 0});
     void HideEmbedded();
     bool HasPanel(uint64_t id) const;
+    // Embedded page, host side: read a state, commit one as the user would, or
+    // click a node (its click subscribers run). False when no page is open.
+    std::optional<std::string> EmbeddedState(const std::string &key) const;
+    bool CommitEmbeddedState(const std::string &key, const std::string &value);
+    bool ClickEmbedded(const std::string &node);
     void Stop();
     bool InCallback() const;
     HWND NodeWindow(const std::string &id) const;

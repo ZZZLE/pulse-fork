@@ -21,13 +21,15 @@ public:
     IndexClient(const IndexClient&) = delete;
     IndexClient& operator=(const IndexClient&) = delete;
 
-    void Start(HWND notify, UINT status_msg, UINT search_msg, std::wstring pipe_name = kPipeName);
+    void Start(HWND notify, UINT status_msg, UINT search_msg, std::wstring pipe_name = kPipeName,
+               std::wstring helper_executable = {});
     void Stop();
 
     std::wstring Status() const;
     std::wstring IndexPath() const;
     bool ServiceMode() const;
     bool Connected() const { return connected_.load(); }
+    bool Ready() const { return connected_.load() && ready_.load(); }
     // Owner-thread snapshot; the eject worker probes this and the service pipe without starting either.
     std::wstring ReleasePipeName() const { return pipe_name_; }
     bool PinyinReady() const { return connected_.load() && pinyin_ready_.load(); }
@@ -85,6 +87,7 @@ private:
     UINT search_msg_ = 0;
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
     std::wstring pipe_name_ = kPipeName;
+    std::wstring helper_executable_; // Optional caller-verified helper; default retains ExePath policy.
     HANDLE child_proc_ = nullptr;
     HANDLE child_thread_ = nullptr;
     ULONGLONG service_start_tick_ = 0;   // last StartStoppedService attempt (Worker thread only)

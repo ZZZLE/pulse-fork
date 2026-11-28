@@ -7,6 +7,8 @@ inline constexpr UINT kPickerInteractionTestMessage = WM_APP + 93;
 struct PickerInteractionTest {
     UINT key = 0;
     int command = 0;
+    size_t filter_index = 0;
+    std::wstring filter_label;
     int edit_id = 0;
     bool ctrl = false, shift = false;
     bool folder = false;
@@ -19,6 +21,7 @@ struct PickerInteractionTest {
     std::vector<std::wstring> selected_paths;
     bool selected_visible = false;
     HWND rename_edit = nullptr;
-    RECT card{}, footer{};
+    RECT card{}, footer{}, cancel{}, primary{};
+    std::wstring cancel_text;
 };
 }

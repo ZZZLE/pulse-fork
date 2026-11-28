@@ -1,0 +1,8 @@
+LIBRARY PulseDialogCore64
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
+    PulseInitializeDirectReveal
+    PulseIsDirectRevealInstalled
+    PulseIsExplorerProcessInstalled
+    PulseDialogCoreQueryV1

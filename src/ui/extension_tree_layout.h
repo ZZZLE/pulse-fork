@@ -12,6 +12,11 @@ struct ExtensionLayoutCallbacks {
     std::function<float(const extensions::UiNode &, float)> measure;
     std::function<float(const extensions::UiNode &, float)> feedback_height;
     std::function<void(const extensions::UiNode &, D2D1_RECT_F, D2D1_RECT_F, bool, bool)> place;
+    // Optional content width in pixels for controls that size to their label (breadcrumbs); 0 = fill.
+    std::function<float(const extensions::UiNode &)> intrinsic_width;
+    // Optional label width in pixels of a badge: a horizontal stack made only of badges wraps
+    // like a line of text (as many per row as fit) instead of splitting into equal cells.
+    std::function<float(const extensions::UiNode &)> chip_width;
 };
 class ExtensionTreeLayout {
   public:
@@ -24,7 +29,7 @@ class ExtensionTreeLayout {
     };
     void Reset();
     float Arrange(const extensions::UiNode &root, D2D1_RECT_F viewport, float outer_offset, float scale,
-                  const ExtensionLayoutCallbacks &callbacks);
+                  const ExtensionLayoutCallbacks &callbacks, bool scroll_only = false, float bleed_x = 0);
     const std::map<const extensions::UiNode *, Viewport> &Viewports() const { return viewports_; }
     const extensions::UiNode *HitScrollbar(float x, float y) const;
     fluent::ScrollbarSpec Scrollbar(const extensions::UiNode *node, bool expanded = false) const;
@@ -41,9 +46,18 @@ class ExtensionTreeLayout {
     std::map<const extensions::UiNode *, Viewport> viewports_;
     std::map<const extensions::UiNode *, Placement> placements_;
     float scale_ = 1;
+    const extensions::UiNode* cached_root_ = nullptr;
+    float cached_width_ = 0, cached_height_ = 0;
+    std::map<std::pair<const extensions::UiNode*, float>, float> measure_cache_, feedback_cache_;
+    std::map<const extensions::UiNode*, bool> visible_cache_, enabled_cache_;
+    std::map<const extensions::UiNode*, int> selected_cache_;
     struct Flow {
         int columns = 1;
         std::vector<float> widths;
+        std::vector<char> row_end;  // wrapped chips: the visible child that ends each row
+        bool EndRow(size_t index, int column) const {
+            return row_end.empty() ? column == columns : row_end[index] != 0;
+        }
     };
     float ConstrainWidth(const extensions::UiNode &node, float width) const;
     float ConstrainHeight(const extensions::UiNode &node, float height) const;

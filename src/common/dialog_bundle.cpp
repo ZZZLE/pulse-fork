@@ -6,6 +6,7 @@
 #include <array>
 #include <filesystem>
 #include <set>
+#include <map>
 #include <vector>
 #include <utility>
 #include <stdexcept>
@@ -14,6 +15,7 @@ namespace pulse::dialog_bundle {
 namespace {
 namespace fs = std::filesystem;
 using json::Value;
+enum class VerifyMode { Dialog, AppRuntime, AppStartup };
 struct Failure { DWORD error; };
 void Require(bool ok, DWORD error = ERROR_INVALID_DATA) { if (!ok) throw Failure{error}; }
 DWORD Last() { const DWORD e = GetLastError(); return e ? e : ERROR_FUNCTION_FAILED; }
@@ -143,12 +145,14 @@ struct Pe {
 };
 }
 struct BundleLease::State {
-    std::wstring directory,launcher,host,runtime,ui;
-    std::string digest; unsigned machine=0;
+    std::wstring directory,launcher,host,runtime,ui,admin_auto_helper,auto_runtime;
+    std::string digest,version; unsigned machine=0;
     std::vector<File> directories,files;
     std::vector<std::pair<std::wstring,BY_HANDLE_FILE_INFORMATION>> identities;
     std::set<std::string> expected;
     bool installed=false;
+    bool allow_empty_root_log = false;
+    std::unique_ptr<BundleLease> host_bundle;
 };
 namespace {
 void Keep(BundleLease::State& s, const fs::path& path, File f) {
@@ -167,7 +171,19 @@ void Enumerate(const BundleLease::State& s) {
         if(s.installed && (attr&FILE_ATTRIBUTE_DIRECTORY) && (relative==".pulse-setup" || relative=="dialogbridge")) {
             it.disable_recursion_pending(); continue;
         }
-        if(attr&FILE_ATTRIBUTE_DIRECTORY) { Require(relative=="licenses" || relative.starts_with("licenses/")); continue; }
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+            if (s.allow_empty_root_log && relative == "log") {
+                // An empty directory is not a loadable member. Check it without
+                // skipping enumeration errors or permitting a reparse point.
+                const auto log = Open(item.path(), true);
+                std::error_code error;
+                const fs::directory_iterator child(item.path(), error);
+                Require(!error && child == fs::directory_iterator{});
+                continue;
+            }
+            Require(relative == "licenses" || relative.starts_with("licenses/"));
+            continue;
+        }
         if(s.installed && (relative=="uninstall.exe" || relative=="setup-defaults.ini" || relative==".pulse-files")) continue;
         Require(found.insert(relative).second && s.expected.contains(relative));
     } Require(found==s.expected);
@@ -182,15 +198,25 @@ BundleLease& BundleLease::operator=(BundleLease&&) noexcept = default;
 BundleLease::operator bool() const noexcept { return state_!=nullptr; }
 #define ACCESSOR(name,field) const std::wstring& BundleLease::name() const noexcept { static const std::wstring empty; return state_?state_->field:empty; }
 ACCESSOR(Directory,directory) ACCESSOR(Launcher,launcher) ACCESSOR(Host,host) ACCESSOR(Runtime,runtime) ACCESSOR(UiProvider,ui)
+ACCESSOR(AdminAutoHelper,admin_auto_helper) ACCESSOR(AutoRuntime,auto_runtime)
 #undef ACCESSOR
 const std::string& BundleLease::ManifestDigest() const noexcept { static const std::string empty; return state_?state_->digest:empty; }
+const std::string& BundleLease::Version() const noexcept { static const std::string empty; return state_?state_->version:empty; }
 unsigned BundleLease::Machine() const noexcept { return state_?state_->machine:0; }
+bool BundleLease::IsThinCompanion() const noexcept { return state_ && !!state_->host_bundle; }
 DWORD RecheckDirectory(const BundleLease& lease) noexcept {
-    try { Require(!!lease,ERROR_INVALID_HANDLE); Enumerate(*lease.state_); return ERROR_SUCCESS; }
+    try { Require(!!lease,ERROR_INVALID_HANDLE); Enumerate(*lease.state_); if(lease.state_->host_bundle) return RecheckDirectory(*lease.state_->host_bundle); return ERROR_SUCCESS; }
     catch(const Failure& f) {return f.error;} catch(const fs::filesystem_error& e) {return static_cast<DWORD>(e.code().value());} catch(...) {return ERROR_NOT_ENOUGH_MEMORY;}
 }
-DWORD VerifyBundle(const std::wstring& directory, std::string_view expected_digest, BundleLease& output) noexcept {
+struct BundleVerifier {
+    static DWORD Verify(const std::wstring& directory, std::string_view expected_digest,
+                        VerifyMode mode, BundleLease& output, ResolveStage* stage) noexcept;
+};
+
+DWORD BundleVerifier::Verify(const std::wstring& directory, std::string_view expected_digest,
+                            VerifyMode mode, BundleLease& output, ResolveStage* stage) noexcept {
     output=BundleLease{};
+    if (stage) *stage = ResolveStage::BundleDirectory;
     try {
         Require(expected_digest.empty()||Hex(expected_digest));
         Require(directory.size()>=3 && directory[1]==L':' && directory[2]==L'\\' && directory.find(L'/',0)==directory.npos && directory.find(L':',2)==directory.npos && directory.find(L'\0')==directory.npos,ERROR_BAD_PATHNAME);
@@ -199,26 +225,50 @@ DWORD VerifyBundle(const std::wstring& directory, std::string_view expected_dige
         s->directories.push_back(Open(path,true));
         for(const auto& part:root.relative_path()) { Require(part!=L"." && part!=L"..",ERROR_BAD_PATHNAME); path/=part; s->directories.push_back(Open(path,true)); }
         s->directory=Final(s->directories.back().h);
+        if (stage) *stage = ResolveStage::Manifest;
         auto mf=Open(root/L"manifest.json",false); auto raw=Read(mf.h,1024*1024); s->digest=Digest(raw);
         Require(expected_digest.empty()||s->digest==expected_digest,ERROR_REVISION_MISMATCH);
-        auto manifest=Parse(raw); Keys(manifest,{"schema","version","architecture","contract","dynamic_helpers","system_dependencies","files"});
-        const auto schema=Int(At(manifest,"schema")); Require(schema==1 || schema==2,ERROR_REVISION_MISMATCH); s->installed=schema==2;
-        const auto version=Text(At(manifest,"version")); Require(!version.empty()&&version.size()<=64);
+        auto manifest=Parse(raw);
+        const auto schema=Int(At(manifest,"schema"));
+        const bool app_runtime = mode != VerifyMode::Dialog;
+        Require(app_runtime ? schema==4 : (schema==1 || schema==2 || schema==3),ERROR_REVISION_MISMATCH);
+        s->installed=schema==2;
+        s->allow_empty_root_log = mode == VerifyMode::AppStartup;
+        const bool thin=schema==3;
+        if(thin) Keys(manifest,{"schema","version","architecture","contract","dynamic_helpers","system_dependencies","files","host_bundle"});
+        else Keys(manifest,{"schema","version","architecture","contract","dynamic_helpers","system_dependencies","files"});
+        const auto version=Text(At(manifest,"version")); Require(!version.empty()&&version.size()<=64); s->version=version;
         Require(std::all_of(version.begin(),version.end(),[](char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='.'||c=='-';}));
         Require(version[0]!='_'&&version[0]!='.'&&version[0]!='-');
-        const auto arch=Text(At(manifest,"architecture")); Require(arch=="x64"||arch=="x86"); s->machine=arch=="x64"?0x8664:0x14c;
-        const auto& contract=At(manifest,"contract"); Keys(contract,{"manifest","picker_ui_abi","runtime_session","open_policy","save_policy","experimental","capability_certification"});
-        Require(Int(At(contract,"manifest"))==1 && Int(At(contract,"picker_ui_abi"))==2 && Int(At(contract,"runtime_session"))==1 && Text(At(contract,"open_policy"))=="LocalOpenV1" && Text(At(contract,"save_policy"))=="LocalSaveV1",ERROR_REVISION_MISMATCH);
-        Require(At(contract,"experimental").is_bool()&&At(contract,"experimental").as_bool()&&At(contract,"capability_certification").is_bool()&&!At(contract,"capability_certification").as_bool());
-        const auto& dynamic=At(manifest,"dynamic_helpers"); Keys(dynamic,{"Pulse.Preview.exe","pdfium.dll","pulse_elevated.exe"});
-        Require(Text(At(dynamic,"Pulse.Preview.exe"))=="src/ui/thumbnail_cache.cpp: module-relative preview worker" && Text(At(dynamic,"pdfium.dll"))=="src/preview_host/pdf_raster.cpp: dynamic PDF renderer" && Text(At(dynamic,"pulse_elevated.exe"))=="src/ops/elevated_transfer_client.cpp: explicit elevated operation helper");
+        const auto arch=Text(At(manifest,"architecture")); Require(arch=="x64"||arch=="x86"); s->machine=arch=="x64"?0x8664:0x14c; Require(!thin || arch=="x86",ERROR_EXE_MACHINE_TYPE_MISMATCH);
+        const auto& contract=At(manifest,"contract");
+        if (app_runtime) {
+            Keys(contract,{"manifest","kind"});
+            Require(Int(At(contract,"manifest"))==1 && Text(At(contract,"kind"))=="AppRuntime",ERROR_REVISION_MISMATCH);
+        } else {
+            Keys(contract,{"manifest","picker_ui_abi","runtime_session","open_policy","save_policy","experimental","capability_certification"});
+            Require(Int(At(contract,"manifest"))==1 && Int(At(contract,"picker_ui_abi"))==2 && Int(At(contract,"runtime_session"))==1 && Text(At(contract,"open_policy"))=="LocalOpenV1" && Text(At(contract,"save_policy"))=="LocalSaveV1",ERROR_REVISION_MISMATCH);
+            Require(At(contract,"experimental").is_bool()&&At(contract,"experimental").as_bool()&&At(contract,"capability_certification").is_bool()&&!At(contract,"capability_certification").as_bool());
+        }
+        const auto& dynamic=At(manifest,"dynamic_helpers");
+        if(thin) Keys(dynamic,{});
+        else { Keys(dynamic,{"Pulse.Preview.exe","pdfium.dll","pulse_elevated.exe"});
+        Require(Text(At(dynamic,"Pulse.Preview.exe"))=="src/ui/thumbnail_cache.cpp: module-relative preview worker" && Text(At(dynamic,"pdfium.dll"))=="src/preview_host/pdf_raster.cpp: dynamic PDF renderer" && Text(At(dynamic,"pulse_elevated.exe"))=="src/ops/elevated_transfer_client.cpp: explicit elevated operation helper"); }
         Keep(*s,root/L"manifest.json",std::move(mf)); s->expected.insert("manifest.json");
+        if (stage) *stage = ResolveStage::VerificationMarker;
         auto marker=Open(root/L"VERIFIED.json",false); auto mark=Parse(Read(marker.h,1024)); Keys(mark,{"manifest_sha256","integrity_only"});
         Require(Text(At(mark,"manifest_sha256"))==s->digest && At(mark,"integrity_only").is_bool()&&At(mark,"integrity_only").as_bool()); Keep(*s,root/L"VERIFIED.json",std::move(marker)); s->expected.insert("verified.json");
+        if (stage) *stage = ResolveStage::Member;
         const auto& entries=At(manifest,"files"); Require(entries.is_array()&&entries.size()>=1&&entries.size()<=512);
         std::set<std::string> binaries,dependencies,systems;
+        std::map<std::string,std::set<std::string>> imports;
         for(const auto& item:entries.items()) {
             auto relative=Text(At(item,"path")), role=Text(At(item,"role")); Require(Relative(relative)); const bool license=role=="license";
+            if (app_runtime && !license) {
+                const auto name = Lower(relative);
+                Require(!name.starts_with("pulsedialog") && !name.starts_with("pulsefiledialog") &&
+                    name != "pulsepickeruiproof.dll");
+            }
             if(license) Keys(item,{"path","role","size","sha256"}); else Keys(item,{"path","role","size","sha256","machine","imports","delay_imports"});
             Require(license||role=="entry"||role=="import"||role=="dynamic-helper"); Require(license?relative.starts_with("licenses/"):relative.find('/')==relative.npos);
             Require(s->expected.insert(Lower(relative)).second); auto wide=json::Wide(relative); Require(!wide.empty()); auto full=root/fs::path(wide);
@@ -231,50 +281,191 @@ DWORD VerifyBundle(const std::wstring& directory, std::string_view expected_dige
             auto hash=Text(At(item,"sha256")); Require(Hex(hash)&&hash==Digest(bytes),ERROR_CRC);
             if(!license) { Pe pe(bytes); Require(pe.machine==s->machine && Int(At(item,"machine"))==pe.machine,ERROR_EXE_MACHINE_TYPE_MISMATCH);
                 auto normal=pe.Imports(false), delay=pe.Imports(true); Require(normal==Strings(At(item,"imports"))&&delay==Strings(At(item,"delay_imports")));
+                imports[Lower(relative)]=normal; imports[Lower(relative)].insert(delay.begin(),delay.end());
                 dependencies.insert(normal.begin(),normal.end()); dependencies.insert(delay.begin(),delay.end()); binaries.insert(Lower(relative)); }
             Keep(*s,full,std::move(f));
         }
+        if (stage) *stage = ResolveStage::DependencyClosure;
         const std::string automatic=arch=="x64"?"pulsedialogauto64.dll":"pulsedialogauto32.dll";
         const std::string wrong_automatic=arch=="x64"?"pulsedialogauto32.dll":"pulsedialogauto64.dll";
         Require(!binaries.contains(wrong_automatic));
         Require(binaries.contains(automatic)==binaries.contains("pulsedialogautocontrol.exe"));
         const std::string runtime=arch=="x64"?"PulseFileDialogRuntimeUiProof64R8.dll":"PulseFileDialogRuntimeUiProof32R8.dll";
-        for(const auto& name:std::vector<std::string>{"PulseDialogLauncher.exe",runtime,"pulse.exe","PulsePickerUiProof.dll","lumatext.dll","pulse_shell.exe","Pulse.Preview.exe","pdfium.dll","pulse_elevated.exe"}) Require(binaries.contains(Lower(name)),ERROR_MOD_NOT_FOUND);
+        auto required=thin ? std::vector<std::string>{"PulseDialogLauncher.exe",runtime,"PulseDialogAuto32.dll","PulseDialogAutoControl.exe"} : std::vector<std::string>{"PulseDialogLauncher.exe",runtime,"pulse.exe","PulsePickerUiProof.dll","lumatext.dll","pulse_shell.exe","Pulse.Preview.exe","pdfium.dll","pulse_elevated.exe"};
+        if (app_runtime) required = {"pulse.exe", "lumatext.dll", "pulse_shell.exe", "Pulse.Preview.exe", "pdfium.dll", "pulse_elevated.exe"};
+        const std::string auto_runtime = arch == "x64" ? "PulseFileDialogAutoRuntime64.dll" : "PulseFileDialogAutoRuntime32.dll";
+        const std::string wrong_auto_runtime = arch == "x64" ? "PulseFileDialogAutoRuntime32.dll" : "PulseFileDialogAutoRuntime64.dll";
+        Require(!binaries.contains(Lower(wrong_auto_runtime)));
+        Require(binaries.contains("pulsedialogadminauto.exe") == binaries.contains(Lower(auto_runtime)), ERROR_MOD_NOT_FOUND);
+        if (binaries.contains("pulsedialogadminauto.exe")) {
+            required.push_back("PulseDialogAdminAuto.exe"); required.push_back(auto_runtime);
+            s->admin_auto_helper = (root / L"PulseDialogAdminAuto.exe").wstring();
+            s->auto_runtime = (root / json::Wide(auto_runtime)).wstring();
+        }
+        for(const auto& name:required) Require(binaries.contains(Lower(name)),ERROR_MOD_NOT_FOUND);
         for(const auto& dep:dependencies) { if(System(dep)) {Require(!binaries.contains(dep));systems.insert(dep);} else Require(binaries.contains(dep),ERROR_MOD_NOT_FOUND); }
         Require(systems==Strings(At(manifest,"system_dependencies")));
-        for(auto name:{"licenses/pulse/license","licenses/detours/license.md","licenses/ib-pinyin/license.txt","licenses/md4c/license.md","licenses/sqlite/readme.md","licenses/lzma/readme.pulse.md"}) Require(s->expected.contains(name),ERROR_FILE_NOT_FOUND);
-        for(auto group:{"licenses/lumatext/","licenses/pdfium/"}) Require(std::any_of(s->expected.begin(),s->expected.end(),[&](const auto& x){return x.starts_with(group);}),ERROR_FILE_NOT_FOUND);
-        s->launcher=(root/L"PulseDialogLauncher.exe").wstring(); s->host=(root/L"pulse.exe").wstring(); s->runtime=(root/json::Wide(runtime)).wstring(); s->ui=(root/L"PulsePickerUiProof.dll").wstring();
-        Enumerate(*s); output.state_=std::move(s); return ERROR_SUCCESS;
+        if(thin || app_runtime) {
+            std::set<std::string> reachable;
+            for(const auto& name:required) reachable.insert(Lower(name));
+            if (app_runtime) {
+                for (const auto* name : {"pulse.ai.exe", "pulse.content.exe", "pulse.document.exe",
+                        "pulse.index.exe", "pulse_hotkey_broker.exe", "pulse_start_pin.dll", "pulse_integration.exe",
+                        "pulse_explorer_bridge.exe"}) {
+                    if (binaries.contains(name)) reachable.insert(name);
+                }
+            }
+            for(size_t previous=0;previous!=reachable.size();) {
+                previous=reachable.size();
+                const auto snapshot=reachable;
+                for(const auto& name:snapshot) for(const auto& dependency:imports.at(name))
+                    if(!System(dependency)) reachable.insert(dependency);
+            }
+            Require(reachable==binaries,ERROR_INVALID_DATA);
+        }
+        for(auto name:{"licenses/pulse/license","licenses/detours/license.md"}) Require(s->expected.contains(name),ERROR_FILE_NOT_FOUND);
+        if(!thin) for(auto name:{"licenses/ib-pinyin/license.txt","licenses/md4c/license.md","licenses/sqlite/readme.md","licenses/lzma/readme.pulse.md"}) Require(s->expected.contains(name),ERROR_FILE_NOT_FOUND);
+        if(!thin) for(auto group:{"licenses/lumatext/","licenses/pdfium/"}) Require(std::any_of(s->expected.begin(),s->expected.end(),[&](const auto& x){return x.starts_with(group);}),ERROR_FILE_NOT_FOUND);
+        s->host=(root/L"pulse.exe").wstring();
+        if (!app_runtime) {
+            s->launcher=(root/L"PulseDialogLauncher.exe").wstring();
+            s->runtime=(root/json::Wide(runtime)).wstring();
+            s->ui=(root/L"PulsePickerUiProof.dll").wstring();
+        }
+        if(thin) {
+            const auto& binding=At(manifest,"host_bundle"); Keys(binding,{"manifest_sha256"});
+            const auto digest=Text(At(binding,"manifest_sha256")); Require(Hex(digest));
+            const auto host_root=root.parent_path()/json::Wide(digest);
+            // Hold the manifest while checking its schema, preventing recursive
+            // companion chains and substitution before the full closure is leased.
+            auto host_manifest=Open(host_root/L"manifest.json",false);
+            const auto host_description=Parse(Read(host_manifest.h,1024*1024));
+            Require(Int(At(host_description,"schema"))==1,ERROR_REVISION_MISMATCH);
+            std::set<std::string> host_files;
+            for(const auto& item:At(host_description,"files").items()) host_files.insert(Lower(Text(At(item,"path"))));
+            Require(host_files.contains("pulsedialogauto64.dll") && host_files.contains("pulsedialogautocontrol.exe"),ERROR_MOD_NOT_FOUND);
+            auto host=std::make_unique<BundleLease>();
+            const DWORD error=VerifyBundle(host_root.wstring(),digest,*host); Require(!error,error);
+            Require(host->Machine()==IMAGE_FILE_MACHINE_AMD64,ERROR_EXE_MACHINE_TYPE_MISMATCH);
+            Require(host->Version()==s->version,ERROR_REVISION_MISMATCH);
+            s->host=host->Host(); s->ui.clear(); s->host_bundle=std::move(host);
+        }
+        if (stage) *stage = ResolveStage::DirectoryContents;
+        Enumerate(*s);
+        output.state_=std::move(s);
+        if (stage) *stage = ResolveStage::None;
+        return ERROR_SUCCESS;
     } catch(const Failure& f) {return f.error;} catch(const fs::filesystem_error& e) {return static_cast<DWORD>(e.code().value());} catch(...) {return ERROR_NOT_ENOUGH_MEMORY;}
 }
-DWORD ResolveInstalledBundle(const std::wstring& directory, BundleLease& output) noexcept {
+DWORD VerifyBundle(const std::wstring& directory, std::string_view expected_digest, BundleLease& output,
+                   ResolveStage* stage) noexcept {
+    return BundleVerifier::Verify(directory, expected_digest, VerifyMode::Dialog, output, stage);
+}
+DWORD VerifyAppRuntime(const std::wstring& directory, std::string_view expected_digest, BundleLease& output,
+                       ResolveStage* stage) noexcept {
+    return BundleVerifier::Verify(directory, expected_digest, VerifyMode::AppRuntime, output, stage);
+}
+DWORD VerifyAppRuntimeForStartup(const std::wstring& directory, std::string_view expected_digest,
+                                BundleLease& output, ResolveStage* stage) noexcept {
+    return BundleVerifier::Verify(directory, expected_digest, VerifyMode::AppStartup, output, stage);
+}
+namespace {
+DWORD ResolvePointer(const std::wstring& directory, const wchar_t* name, BundleLease& output,
+                     ResolveStage* stage = nullptr, VerifyMode mode = VerifyMode::Dialog) {
+    if (stage) *stage = ResolveStage::InstallDirectory;
+    Require(directory.size()>=3 && directory[1]==L':' && directory[2]==L'\\' &&
+        directory.find(L'/')==directory.npos && directory.find(L':',2)==directory.npos &&
+        directory.find(L'\0')==directory.npos,ERROR_BAD_PATHNAME);
+    const fs::path root(directory);
+    Require(root.is_absolute() && root.lexically_normal()==root,ERROR_BAD_PATHNAME);
+    std::vector<File> ancestors;
+    auto path=root.root_path(); ancestors.push_back(Open(path,true));
+    for(const auto& part:root.relative_path()) {path/=part;ancestors.push_back(Open(path,true));}
+    std::string digest, relative;
+    {
+        if (stage) *stage = ResolveStage::PointerOpen;
+        auto pointer=Open(root/name,false,true);
+        if (stage) *stage = ResolveStage::PointerData;
+        const auto value=Parse(Read(pointer.h,1024));
+        Keys(value,{"schema","directory","manifest_sha256"});
+        Require(Int(At(value,"schema"))==1,ERROR_REVISION_MISMATCH);
+        digest=Text(At(value,"manifest_sha256"));
+        relative=Text(At(value,"directory"));
+        Require(Hex(digest) && relative==(mode == VerifyMode::Dialog ? "DialogBridge/" : "AppRuntime/")+digest,ERROR_BAD_PATHNAME);
+    }
+    if (stage) *stage = ResolveStage::BundleDirectory;
+    auto selected=root/json::Wide(relative); selected.make_preferred();
+    return BundleVerifier::Verify(selected.wstring(), digest, mode, output, stage);
+}
+DWORD ResolveAppPointer(const std::wstring& directory, BundleLease& output,
+                        ResolveStage* stage, VerifyMode mode) noexcept {
+    output = BundleLease{};
+    try {
+        return ResolvePointer(directory, L"app-current.json", output, stage, mode);
+    } catch (const Failure& failure) {
+        return failure.error;
+    } catch (const fs::filesystem_error& error) {
+        return static_cast<DWORD>(error.code().value());
+    } catch (...) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+}
+}
+DWORD ResolveInstalledBundle(const std::wstring& directory, BundleLease& output,
+                             ResolveStage* stage) noexcept {
     output=BundleLease{};
     try {
-        Require(directory.size()>=3 && directory[1]==L':' && directory[2]==L'\\' &&
-            directory.find(L'/')==directory.npos && directory.find(L':',2)==directory.npos &&
-            directory.find(L'\0')==directory.npos,ERROR_BAD_PATHNAME);
-        const fs::path root(directory);
-        Require(root.is_absolute() && root.lexically_normal()==root,ERROR_BAD_PATHNAME);
-        std::vector<File> ancestors;
-        auto path=root.root_path(); ancestors.push_back(Open(path,true));
-        for(const auto& part:root.relative_path()) {path/=part;ancestors.push_back(Open(path,true));}
-        std::string digest, relative;
-        {
-            auto pointer=Open(root/L"dialog-current.json",false,true);
-            const auto value=Parse(Read(pointer.h,1024));
-            Keys(value,{"schema","directory","manifest_sha256"});
-            Require(Int(At(value,"schema"))==1,ERROR_REVISION_MISMATCH);
-            digest=Text(At(value,"manifest_sha256"));
-            relative=Text(At(value,"directory"));
-            Require(Hex(digest) && relative=="DialogBridge/"+digest,ERROR_BAD_PATHNAME);
-        }
-        auto selected=root/json::Wide(relative); selected.make_preferred();
         BundleLease lease;
-        const DWORD error=VerifyBundle(selected.wstring(),digest,lease);
+        const DWORD error=ResolvePointer(directory,L"dialog-current.json",lease,stage);
         if(error) return error;
-        Require(!lease.state_->installed,ERROR_REVISION_MISMATCH);
+        if (stage) *stage = ResolveStage::BundleKind;
+        Require(!lease.state_->installed && !lease.state_->host_bundle,ERROR_REVISION_MISMATCH);
         output=std::move(lease);
+        if (stage) *stage = ResolveStage::None;
+        return ERROR_SUCCESS;
+    } catch(const Failure& f) {return f.error;} catch(const fs::filesystem_error& e) {return static_cast<DWORD>(e.code().value());} catch(...) {return ERROR_NOT_ENOUGH_MEMORY;}
+}
+DWORD ResolveInstalledAppRuntime(const std::wstring& directory, BundleLease& output,
+                                 ResolveStage* stage) noexcept {
+    return ResolveAppPointer(directory, output, stage, VerifyMode::AppRuntime);
+}
+DWORD ResolveStartupBundle(const std::wstring& directory, BundleLease& output,
+                           ResolveStage* stage) noexcept {
+    ResolveStage app_stage{};
+    const DWORD result = ResolveAppPointer(directory, output, &app_stage, VerifyMode::AppStartup);
+    if (stage) *stage = app_stage;
+    if (result != ERROR_FILE_NOT_FOUND || app_stage != ResolveStage::PointerOpen) return result;
+    try {
+        // A directory can survive an interrupted or rolled-back legacy upgrade.
+        // Only the marker committed with the root files opts that install in.
+        const auto marker = fs::path(directory) / L".pulse-app-layout";
+        if (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES) return result;
+        const DWORD marker_error = GetLastError();
+        if (marker_error != ERROR_FILE_NOT_FOUND && marker_error != ERROR_PATH_NOT_FOUND) {
+            return marker_error;
+        }
+        return ResolveInstalledBundle(directory, output, stage);
+    } catch (...) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+}
+DWORD ResolveInstalledBundleForMachine(const std::wstring& directory, unsigned machine, BundleLease& output) noexcept {
+    output=BundleLease{};
+    try {
+        Require(machine==IMAGE_FILE_MACHINE_AMD64 || machine==IMAGE_FILE_MACHINE_I386,ERROR_INVALID_PARAMETER);
+        BundleLease primary;
+        const DWORD first=ResolveInstalledBundle(directory,primary);
+        if(first) return first;
+        if(primary.Machine()==machine) {output=std::move(primary);return ERROR_SUCCESS;}
+        Require(machine==IMAGE_FILE_MACHINE_I386,ERROR_EXE_MACHINE_TYPE_MISMATCH);
+        BundleLease companion;
+        const DWORD error=ResolvePointer(directory,L"dialog-x86-current.json",companion);
+        if(error) return error;
+        Require(!companion.state_->installed,ERROR_REVISION_MISMATCH);
+        Require(companion.Machine()==machine,ERROR_EXE_MACHINE_TYPE_MISMATCH);
+        Require(companion.Version()==primary.Version(),ERROR_REVISION_MISMATCH);
+        if(companion.state_->host_bundle) Require(companion.state_->host_bundle->ManifestDigest()==primary.ManifestDigest(),ERROR_REVISION_MISMATCH);
+        output=std::move(companion);
         return ERROR_SUCCESS;
     } catch(const Failure& f) {return f.error;} catch(const fs::filesystem_error& e) {return static_cast<DWORD>(e.code().value());} catch(...) {return ERROR_NOT_ENOUGH_MEMORY;}
 }

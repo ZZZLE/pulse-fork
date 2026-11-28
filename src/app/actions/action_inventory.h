@@ -196,8 +196,12 @@ inline constexpr ActionEntry kActions[] = {
     {"net.system_settings", ActionRisk::View},
     // 工具
     {"git.refresh", ActionRisk::Read},
+    {"git.source_control", ActionRisk::View},
     {"git.pull", ActionRisk::External},
     {"git.push", ActionRisk::External},
+    {"git.sync", ActionRisk::External},
+    {"git.branches", ActionRisk::View},
+    {"git.history", ActionRisk::View},
     {"toolbar.open_with", ActionRisk::External},
     {"toolbar.pin_app", ActionRisk::Organize},
     {"toolbar.customize", ActionRisk::View},
@@ -272,12 +276,14 @@ inline constexpr KeyActionLink kKeyActionLinks[] = {
     {KeyAction::AiAssistant, {"", "the assistant itself"}},
     {KeyAction::AiHistory, {"", "the assistant's own chat history"}},
     {KeyAction::ShortcutHelp, {"app.shortcut_help"}},
+    {KeyAction::OpenSettings, {"app.settings_page"}},
     {KeyAction::ArrangeSideBySide, {"window.arrange"}},
     {KeyAction::ArrangeStacked, {"window.arrange"}},
     {KeyAction::ArrangeColumns, {"window.arrange"}},
     {KeyAction::ArrangeTile, {"window.arrange"}},
     {KeyAction::ArrangeMain, {"window.arrange"}},
     {KeyAction::ArrangeCascade, {"window.arrange"}},
+    {KeyAction::CloseOtherTabs, {"tab.close_others"}},
 };
 
 inline constexpr MenuCmdLink kMenuCmdLinks[] = {
@@ -405,6 +411,13 @@ inline constexpr MenuCmdLink kMenuCmdLinks[] = {
     {CmdShellNewBase, {"file.new_file"}},
     {CmdCopyToWindowBase, {"file.copy_to"}},
     {CmdMoveToWindowBase, {"file.move_to"}},
+    {CmdCopyToPicked, {"", "choose-folder row of the copy to flyout; file.copy_to takes the target"}},
+    {CmdMoveToPicked, {"", "choose-folder row of the move to flyout; file.move_to takes the target"}},
+    {CmdOpenInOtherPane, {"", "menu-only: opens the selected folder in the other pane"}},
+    {CmdOpenInOtherPaneHere, {"", "menu-only: opens the current folder in the other pane"}},
+    {CmdOpenNativeExplorer, {"", "menu-only hand-off of the selection to File Explorer"}},
+    {CmdOpenNativeExplorerHere, {"", "menu-only hand-off of the current folder to File Explorer"}},
+    {CmdVfsExtractSelected, {"", "archive-as-folder row; extracts through a folder picker"}},
     {CmdToolbarAppBase, {"toolbar.open_with"}},
     {CmdToolbarPinAppBase, {"toolbar.pin_app"}},
     {CmdToolbarToolBase, {"toolbar.tools"}},
@@ -429,6 +442,10 @@ inline constexpr MenuCmdLink kMenuCmdLinks[] = {
     {kCmdGitPull, {"git.pull"}},
     {kCmdGitPush, {"git.push"}},
     {kCmdGitRefresh, {"git.refresh"}},
+    {kCmdGitSourceControl, {"git.source_control"}},
+    {kCmdGitSync, {"git.sync"}},
+    {kCmdGitBranches, {"git.branches"}},
+    {kCmdGitHistory, {"git.history"}},
 };
 
 constexpr const ActionEntry* FindAction(std::string_view id) noexcept {

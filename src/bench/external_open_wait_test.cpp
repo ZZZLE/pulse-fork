@@ -22,7 +22,13 @@ int wmain() {
         reveal.deadline = now + 10000;
         reveal.path = L"C:\\fixture\\folder";
         reveal.reveal = true;
-        check(Coordinator::EncodeOpenRequest(reveal).empty(), "internal reveal cannot silently lose intent on v2 wire");
+        const auto reveal_bytes = Coordinator::EncodeOpenRequest(reveal);
+        COPYDATASTRUCT reveal_data{Coordinator::OpenRequestMessageId(),
+            static_cast<DWORD>(reveal_bytes.size()), const_cast<unsigned char*>(reveal_bytes.data())};
+        Coordinator::OpenRequest decoded_reveal;
+        check(Coordinator::DecodeOpenRequest(&reveal_data, decoded_reveal) &&
+            decoded_reveal.reveal && decoded_reveal.wire_reveal && decoded_reveal.path == reveal.path,
+            "explicit v3 wire preserves reveal intent rather than silently encoding a v2 open");
         check(reveal_queue.SubmitOpenRequest(reveal, now, host, WM_APP + 125) == Coordinator::OpenSubmission::Accepted,
             "folder reveal enters owned queue");
         auto open_same_id = reveal;
@@ -99,6 +105,28 @@ int wmain() {
     if (next) Coordinator::CompleteDelivery(*next, true);
     if (last) Coordinator::CompleteDelivery(*last, true);
     timed.Release();
+    Coordinator not_shown;
+    auto failed_reveal = make(73);
+    check(not_shown.SubmitOpenRequest(failed_reveal, now, host, WM_APP + 125) == Coordinator::OpenSubmission::Accepted &&
+        failed_reveal.delivery->load() == Coordinator::OpenDeliveryState::Queued, "request admission alone does not claim a successful reveal");
+    auto failed_claim = not_shown.TakeQueuedOpenRequest(now, true);
+    check(failed_claim.has_value(), "failed-reveal fixture owns its admitted UI request");
+    ExternalOpenNotice failed_notice;
+    if (failed_claim) {
+        // DispatchQueuedExternalOpen owns application failures; the queue must not count them twice.
+        failed_notice.Failed(false);
+        not_shown.FinishOpenClaim(std::move(*failed_claim), false);
+    }
+    const auto infrastructure_failure = not_shown.TakeOpenFailures();
+    failed_notice.pending += infrastructure_failure.timed_out;
+    failed_notice.failed += infrastructure_failure.failed;
+    const auto reveal_failure = failed_notice.Take(true, false, false, false);
+    check(failed_reveal.delivery->load() == Coordinator::OpenDeliveryState::Cancelled &&
+        reveal_failure.failed == 1 && reveal_failure.timed_out == 0 && infrastructure_failure.failed == 0,
+        "unshown window cancels delivery and records one failure, not success");
+    check(!not_shown.TakeQueuedOpenRequest(now + 1) && !failed_notice.Take(true, false, false, false) &&
+        not_shown.TakeOpenFailures().failed == 0, "failed reveal is not retried or counted repeatedly");
+    not_shown.Release();
     ExternalOpenNotice notice;
     notice.TimedOut(false); notice.TimedOut(false); notice.Failed(false);
     check(!notice.Take(true, true, false, false) && !notice.Take(false, false, false, false) && !notice.Take(true, false, true, false), "busy hidden or existing toast retains summary");

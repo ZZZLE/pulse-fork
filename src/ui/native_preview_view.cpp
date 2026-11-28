@@ -2,12 +2,30 @@
 #include "extension_panel.h"
 #include "../app/extensions/native/previews_adapter.h"
 #include "../app/extensions/native/session.h"
+#include "../app/extensions/runtime.h"
 #include "../app/app_runtime.h"
+#include <algorithm>
 #include <atomic>
 
 namespace pulse::ui {
 namespace {
 std::atomic<uint64_t> next_surface{1};
+void EnsurePreviewPackagesStarted(AppState& state, const std::wstring& path) {
+    extensions::native::PrepareCommandPackages(state);
+    const auto dot = path.find_last_of(L'.');
+    if (dot == std::wstring::npos) return;
+    std::string ext;
+    ext.reserve(path.size() - dot);
+    for (size_t i = dot; i < path.size(); ++i) {
+        const wchar_t wc = path[i];
+        if (wc <= 0 || wc > 0x7f) return;
+        char c = static_cast<char>(wc);
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        ext.push_back(c);
+    }
+    // Providers register in OnStart: activate, loading alone registers nothing.
+    extensions::native::ActivatePreviewPackages(state, ext);
+}
 }
 NativePreviewView::NativePreviewView() : surface_(next_surface.fetch_add(1)) {}
 NativePreviewView::~NativePreviewView() { Reset(); }
@@ -18,7 +36,7 @@ void NativePreviewView::Reset() {
     result_.reset(); bitmap_.reset(); device_ = nullptr;
 }
 bool NativePreviewView::Available(HWND owner, const std::wstring& path) {
-    if (auto* state = GetAppState(owner)) extensions::native::PrepareCommandPackages(*state);
+    if (auto* state = GetAppState(owner)) EnsurePreviewPackagesStarted(*state, path);
     const bool available = extensions::native::PreviewsAdapter::Available(owner, path);
     if (!available) Reset();
     return available;

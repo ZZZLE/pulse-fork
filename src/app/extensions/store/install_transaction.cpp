@@ -1,14 +1,20 @@
 #include "install_transaction.h"
+#include "install_rename.h"
 #include "publisher_trust.h"
 #include "installed_store.h"
 #include "../native_image_verify.h"
 #include "../package_signature.h"
 #include "../package_store.h"
+#include "../developer_mode.h"
+#include "../resource_settings.h"
+#include "../command_projection_cache.h"
+#include "../associations_cleanup.h"
 #include "../../../common/json_value.h"
 #include <windows.h>
 #include <algorithm>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
@@ -22,6 +28,17 @@ thread_local const testing::InstallHooks* install_hooks = nullptr;
 #endif
 struct Handle {
     HANDLE value = INVALID_HANDLE_VALUE;
+    Handle() = default;
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    Handle(Handle&& other) noexcept : value(std::exchange(other.value, INVALID_HANDLE_VALUE)) {}
+    Handle& operator=(Handle&& other) noexcept {
+        if (this != &other) {
+            if (value != INVALID_HANDLE_VALUE) CloseHandle(value);
+            value = std::exchange(other.value, INVALID_HANDLE_VALUE);
+        }
+        return *this;
+    }
     ~Handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
 };
 [[noreturn]] void Fail(const std::string& text) { throw std::runtime_error(text); }
@@ -45,6 +62,29 @@ std::unique_ptr<Handle> Open(const fs::path& path, bool directory, DWORD access 
         !!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != directory) Fail("store_requires_ordinary_path");
     return handle;
 }
+std::unique_ptr<Handle> OpenPublished(const fs::path& path, bool directory, const std::atomic<bool>& cancelled,
+    DWORD access = FILE_READ_ATTRIBUTES, DWORD sharing = FILE_SHARE_READ | FILE_SHARE_WRITE) {
+    for (unsigned attempt = 0;; ++attempt) {
+        CheckCancel(cancelled);
+        auto handle = std::make_unique<Handle>();
+        handle->value = CreateFileW(path.c_str(), access, sharing, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0), nullptr);
+        if (handle->value == INVALID_HANDLE_VALUE) {
+            const DWORD code = GetLastError();
+            if (detail::IsInstallRenameRetryable(code) && attempt < detail::kPayloadRenameMaxAttempts) {
+                detail::SleepCancellableSlice(detail::BackoffDelayMs(attempt), cancelled);
+                continue;
+            }
+            SetLastError(code);
+            Io("store_open");
+        }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(handle->value, &info)) Io("store_file_info");
+        if (GetFileType(handle->value) != FILE_TYPE_DISK || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            !!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != directory) Fail("store_requires_ordinary_path");
+        return handle;
+    }
+}
 std::string Read(const fs::path& path, size_t limit, std::vector<std::unique_ptr<Handle>>* pins = nullptr) {
     auto file = Open(path, false, GENERIC_READ, FILE_SHARE_READ);
     LARGE_INTEGER length{};
@@ -53,6 +93,24 @@ std::string Read(const fs::path& path, size_t limit, std::vector<std::unique_ptr
     std::string bytes(static_cast<size_t>(length.QuadPart), '\0');
     size_t offset = 0;
     while (offset < bytes.size()) {
+        DWORD count = 0;
+        const auto wanted = static_cast<DWORD>((std::min)(bytes.size() - offset, size_t{65536}));
+        if (!ReadFile(file->value, bytes.data() + offset, wanted, &count, nullptr) || count != wanted) Io("store_read");
+        offset += count;
+    }
+    if (pins) pins->push_back(std::move(file));
+    return bytes;
+}
+std::string ReadPublished(const fs::path& path, size_t limit, const std::atomic<bool>& cancelled,
+    std::vector<std::unique_ptr<Handle>>* pins = nullptr) {
+    auto file = OpenPublished(path, false, cancelled, GENERIC_READ, FILE_SHARE_READ);
+    LARGE_INTEGER length{};
+    if (!GetFileSizeEx(file->value, &length)) Io("store_size");
+    if (length.QuadPart < 0 || static_cast<uint64_t>(length.QuadPart) > limit) Fail("store_size_limit");
+    std::string bytes(static_cast<size_t>(length.QuadPart), '\0');
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        CheckCancel(cancelled);
         DWORD count = 0;
         const auto wanted = static_cast<DWORD>((std::min)(bytes.size() - offset, size_t{65536}));
         if (!ReadFile(file->value, bytes.data() + offset, wanted, &count, nullptr) || count != wanted) Io("store_read");
@@ -170,7 +228,9 @@ std::string Policy(Session& session, const VerifiedPackage& package) {
         Fail("store_publisher_policy:" + error);
     return bytes;
 }
-InstallReview Review(Session& session, const VerifiedPackage& package, const Value& registry) {
+InstallReview Review(Session& session, const VerifiedPackage& package, const Value& registry,
+    std::string_view rotation = {}, std::string* resolved_rotation = nullptr) {
+    if (resolved_rotation) resolved_rotation->clear();
     InstallReview review; review.root = session.root.native();
     review.id = package.Declaration().id; review.revision = package.Revision(); review.publisher_id = package.PublisherId();
     review.native_code = package.Declaration().native.has_value();
@@ -180,161 +240,157 @@ InstallReview Review(Session& session, const VerifiedPackage& package, const Val
         review.active_revision = entry->get_string("activeRevision"); review.currently_enabled = entry->get_bool("enabled");
         session.pins.push_back(Open(session.root / L"versions", true));
         const auto old_bytes = Read(session.root / L"versions" / (review.active_revision + ".json"), kMaxManifestBytes, &session.pins);
-        const auto old_signature = Read(session.root / L"versions" / (review.active_revision + ".sig.json"), 16384, &session.pins);
+        // An unsigned active revision (a developer-mode install) has no publisher to keep:
+        // a verified signed package may replace it (e.g. restoring the official build).
+        const bool old_unsigned = !Exists(session.root / L"versions" / (review.active_revision + ".sig.json")) &&
+            !Exists(session.root / L"versions" / (review.active_revision + ".rotation.json"));
+        const auto old_signature = old_unsigned ? std::string{}
+            : Read(session.root / L"versions" / (review.active_revision + ".sig.json"), 16384, &session.pins);
         const auto old = ParseManifest(old_bytes);
-        std::string error;
         if (!old || PackageRevision(old_bytes) != review.active_revision || old.manifest->id != review.id ||
-            old.manifest->name != entry->get_string("name") || !VerifyPackageSignature(old_bytes, old_signature, policy, error))
+            old.manifest->name != entry->get_string("name"))
             Fail("invalid_active_revision");
-        // Do not allow an unrelated trusted publisher to take over an installed id.
+        std::string disk_rotation;
+        const auto rotation_path = session.root / L"versions" / (review.revision + ".rotation.json");
+        if (Exists(rotation_path)) disk_rotation = Read(rotation_path, 16384, &session.pins);
+        if (!rotation.empty() && !disk_rotation.empty() && disk_rotation != rotation) Fail("immutable_revision_conflict");
+        const std::string effective_rotation = !rotation.empty() ? std::string(rotation) : disk_rotation;
         Value signature;
-        if (!json::Parse(old_signature, signature) || signature.get_string("publisher") != package.PublisherId()) Fail("installed_publisher_mismatch");
+        const bool sig_parsed = json::Parse(old_signature, signature, nullptr, {16384, 4});
+        const std::string old_publisher = sig_parsed ? signature.get_string("publisher") : std::string{};
+        std::string error;
+        if (old_unsigned) {
+            if (!rotation.empty()) Fail("unexpected_publisher_rotation");
+        } else {
+        if (!VerifyPackageSignature(old_bytes, old_signature, policy, error)) {
+            bool verified_retired = false;
+            if (error == "unknown_publisher" && !effective_rotation.empty() && !old_publisher.empty() &&
+                old_publisher != package.PublisherId()) {
+                Value rot_doc;
+                if (json::Parse(effective_rotation, rot_doc, nullptr, {16384, 4}) &&
+                    rot_doc.find("oldPublicKey") && rot_doc.find("oldPublicKey")->is_string()) {
+                    auto retired_pin = Value::Object();
+                    retired_pin.set("id", old_publisher);
+                    retired_pin.set("publicKey", rot_doc.get_string("oldPublicKey"));
+                    auto retired_pins = Value::Array();
+                    retired_pins.push(std::move(retired_pin));
+                    auto retired_policy = Value::Object();
+                    retired_policy.set("formatVersion", 1);
+                    retired_policy.set("requireSigned", true);
+                    retired_policy.set("publishers", std::move(retired_pins));
+                    std::string retired_err;
+                    verified_retired = VerifyPackageSignature(old_bytes, old_signature, json::Serialize(retired_policy), retired_err);
+                }
+            }
+            if (!verified_retired) Fail("invalid_active_revision");
+        }
+        // Do not allow an unrelated trusted publisher to take over an installed id without an explicit rotation proof.
+        if (!sig_parsed || old_publisher.empty()) Fail("installed_publisher_mismatch");
+        if (old_publisher != package.PublisherId()) {
+            if (effective_rotation.empty()) Fail("installed_publisher_mismatch");
+            std::string rot_error;
+            if (!VerifyPublisherRotationPolicy(review.id, old_publisher, package.PublisherId(), effective_rotation, policy, rot_error))
+                Fail("invalid_publisher_rotation:" + rot_error);
+            if (review.revision == review.active_revision) Fail("rotation_requires_new_revision");
+            review.publisher_rotated = true;
+            review.previous_publisher_id = old_publisher;
+            if (resolved_rotation) *resolved_rotation = effective_rotation;
+        } else if (!rotation.empty()) {
+            Fail("unexpected_publisher_rotation");
+        }
+        }
         std::erase_if(review.added_resources, [&](const auto& value) {
             return std::find(old.manifest->resources.begin(), old.manifest->resources.end(), value) != old.manifest->resources.end();
         });
-    } else if (registry.find("packages")->size() >= kMaxStorePackages) Fail("store_full");
+    } else {
+        if (registry.find("packages")->size() >= kMaxStorePackages) Fail("store_full");
+        if (!rotation.empty()) Fail("unexpected_publisher_rotation");
+    }
     std::sort(review.added_resources.begin(), review.added_resources.end());
     return review;
 }
-struct Temporary {
-    fs::path path;
-    std::unique_ptr<Handle> handle;
-    bool committed = false;
-    ~Temporary() {
-        if (!committed && handle) {
-            FILE_DISPOSITION_INFO info{TRUE};
-            SetFileInformationByHandle(handle->value, FileDispositionInfo, &info, sizeof(info));
-        }
-    }
-};
-std::unique_ptr<Temporary> WriteTemporary(const fs::path& parent, std::string_view bytes, const std::atomic<bool>& cancelled) {
-    static std::atomic<uint64_t> serial{0};
-    auto file = std::make_unique<Temporary>(); file->handle = std::make_unique<Handle>();
-    for (int attempt = 0; attempt < 32; ++attempt) {
-        CheckCancel(cancelled);
-        file->path = parent / (L".install-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(serial.fetch_add(1)));
-        file->handle->value = CreateFileW(file->path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file->handle->value != INVALID_HANDLE_VALUE) break;
-        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) Io("install_create_temporary");
-    }
-    if (file->handle->value == INVALID_HANDLE_VALUE) Fail("install_temporary_collision");
-    size_t offset = 0;
-    while (offset < bytes.size()) {
-        CheckCancel(cancelled);
-        DWORD count = 0; const auto wanted = static_cast<DWORD>((std::min)(bytes.size() - offset, size_t{65536}));
-        if (!WriteFile(file->handle->value, bytes.data() + offset, wanted, &count, nullptr) || count != wanted) Io("install_write");
-        offset += count;
-    }
-    if (!FlushFileBuffers(file->handle->value)) Io("install_flush");
+std::function<void(const fs::path&, DWORD)> RenameRetryCallback() {
+#ifdef PULSE_EXTENSION_INSTALL_TRANSACTION_TESTING
+    return [](const fs::path& path, DWORD error) {
+        if (install_hooks && install_hooks->rename_retry) install_hooks->rename_retry(path, error);
+    };
+#else
+    return {};
+#endif
+}
+detail::StagedTempFile WriteTemporary(const fs::path& parent, std::string_view bytes, const std::atomic<bool>& cancelled) {
+    auto file = detail::WriteStagedTempFile(parent, L".install-", bytes, cancelled);
+#ifdef PULSE_EXTENSION_INSTALL_TRANSACTION_TESTING
+    if (install_hooks && install_hooks->after_temp_write) install_hooks->after_temp_write(file.path);
+#endif
     return file;
 }
-void RenameHandle(HANDLE handle, const fs::path& target, bool replace, const std::atomic<bool>* cancelled = nullptr) {
-    const auto name = target.native(); const auto bytes = name.size() * sizeof(wchar_t);
-    if (bytes > 65500) Fail("install_path_limit");
-    std::vector<unsigned char> storage(sizeof(FILE_RENAME_INFO) + bytes);
-    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    info->ReplaceIfExists = replace; info->FileNameLength = static_cast<DWORD>(bytes);
-    std::memcpy(info->FileName, name.data(), bytes);
-    // Open descendants can temporarily prevent directory publication on Windows.
-    // Tolerate a short-lived reader, never bypass a denial.
-    for (unsigned attempt = 0;; ++attempt) {
-        if (cancelled) CheckCancel(*cancelled);
-        if (SetFileInformationByHandle(handle, FileRenameInfo, info, static_cast<DWORD>(storage.size()))) return;
-        const DWORD code = GetLastError();
-        if (!cancelled || attempt == 8 || (code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION && code != ERROR_LOCK_VIOLATION)) {
-            SetLastError(code); Io("install_atomic_rename");
-        }
-#ifdef PULSE_EXTENSION_INSTALL_TRANSACTION_TESTING
-        if (install_hooks && install_hooks->rename_retry) install_hooks->rename_retry(target, code);
-#endif
-        Sleep(25 * (attempt + 1));
-    }
+void Rename(detail::StagedTempFile& file, const fs::path& target, bool replace, const std::atomic<bool>& cancelled,
+    unsigned max_attempts = detail::kMetadataRenameMaxAttempts) {
+    detail::RenameStagedTempFile(file, target, replace, cancelled, max_attempts, RenameRetryCallback());
 }
-void Rename(Temporary& file, const fs::path& target, bool replace) {
-    RenameHandle(file.handle->value, target, replace);
-    file.committed = true;
-}
-void ImmutableFile(Session& session, const fs::path& target, std::string_view bytes, const std::atomic<bool>& cancelled, bool pin = true) {
+void ImmutableFile(Session& session, const fs::path& target, std::string_view bytes, const std::atomic<bool>& cancelled,
+    bool pin = true, bool payload_budget = false) {
     if (Exists(target)) {
-        if (Read(target, bytes.size(), pin ? &session.pins : nullptr) != bytes) Fail("immutable_revision_conflict");
+        if (ReadPublished(target, bytes.size(), cancelled, pin ? &session.pins : nullptr) != bytes) Fail("immutable_revision_conflict");
         return;
     }
     auto temporary = WriteTemporary(target.parent_path(), bytes, cancelled);
     CheckCancel(cancelled);
-    Rename(*temporary, target, false);
-    temporary->handle.reset();
-    if (pin && Read(target, bytes.size(), &session.pins) != bytes) Fail("immutable_revision_conflict");
+    Rename(temporary, target, false, cancelled,
+        payload_budget ? detail::kPayloadRenameMaxAttempts : detail::kMetadataRenameMaxAttempts);
+    if (pin && ReadPublished(target, bytes.size(), cancelled, &session.pins) != bytes) Fail("immutable_revision_conflict");
 }
-struct PayloadTemporary {
-    fs::path path;
-    std::unique_ptr<Handle> handle;
-    std::vector<std::string> files;
-    bool committed = false;
-    ~PayloadTemporary() {
-        if (committed || !handle) return;
-        for (const auto& name : files) {
-            try {
-                auto file = Open(path / name, false, DELETE, FILE_SHARE_READ);
-                FILE_DISPOSITION_INFO info{TRUE};
-                SetFileInformationByHandle(file->value, FileDispositionInfo, &info, sizeof(info));
-            } catch (...) {} // A failure leaves an inactive, uniquely named directory, never a live revision.
-        }
-        FILE_DISPOSITION_INFO info{TRUE};
-        SetFileInformationByHandle(handle->value, FileDispositionInfo, &info, sizeof(info));
-    }
-};
 void Payload(Session& session, const VerifiedPackage& package, const std::atomic<bool>& cancelled) {
     const auto parent = session.root / L"packages";
     session.Directory(parent);
     const auto target = parent / package.Revision();
     if (Exists(target)) {
-        session.pins.push_back(Open(target, true));
+        session.pins.push_back(OpenPublished(target, true, cancelled));
         std::set<std::string> expected;
         for (const auto& file : package.Files()) {
             CheckCancel(cancelled);
             expected.insert(file.name);
-            if (Read(target / file.name, file.bytes.size(), &session.pins) != file.bytes) Fail("immutable_revision_conflict");
+            if (ReadPublished(target / detail::PathFromUtf8(file.name), file.bytes.size(), cancelled, &session.pins) != file.bytes) {
+                Fail("immutable_revision_conflict");
+            }
         }
         for (const auto& item : fs::directory_iterator(target))
             if (!expected.contains(json::Utf8(item.path().filename().wstring()))) Fail("immutable_revision_extra_member");
         return;
     }
-    static std::atomic<uint64_t> serial{0};
-    PayloadTemporary temporary;
-    for (int attempt = 0; attempt < 32; ++attempt) {
-        CheckCancel(cancelled);
-        temporary.path = parent / (L".package-install-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
-            std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(serial.fetch_add(1)));
-        if (CreateDirectoryW(temporary.path.c_str(), nullptr)) {
-            temporary.handle = Open(temporary.path, true, FILE_READ_ATTRIBUTES | DELETE);
-            break;
-        }
-        if (GetLastError() != ERROR_ALREADY_EXISTS) Io("install_payload_directory");
-    }
-    if (!temporary.handle) Fail("install_payload_collision");
+    auto temporary = detail::CreateStagedPayloadDir(parent, L".package-install-", cancelled);
     for (const auto& file : package.Files()) {
-        temporary.files.push_back(file.name);
-        ImmutableFile(session, temporary.path / file.name, file.bytes, cancelled, false);
+        detail::WriteStagedMemberFile(temporary, file.name, file.bytes, cancelled);
     }
     CheckCancel(cancelled);
 #ifdef PULSE_EXTENSION_INSTALL_TRANSACTION_TESTING
     if (install_hooks && install_hooks->before_payload_publish) install_hooks->before_payload_publish(temporary.path);
 #endif
-    RenameHandle(temporary.handle->value, target, false, &cancelled);
-    temporary.committed = true;
+    detail::RenameStagedDirectory(temporary, target, cancelled, detail::kPayloadRenameMaxAttempts, RenameRetryCallback());
+    session.pins.push_back(OpenPublished(target, true, cancelled));
+    std::set<std::string> expected;
     for (const auto& file : package.Files()) {
         CheckCancel(cancelled);
-        if (Read(target / file.name, file.bytes.size(), &session.pins) != file.bytes) Fail("immutable_revision_conflict");
+        expected.insert(file.name);
+        if (ReadPublished(target / detail::PathFromUtf8(file.name), file.bytes.size(), cancelled, &session.pins) != file.bytes) {
+            Fail("immutable_revision_conflict");
+        }
     }
+    for (const auto& item : fs::directory_iterator(target))
+        if (!expected.contains(json::Utf8(item.path().filename().wstring()))) Fail("immutable_revision_extra_member");
 }
 InstallResult Commit(Session& session, const VerifiedPackage& package, const InstallReview& authorized,
-    const InstallConsent& consent, const std::atomic<bool>& cancelled, const std::function<void()>& hook) {
+    const InstallConsent& consent, const std::atomic<bool>& cancelled, const std::function<void()>& hook,
+    std::string_view rotation = {}) {
     CheckCancel(cancelled);
     auto registry = Registry(session);
-    const auto review = Review(session, package, registry);
+    std::string resolved_rotation;
+    const auto review = Review(session, package, registry, rotation, &resolved_rotation);
     if (authorized.root != review.root || authorized.id != review.id || authorized.revision != review.revision || authorized.active_revision != review.active_revision ||
         authorized.publisher_id != review.publisher_id ||
+        authorized.previous_publisher_id != review.previous_publisher_id ||
+        authorized.publisher_rotated != review.publisher_rotated ||
         authorized.currently_enabled != review.currently_enabled || authorized.native_code != review.native_code ||
         authorized.added_resources != review.added_resources) Fail("install_review_stale");
     if (!consent.approved) Fail("install_confirmation_required");
@@ -347,13 +403,16 @@ InstallResult Commit(Session& session, const VerifiedPackage& package, const Ins
             session.Directory(session.root / L"binaries");
             const auto file = std::find_if(package.Files().begin(), package.Files().end(), [&](const auto& item) { return item.name == native.library; });
             if (file == package.Files().end()) Fail("invalid_verified_payload");
-            ImmutableFile(session, session.root / L"binaries" / (native.sha256 + ".dll"), file->bytes, cancelled);
+            ImmutableFile(session, session.root / L"binaries" / (native.sha256 + ".dll"), file->bytes, cancelled, true, true);
         } else {
             Payload(session, package, cancelled);
         }
     }
     ImmutableFile(session, session.root / L"versions" / (review.revision + ".json"), package.ManifestBytes(), cancelled);
     ImmutableFile(session, session.root / L"versions" / (review.revision + ".sig.json"), package.SignatureBytes(), cancelled);
+    if (review.publisher_rotated && !resolved_rotation.empty()) {
+        ImmutableFile(session, session.root / L"versions" / (review.revision + ".rotation.json"), resolved_rotation, cancelled);
+    }
     InstallResult result;
     result.id = review.id; result.revision = review.revision;
     result.enabled = review.active_revision.empty() ? consent.enable_new : review.currently_enabled;
@@ -373,7 +432,8 @@ InstallResult Commit(Session& session, const VerifiedPackage& package, const Ins
     if (hook) hook();
     CheckCancel(cancelled);
     if (Exists(session.root / L"registry.json")) { auto pin = Open(session.root / L"registry.json", false); }
-    Rename(*temporary, session.root / L"registry.json", true);
+    Rename(temporary, session.root / L"registry.json", true, cancelled);
+    command_projection::Invalidate(review.id);
     return result;
 }
 // Management shares the exact install I/O, lock, pin and atomic publication path.
@@ -385,19 +445,26 @@ struct StoredPrivate {
     Manifest manifest;
     std::string publisher;
 };
+// allow_unsigned: a revision without .sig.json (a developer-mode install) is accepted
+// with an empty publisher; a rotation file without a signature is still refused.
 StoredPrivate VerifyStoredPrivate(Session& session, const Value& entry, const std::string& revision,
-    bool active, bool payload) {
+    bool active, bool payload, bool allow_unsigned = false) {
     session.pins.push_back(Open(session.root / L"versions", true));
     const auto bytes = Read(session.root / L"versions" / (revision + ".json"), kMaxManifestBytes, &session.pins);
     const auto parsed = ParseManifest(bytes);
     if (!parsed || PackageRevision(bytes) != revision || parsed.manifest->id != entry.get_string("id") ||
         (active && parsed.manifest->name != entry.get_string("name"))) Fail("invalid_stored_revision");
-    const auto signature = Read(session.root / L"versions" / (revision + ".sig.json"), 16384, &session.pins);
-    const auto policy = Read(session.root / L"signature-policy.json", kMaxStoreRegistryBytes, &session.pins);
-    std::string error;
-    if (!VerifyPackageSignature(bytes, signature, policy, error)) Fail("store_signature:" + error);
     Value signed_by;
-    if (!json::Parse(signature, signed_by) || signed_by.get_string("publisher").empty()) Fail("stored_publisher_required");
+    if (allow_unsigned && !Exists(session.root / L"versions" / (revision + ".sig.json"))) {
+        if (Exists(session.root / L"versions" / (revision + ".rotation.json"))) Fail("stored_publisher_required");
+        signed_by = Value::Object();
+    } else {
+        const auto signature = Read(session.root / L"versions" / (revision + ".sig.json"), 16384, &session.pins);
+        const auto policy = Read(session.root / L"signature-policy.json", kMaxStoreRegistryBytes, &session.pins);
+        std::string error;
+        if (!VerifyPackageSignature(bytes, signature, policy, error)) Fail("store_signature:" + error);
+        if (!json::Parse(signature, signed_by) || signed_by.get_string("publisher").empty()) Fail("stored_publisher_required");
+    }
     if (payload && parsed.manifest->native) {
         const auto& native = *parsed.manifest->native;
         // Pin each path before using the shared production hash/PE verifier.
@@ -406,6 +473,7 @@ StoredPrivate VerifyStoredPrivate(Session& session, const Value& entry, const st
         session.pins.push_back(Open(parent, true));
         std::vector<HANDLE> locks;
         const auto entry_path = parent / (native.files.empty() ? native.sha256 + ".dll" : native.library);
+        std::string error;
         if (!OpenVerifiedNativePackage(entry_path.wstring(), native, locks, error)) Fail("stored_payload:" + error);
         // Transfer all read locks into Session before any further operation.
         struct Acquired { std::vector<HANDLE>& values; ~Acquired() { for (auto h : values) if (h != INVALID_HANDLE_VALUE) CloseHandle(h); } } acquired{locks};
@@ -437,14 +505,38 @@ StoreChangeReview ChangeReview(Session& session, const Value& registry, const st
     review.previous_revision = entry->get_string("previousRevision");
     review.enabled = entry->get_bool("enabled");
     if (action == StoreChangeAction::Disable || action == StoreChangeAction::Uninstall) return review;
-    review.policy_revision = PackageRevision(Read(session.root / L"signature-policy.json", kMaxStoreRegistryBytes, &session.pins));
-    auto current = VerifyStoredPrivate(session, *entry, review.active_revision, true, action == StoreChangeAction::Enable);
+    const auto policy_bytes = Read(session.root / L"signature-policy.json", kMaxStoreRegistryBytes, &session.pins);
+    review.policy_revision = PackageRevision(policy_bytes);
+    std::string policy_err;
+    const bool policy_allows_unsigned = VerifyPackageSignature({}, {}, policy_bytes, policy_err);
+    if (!policy_allows_unsigned && policy_err != "signature_required") Fail("invalid_signature_policy:" + policy_err);
+    const bool allow_unsigned_enable = devmode::Enabled(session.root) || policy_allows_unsigned;
+    // Rolling back leaves the active revision, so an unsigned developer build may be left
+    // even with developer mode off; enabling or rolling back TO an unsigned revision needs
+    // developer mode (or a store policy with requireSigned:false).
+    auto current = VerifyStoredPrivate(session, *entry, review.active_revision, true, action == StoreChangeAction::Enable,
+        action == StoreChangeAction::Rollback || (action == StoreChangeAction::Enable && allow_unsigned_enable));
     review.publisher_id = current.publisher;
     auto target = current;
     if (action == StoreChangeAction::Rollback) {
         if (review.previous_revision.empty() || review.previous_revision == review.active_revision) Fail("store_rollback_unavailable");
-        target = VerifyStoredPrivate(session, *entry, review.previous_revision, false, true);
-        if (target.publisher != current.publisher) Fail("installed_publisher_mismatch");
+        target = VerifyStoredPrivate(session, *entry, review.previous_revision, false, true, devmode::Enabled(session.root));
+        // Between a signed and an unsigned revision there is no publisher to rotate.
+        if (target.publisher != current.publisher && !target.publisher.empty() && !current.publisher.empty()) {
+            bool rotation_verified = false;
+            const auto active_rot = session.root / L"versions" / (review.active_revision + ".rotation.json");
+            const auto prev_rot = session.root / L"versions" / (review.previous_revision + ".rotation.json");
+            std::string rot_err;
+            if (Exists(active_rot)) {
+                const auto rot_bytes = Read(active_rot, 16384, &session.pins);
+                rotation_verified = VerifyPublisherRotationPolicy(id, target.publisher, current.publisher, rot_bytes, policy_bytes, rot_err);
+            }
+            if (!rotation_verified && Exists(prev_rot)) {
+                const auto rot_bytes = Read(prev_rot, 16384, &session.pins);
+                rotation_verified = VerifyPublisherRotationPolicy(id, current.publisher, target.publisher, rot_bytes, policy_bytes, rot_err);
+            }
+            if (!rotation_verified) Fail("installed_publisher_mismatch");
+        }
     }
     review.native_code = target.manifest.native.has_value();
     review.added_resources = target.manifest.resources;
@@ -475,7 +567,8 @@ StoreChangeResult CommitChange(Session& session, const StoreChangeReview& author
         if (item.get_string("id") == review.id) {
             if (review.action == StoreChangeAction::Uninstall) continue;
             if (review.action == StoreChangeAction::Rollback) {
-                const auto target = VerifyStoredPrivate(session, item, review.previous_revision, false, false);
+                const auto target = VerifyStoredPrivate(session, item, review.previous_revision, false, false,
+                    devmode::Enabled(session.root));
                 item.set("name", target.manifest.name);
                 item.set("activeRevision", review.previous_revision); item.set("previousRevision", review.active_revision);
             } else item.set("enabled", review.action == StoreChangeAction::Enable);
@@ -488,8 +581,20 @@ StoreChangeResult CommitChange(Session& session, const StoreChangeReview& author
     CheckCancel(cancelled);
     if (RegistryRevision(session) != review.registry_revision) Fail("store_review_stale");
     if (Exists(session.root / L"registry.json")) { auto pin = Open(session.root / L"registry.json", false); }
-    Rename(*temporary, session.root / L"registry.json", true);
+    Rename(temporary, session.root / L"registry.json", true, cancelled);
     result.restart_required = true; // No checks/cancellation after the commit point.
+    if (review.action == StoreChangeAction::Uninstall || review.action == StoreChangeAction::Rollback) {
+        command_projection::Invalidate(review.id);
+    }
+    if (review.action == StoreChangeAction::Disable || review.action == StoreChangeAction::Uninstall) {
+        NotifyPackageAssociationsCleanup(review.id);
+    }
+    if (review.action == StoreChangeAction::Uninstall) {
+        try { (void)PurgeCommandProjectionFile(session.root.parent_path().wstring(), review.id); } catch (...) {}
+        if (consent.purge_data) {
+            try { (void)PurgeOwnSettings(session.root.parent_path().wstring(), review.id); } catch (...) {}
+        }
+    }
     return result;
 }
 struct TrustProposal {
@@ -538,6 +643,16 @@ bool ReadInstalledStore(const fs::path& root, InstalledSnapshot& out, std::strin
         Session session(root, false, true);
         InstalledSnapshot snapshot; snapshot.root = session.root; snapshot.missing = !session.root_exists;
         if (session.root_exists) {
+            const auto policy_path = session.root / L"signature-policy.json";
+            if (Exists(policy_path)) {
+                try {
+                    const auto policy_bytes = Read(policy_path, kMaxStoreRegistryBytes, &session.pins);
+                    std::string policy_err;
+                    snapshot.policy_allows_unsigned = VerifyPackageSignature({}, {}, policy_bytes, policy_err);
+                } catch (...) {
+                    snapshot.policy_allows_unsigned = false;
+                }
+            }
             const auto registry = Registry(session); snapshot.registry_revision = RegistryRevision(session);
             for (const auto& item : registry.find("packages")->items()) {
                 InstalledEntry row;
@@ -578,6 +693,244 @@ bool CommitStoreChange(const fs::path& root, const StoreChangeReview& review, co
     const std::atomic<bool>& cancelled, StoreChangeResult& out, std::string& error) {
     return CommitChangePublic(root, review, consent, cancelled, out, error, {});
 }
+namespace {
+bool IsGcSkipError(DWORD code) noexcept {
+    return code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION ||
+        code == ERROR_USER_MAPPED_FILE || code == ERROR_ACCESS_DENIED;
+}
+enum class GcOpenStatus { Opened, Locked, Missing, SkipNonRegular };
+struct GcFileHandle {
+    Handle handle;
+    uint64_t bytes = 0;
+};
+GcOpenStatus OpenExclusiveRegularForDelete(const fs::path& path, GcFileHandle& out) {
+    out.bytes = 0;
+    out.handle.value = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (out.handle.value == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) return GcOpenStatus::Missing;
+        if (IsGcSkipError(code)) return GcOpenStatus::Locked;
+        SetLastError(code);
+        Io("gc_open");
+    }
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(out.handle.value, &info)) Io("gc_file_info");
+    if (GetFileType(out.handle.value) != FILE_TYPE_DISK ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(out.handle.value);
+        out.handle.value = INVALID_HANDLE_VALUE;
+        return GcOpenStatus::SkipNonRegular;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(out.handle.value, &size) || size.QuadPart < 0) Io("gc_file_size");
+    out.bytes = static_cast<uint64_t>(size.QuadPart);
+    return GcOpenStatus::Opened;
+}
+bool MarkGroupForDelete(std::vector<GcFileHandle>& handles, uint64_t& bytes_out, bool& locked_out) {
+    bytes_out = 0;
+    locked_out = false;
+    FILE_DISPOSITION_INFO mark{TRUE};
+    for (size_t i = 0; i < handles.size(); ++i) {
+        if (!SetFileInformationByHandle(handles[i].handle.value, FileDispositionInfo, &mark, sizeof(mark))) {
+            const DWORD code = GetLastError();
+            FILE_DISPOSITION_INFO unmark{FALSE};
+            for (size_t j = 0; j < i; ++j) {
+                SetFileInformationByHandle(handles[j].handle.value, FileDispositionInfo, &unmark, sizeof(unmark));
+            }
+            if (IsGcSkipError(code)) { locked_out = true; return false; }
+            SetLastError(code);
+            Io("gc_delete");
+        }
+        bytes_out += handles[i].bytes;
+    }
+    return true;
+}
+bool ParseVersionArtifact(std::string_view name, std::string& sha) {
+    for (std::string_view suffix : {std::string_view(".rotation.json"), std::string_view(".sig.json"), std::string_view(".json")}) {
+        if (name.size() == 64 + suffix.size() && name.substr(64) == suffix) {
+            std::string candidate(name.substr(0, 64));
+            if (Hash(candidate)) { sha = std::move(candidate); return true; }
+            return false;
+        }
+    }
+    return false;
+}
+} // namespace
+bool GcInstalledStore(const fs::path& root, StoreGcResult& out, std::string& error) {
+    error.clear();
+    try {
+        Session session(root, false, true);
+        StoreGcResult result;
+        if (!session.root_exists) { out = result; return true; }
+        const auto registry = Registry(session);
+        std::set<std::string> retained_revisions;
+        for (const auto& item : registry.find("packages")->items()) {
+            retained_revisions.insert(item.get_string("activeRevision"));
+            if (const auto prev = item.get_string("previousRevision"); !prev.empty()) retained_revisions.insert(prev);
+        }
+        std::set<std::string> retained_binaries;
+        bool can_sweep_binaries = true;
+        const auto versions_dir = session.root / L"versions";
+        const bool versions_exists = Exists(versions_dir);
+        if (versions_exists) session.pins.push_back(Open(versions_dir, true));
+        if (!retained_revisions.empty()) {
+            if (!versions_exists) {
+                can_sweep_binaries = false;
+            } else {
+                for (const auto& rev : retained_revisions) {
+                    const auto manifest_path = versions_dir / (rev + ".json");
+                    if (!Exists(manifest_path)) { can_sweep_binaries = false; continue; }
+                    try {
+                        const auto bytes = Read(manifest_path, kMaxManifestBytes);
+                        const auto parsed = ParseManifest(bytes);
+                        if (!parsed) { can_sweep_binaries = false; continue; }
+                        if (parsed.manifest->native && parsed.manifest->native->files.empty())
+                            retained_binaries.insert(parsed.manifest->native->sha256);
+                    } catch (...) {
+                        can_sweep_binaries = false;
+                    }
+                }
+            }
+        }
+        if (versions_exists) {
+            std::map<std::string, std::vector<fs::path>> version_groups;
+            for (const auto& entry : fs::directory_iterator(versions_dir)) {
+                std::string sha;
+                const auto name = json::Utf8(entry.path().filename().wstring());
+                if (ParseVersionArtifact(name, sha) && !retained_revisions.contains(sha)) {
+                    version_groups[sha].push_back(entry.path());
+                }
+            }
+            for (auto& [sha, paths] : version_groups) {
+                (void)sha;
+                std::sort(paths.begin(), paths.end());
+                std::vector<GcFileHandle> handles;
+                bool locked = false;
+                bool skip_group = false;
+                for (const auto& p : paths) {
+                    GcFileHandle item;
+                    const auto status = OpenExclusiveRegularForDelete(p, item);
+                    if (status == GcOpenStatus::Opened) handles.push_back(std::move(item));
+                    else if (status == GcOpenStatus::Locked) { locked = true; break; }
+                    else if (status == GcOpenStatus::SkipNonRegular) { skip_group = true; break; }
+                }
+                if (locked) { ++result.skipped_locked; continue; }
+                if (skip_group || handles.empty()) continue;
+                uint64_t group_bytes = 0;
+                if (!MarkGroupForDelete(handles, group_bytes, locked)) {
+                    if (locked) ++result.skipped_locked;
+                    continue;
+                }
+                handles.clear();
+                ++result.removed_versions;
+                result.reclaimed_bytes += group_bytes;
+            }
+        }
+        const auto binaries_dir = session.root / L"binaries";
+        if (can_sweep_binaries && Exists(binaries_dir)) {
+            session.pins.push_back(Open(binaries_dir, true));
+            std::vector<fs::path> candidates;
+            for (const auto& entry : fs::directory_iterator(binaries_dir)) {
+                const auto name = json::Utf8(entry.path().filename().wstring());
+                if (name.size() == 68 && name.substr(64) == ".dll") {
+                    const std::string sha = name.substr(0, 64);
+                    if (Hash(sha) && !retained_binaries.contains(sha)) candidates.push_back(entry.path());
+                }
+            }
+            std::sort(candidates.begin(), candidates.end());
+            for (const auto& p : candidates) {
+                std::vector<GcFileHandle> handles(1);
+                const auto status = OpenExclusiveRegularForDelete(p, handles[0]);
+                if (status == GcOpenStatus::Locked) { ++result.skipped_locked; continue; }
+                if (status != GcOpenStatus::Opened) continue;
+                uint64_t file_bytes = 0;
+                bool locked = false;
+                if (!MarkGroupForDelete(handles, file_bytes, locked)) {
+                    if (locked) ++result.skipped_locked;
+                    continue;
+                }
+                handles.clear();
+                ++result.removed_binaries;
+                result.reclaimed_bytes += file_bytes;
+            }
+        }
+        const auto packages_dir = session.root / L"packages";
+        if (Exists(packages_dir)) {
+            session.pins.push_back(Open(packages_dir, true));
+            std::vector<fs::path> candidates;
+            for (const auto& entry : fs::directory_iterator(packages_dir)) {
+                const auto name = json::Utf8(entry.path().filename().wstring());
+                if (Hash(name) && !retained_revisions.contains(name)) candidates.push_back(entry.path());
+            }
+            std::sort(candidates.begin(), candidates.end());
+            for (const auto& pkg_dir : candidates) {
+                Handle dir_handle;
+                dir_handle.value = CreateFileW(pkg_dir.c_str(), FILE_READ_ATTRIBUTES | DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+                if (dir_handle.value == INVALID_HANDLE_VALUE) {
+                    const DWORD code = GetLastError();
+                    if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND) continue;
+                    if (IsGcSkipError(code)) { ++result.skipped_locked; continue; }
+                    SetLastError(code);
+                    Io("gc_open_package");
+                }
+                BY_HANDLE_FILE_INFORMATION dir_info{};
+                if (!GetFileInformationByHandle(dir_handle.value, &dir_info)) Io("gc_package_info");
+                if (GetFileType(dir_handle.value) != FILE_TYPE_DISK ||
+                    (dir_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+                    !(dir_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    continue;
+                }
+                std::vector<fs::path> member_paths;
+                for (const auto& member : fs::directory_iterator(pkg_dir)) member_paths.push_back(member.path());
+                std::sort(member_paths.begin(), member_paths.end());
+                std::vector<GcFileHandle> handles;
+                bool locked = false;
+                bool skip_pkg = false;
+                for (const auto& member_path : member_paths) {
+                    GcFileHandle item;
+                    const auto status = OpenExclusiveRegularForDelete(member_path, item);
+                    if (status == GcOpenStatus::Opened) handles.push_back(std::move(item));
+                    else if (status == GcOpenStatus::Locked) { locked = true; break; }
+                    else if (status == GcOpenStatus::SkipNonRegular) { skip_pkg = true; break; }
+                }
+                if (locked) { ++result.skipped_locked; continue; }
+                if (skip_pkg) continue;
+                uint64_t pkg_bytes = 0;
+                if (!handles.empty() && !MarkGroupForDelete(handles, pkg_bytes, locked)) {
+                    if (locked) ++result.skipped_locked;
+                    continue;
+                }
+                handles.clear();
+                FILE_DISPOSITION_INFO mark_dir{TRUE};
+                if (!SetFileInformationByHandle(dir_handle.value, FileDispositionInfo, &mark_dir, sizeof(mark_dir))) {
+                    const DWORD code = GetLastError();
+                    CloseHandle(dir_handle.value);
+                    dir_handle.value = INVALID_HANDLE_VALUE;
+                    if (!RemoveDirectoryW(pkg_dir.c_str())) {
+                        const DWORD rm_code = GetLastError();
+                        result.reclaimed_bytes += pkg_bytes;
+                        if (IsGcSkipError(code) || IsGcSkipError(rm_code) || rm_code == ERROR_DIR_NOT_EMPTY) {
+                            ++result.skipped_locked;
+                            continue;
+                        }
+                        SetLastError(rm_code);
+                        Io("gc_delete_package");
+                    }
+                } else {
+                    CloseHandle(dir_handle.value);
+                    dir_handle.value = INVALID_HANDLE_VALUE;
+                }
+                ++result.removed_packages;
+                result.reclaimed_bytes += pkg_bytes;
+            }
+        }
+        out = result;
+        return true;
+    } catch (const std::exception& e) { error = e.what(); return false; }
+}
 #ifdef PULSE_EXTENSION_INSTALLED_STORE_TESTING
 namespace testing {
 bool CommitStoreChangeWithHook(const fs::path& root, const StoreChangeReview& review, const StoreChangeConsent& consent,
@@ -617,35 +970,44 @@ bool CommitPublisherTrust(const fs::path& root, const VerifiedPackage& package, 
             const auto current = exists ? Read(path, kMaxStoreRegistryBytes) : std::string{};
             if (current != proposal.original) Fail("publisher_review_stale");
             CheckCancel(cancelled);
-            Rename(*temporary, path, true);
+            Rename(temporary, path, true, cancelled);
             result.changed = true;
         } else CheckCancel(cancelled);
         out = result; return true;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
-bool ReviewInstall(const fs::path& root, const VerifiedPackage& package, InstallReview& out, std::string& error) {
+bool ReviewInstallWithRotation(const fs::path& root, const VerifiedPackage& package,
+    std::string_view rotation, InstallReview& out, std::string& error) {
     error.clear();
     try {
         if (!package) Fail("invalid_verified_package");
         Session session(root); const auto registry = Registry(session);
-        auto review = Review(session, package, registry); out = std::move(review); return true;
+        auto review = Review(session, package, registry, rotation); out = std::move(review); return true;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
+bool ReviewInstall(const fs::path& root, const VerifiedPackage& package, InstallReview& out, std::string& error) {
+    return ReviewInstallWithRotation(root, package, {}, out, error);
+}
 namespace {
-bool CommitPublic(const fs::path& root, const VerifiedPackage& package, const InstallReview& review,
-    const InstallConsent& consent, const std::atomic<bool>& cancelled, InstallResult& out, std::string& error,
-    const std::function<void()>& hook) {
+bool CommitPublic(const fs::path& root, const VerifiedPackage& package, std::string_view rotation,
+    const InstallReview& review, const InstallConsent& consent, const std::atomic<bool>& cancelled,
+    InstallResult& out, std::string& error, const std::function<void()>& hook) {
     error.clear();
     try {
         CheckCancel(cancelled); if (!package) Fail("invalid_verified_package");
-        Session session(root); auto result = Commit(session, package, review, consent, cancelled, hook);
+        Session session(root); auto result = Commit(session, package, review, consent, cancelled, hook, rotation);
         out = std::move(result); return true;
     } catch (const std::exception& e) { error = e.what(); return false; }
 }
 }
+bool CommitInstallWithRotation(const fs::path& root, const VerifiedPackage& package,
+    std::string_view rotation, const InstallReview& review, const InstallConsent& consent,
+    const std::atomic<bool>& cancelled, InstallResult& out, std::string& error) {
+    return CommitPublic(root, package, rotation, review, consent, cancelled, out, error, {});
+}
 bool CommitInstall(const fs::path& root, const VerifiedPackage& package, const InstallReview& review,
     const InstallConsent& consent, const std::atomic<bool>& cancelled, InstallResult& out, std::string& error) {
-    return CommitPublic(root, package, review, consent, cancelled, out, error, {});
+    return CommitPublic(root, package, {}, review, consent, cancelled, out, error, {});
 }
 #ifdef PULSE_EXTENSION_INSTALL_TRANSACTION_TESTING
 namespace testing {
@@ -657,12 +1019,12 @@ bool CommitInstallWithHooks(const fs::path& root, const VerifiedPackage& package
         explicit Scope(const InstallHooks& value) { install_hooks = &value; }
         ~Scope() { install_hooks = previous; }
     } scope(hooks);
-    return CommitPublic(root, package, review, consent, cancelled, out, error, hooks.before_commit);
+    return CommitPublic(root, package, {}, review, consent, cancelled, out, error, hooks.before_commit);
 }
 bool CommitInstallWithHook(const fs::path& root, const VerifiedPackage& package, const InstallReview& review,
     const InstallConsent& consent, const std::atomic<bool>& cancelled, InstallResult& out, std::string& error,
     const BeforeCommit& before_commit) {
-    return CommitPublic(root, package, review, consent, cancelled, out, error, before_commit);
+    return CommitPublic(root, package, {}, review, consent, cancelled, out, error, before_commit);
 }
 }
 #endif

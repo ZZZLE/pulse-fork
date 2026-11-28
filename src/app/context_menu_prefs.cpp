@@ -4,6 +4,7 @@
 #include "session.h"
 #include "../common/json_utils.h"
 #include "../common/utf8_file.h"
+#include "../common/async_file_writer.h"
 #include <algorithm>
 #include <iterator>
 #include <unordered_set>
@@ -13,17 +14,39 @@ namespace pulse::app {
 namespace {
 
 using pulse::json::ExtractObject;
-constexpr size_t kSeenCatalogLimit = 400;
+constexpr size_t kSeenCatalogLimit = 4096;
 
-void RetireOldestSeen(ContextMenuPrefs& prefs) {
-    auto oldest = std::find_if(prefs.seen.begin(), prefs.seen.end(), [&](const auto& row) {
-        return !prefs.item_enabled.contains(row.key) && !prefs.ComDisabled(row.key);
+bool RetireOldestSeen(ContextMenuPrefs& prefs, const std::wstring& protected_key = L"") {
+    // Retire only unconfigured leaves. A parent is never detached from its
+    // children, and a user choice/order never disappears due to discovery.
+    const auto oldest = std::find_if(prefs.seen.begin(), prefs.seen.end(), [&](const auto& row) {
+        if (row.key == protected_key || prefs.item_enabled.contains(row.key) || prefs.ComDisabled(row.key)) return false;
+        if (std::any_of(prefs.seen.begin(), prefs.seen.end(), [&](const auto& child) {
+            return child.tree_node && child.parent_key == row.key;
+        })) return false;
+        for (const auto& [parent, order] : prefs.node_order) {
+            if (parent == row.key || std::find(order.begin(), order.end(), row.key) != order.end()) return false;
+        }
+        return true;
     });
-    if (oldest == prefs.seen.end()) oldest = prefs.seen.begin();
-    // The catalog is bounded discovery metadata; user overrides and disabled
-    // handler state remain intact even when every catalog row is configured.
-    if (oldest != prefs.seen.end()) prefs.seen.erase(oldest);
+    if (oldest == prefs.seen.end()) return false;
+    prefs.seen.erase(oldest);
+    return true;
 }
+
+void TrimLegacySeen(ContextMenuPrefs& prefs, size_t limit) {
+    while (static_cast<size_t>(std::count_if(prefs.seen.begin(), prefs.seen.end(),
+        [](const auto& row) { return !row.tree_node; })) > limit) {
+        auto oldest = std::find_if(prefs.seen.begin(), prefs.seen.end(), [&](const auto& row) {
+            return !row.tree_node && !prefs.item_enabled.contains(row.key) && !prefs.ComDisabled(row.key);
+        });
+        if (oldest == prefs.seen.end()) oldest = std::find_if(prefs.seen.begin(), prefs.seen.end(),
+            [](const auto& row) { return !row.tree_node; });
+        if (oldest == prefs.seen.end()) break;
+        prefs.seen.erase(oldest); // Discovery only; never erase the user's overrides.
+    }
+}
+
 
 
 // 2: slow_ext only holds handlers the host proved hung (collect_hung). Files
@@ -33,7 +56,8 @@ void RetireOldestSeen(ContextMenuPrefs& prefs) {
 // files stored the old off defaults as plain values, so they are turned on
 // once; per-row switches in "items" are the user's and stay.
 // 4: expose COM Open-with entries and remove the old implicit MRU cap.
-constexpr int kPrefsVersion = 4;
+// 5: ancestry-scoped actual-menu node catalog and sibling ordering.
+constexpr int kPrefsVersion = 5;
 
 int ClampCap(int v, int lo, int hi, int fallback) {
     if (v < lo || v > hi) return fallback;
@@ -43,6 +67,37 @@ int ClampCap(int v, int lo, int hi, int fallback) {
 // context_menu.json "pulse_order" keys, indexed by BuiltinMenuSurface.
 constexpr const wchar_t* kOrderKeys[] = { L"item", L"background", L"row_buttons" };
 static_assert(std::size(kOrderKeys) == static_cast<size_t>(BuiltinMenuSurface::Count));
+
+std::wstring AsciiWide(std::string_view s) {
+    return std::wstring(s.begin(), s.end());
+}
+
+bool TryWideAscii(std::wstring_view w, std::string& out) {
+    out.clear();
+    if (w.empty() || w.size() > 192) return false;
+    out.reserve(w.size());
+    for (const wchar_t ch : w) {
+        if (ch <= 0x20 || ch > 0x7e) return false;
+        out.push_back(static_cast<char>(ch));
+    }
+    return true;
+}
+
+const wchar_t* PlacementKey(ExtensionMenuPlacement p) {
+    switch (p) {
+    case ExtensionMenuPlacement::Flat: return L"flat";
+    case ExtensionMenuPlacement::Submenu: return L"submenu";
+    case ExtensionMenuPlacement::Hidden: return L"hidden";
+    default: return L"default";
+    }
+}
+
+ExtensionMenuPlacement ParsePlacementKey(std::wstring_view v) {
+    if (v == L"flat") return ExtensionMenuPlacement::Flat;
+    if (v == L"submenu") return ExtensionMenuPlacement::Submenu;
+    if (v == L"hidden") return ExtensionMenuPlacement::Hidden;
+    return ExtensionMenuPlacement::Default;
+}
 
 } // namespace
 
@@ -60,9 +115,33 @@ void ContextMenuPrefs::ResetToDefaults() {
     open_with_mru = -1;
     item_enabled.clear();
     seen.clear();
+    node_order.clear();
     slow_ext.clear();
     builtin_hidden = 0;
     ResetBuiltinOrder();
+    extension_placement.clear();
+    extension_hidden_commands.clear();
+}
+
+ExtensionMenuPlacement ContextMenuPrefs::PlacementForExtension(std::string_view package_id) const {
+    const auto it = extension_placement.find(std::string(package_id));
+    return it == extension_placement.end() ? ExtensionMenuPlacement::Default : it->second;
+}
+
+void ContextMenuPrefs::SetExtensionPlacement(std::string_view package_id, ExtensionMenuPlacement placement) {
+    if (package_id.empty()) return;
+    if (placement == ExtensionMenuPlacement::Default) extension_placement.erase(std::string(package_id));
+    else extension_placement[std::string(package_id)] = placement;
+}
+
+bool ContextMenuPrefs::ExtensionCommandVisible(std::string_view identity) const {
+    return !extension_hidden_commands.contains(std::string(identity));
+}
+
+void ContextMenuPrefs::SetExtensionCommandVisible(std::string_view identity, bool on) {
+    if (identity.empty()) return;
+    if (on) extension_hidden_commands.erase(std::string(identity));
+    else extension_hidden_commands.insert(std::string(identity));
 }
 
 bool ContextMenuPrefs::CategoryEnabled(ipc::CtxMenuCategory c) const {
@@ -201,7 +280,8 @@ bool ContextMenuPrefs::RecordSeen(const std::wstring& key, const std::wstring& t
         std::rotate(found, std::next(found), seen.end());
         return false;
     }
-    while (seen.size() >= kSeenCatalogLimit) RetireOldestSeen(*this);
+    TrimLegacySeen(*this, 399);
+    while (seen.size() >= kSeenCatalogLimit) if (!RetireOldestSeen(*this)) return false;
     SeenMenuItem item;
     item.key = key;
     item.text = text;
@@ -210,6 +290,174 @@ bool ContextMenuPrefs::RecordSeen(const std::wstring& key, const std::wstring& t
     item.category = category;
     seen.push_back(std::move(item));
     return true;
+}
+
+bool ContextMenuPrefs::RecordSeenNode(SeenMenuItem item) {
+    if (item.key.empty() || item.text.empty() || item.depth > 16) return false;
+    item.tree_node = true;
+    if (!item.parent_key.empty()) {
+        const auto parent = std::find_if(seen.begin(), seen.end(), [&](const auto& row) { return row.tree_node && row.key == item.parent_key; });
+        if (parent == seen.end()) return false;
+        item.configurable = item.configurable && parent->configurable;
+    }
+    auto found = std::find_if(seen.begin(), seen.end(), [&](const auto& row) { return row.key == item.key; });
+    if (found != seen.end()) {
+        // Once ambiguous, never reactivate an old choice merely because a
+        // partial live reply currently contains only one of the twins.
+        item.configurable = item.configurable && found->configurable;
+        const bool changed = found->text != item.text || found->flyout != item.flyout ||
+            found->configurable != item.configurable || found->source != item.source ||
+            found->default_order != item.default_order || found->parent_key != item.parent_key ||
+            found->root_key != item.root_key || found->depth != item.depth ||
+            found->from_com != item.from_com || found->category != item.category || !found->tree_node;
+        *found = std::move(item);
+        return changed;
+    }
+    while (seen.size() >= kSeenCatalogLimit) if (!RetireOldestSeen(*this, item.parent_key)) return false;
+    seen.push_back(std::move(item));
+    return true;
+}
+
+bool ContextMenuPrefs::RecordSeenNodes(std::vector<SeenMenuItem> items) {
+    // One bounded per-thread lookup accelerator, not a catalog/result cache.
+    // Public callers may replace/reorder seen without a revision notification;
+    // every hit validates the current key before using its index. Owned keys
+    // and numeric indices never dereference an expired prefs/vector address.
+    struct LookupCache {
+        const ContextMenuPrefs* owner = nullptr;
+        const SeenMenuItem* data = nullptr;
+        size_t size = 0;
+        std::unordered_map<std::wstring, size_t> index;
+    };
+    thread_local LookupCache cache;
+    auto& index = cache.index;
+    const auto rebuild = [&] {
+        index.clear(); index.reserve(seen.size() + items.size());
+        for (size_t i = 0; i < seen.size(); ++i) index.emplace(seen[i].key, i);
+        cache.owner = this; cache.data = seen.data(); cache.size = seen.size();
+    };
+    if (cache.owner != this || cache.data != seen.data() || cache.size != seen.size()) rebuild();
+    const auto lookup = [&](const std::wstring& key) {
+        auto found = index.find(key);
+        if (found != index.end()) {
+            if (found->second < seen.size() && seen[found->second].key == key) return found;
+            rebuild();
+        } else if (std::any_of(seen.begin(), seen.end(), [&](const auto& row) { return row.key == key; })) {
+            // A same-size in-place replacement may have introduced this key.
+            rebuild();
+        }
+        return index.find(key);
+    };
+    bool changed = false;
+    std::unordered_set<std::wstring> observed;
+    for (auto& item : items) {
+        if (item.key.empty() || item.text.empty() || item.depth > 16) continue;
+        item.tree_node = true;
+        if (!observed.insert(item.key).second) {
+            if (const auto duplicate = lookup(item.key); duplicate != index.end()) {
+                changed = seen[duplicate->second].configurable || changed;
+                seen[duplicate->second].configurable = false;
+            }
+            continue;
+        }
+        if (!item.parent_key.empty()) {
+            const auto parent = lookup(item.parent_key);
+            if (parent == index.end() || !seen[parent->second].tree_node) continue;
+            item.configurable = item.configurable && seen[parent->second].configurable;
+        }
+        const auto found = lookup(item.key);
+        if (found != index.end()) {
+            auto& old = seen[found->second];
+            item.configurable = item.configurable && old.configurable;
+            changed = changed || old.text != item.text || old.flyout != item.flyout ||
+                old.configurable != item.configurable || old.source != item.source ||
+                old.default_order != item.default_order || old.parent_key != item.parent_key ||
+                old.root_key != item.root_key || old.depth != item.depth ||
+                old.from_com != item.from_com || old.category != item.category || !old.tree_node;
+            old = std::move(item);
+            continue;
+        }
+        if (seen.size() >= kSeenCatalogLimit) {
+            if (!RetireOldestSeen(*this, item.parent_key)) continue;
+            rebuild();
+        }
+        index.emplace(item.key, seen.size());
+        seen.push_back(std::move(item));
+        changed = true;
+    }
+    cache.data = seen.data(); cache.size = seen.size();
+    return changed;
+}
+
+std::vector<std::wstring> ContextMenuPrefs::NodeOrder(const std::wstring& parent_key) const {
+    const auto found = node_order.find(parent_key);
+    return found == node_order.end() ? std::vector<std::wstring>{} : found->second;
+}
+
+std::vector<SeenMenuItem> ContextMenuPrefs::NodeChildren(const std::wstring& parent_key,
+                                                      const std::wstring& root_key) const {
+    std::vector<SeenMenuItem> rows;
+    for (const auto& row : seen) if (row.tree_node && row.parent_key == parent_key &&
+        (root_key.empty() || row.root_key == root_key)) rows.push_back(row);
+    std::stable_sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.default_order < b.default_order; });
+    const auto order = NodeOrder(parent_key);
+    if (!order.empty()) {
+        std::vector<SeenMenuItem> movable;
+        for (const auto& row : rows) if (row.configurable) movable.push_back(row);
+        const auto rank = [&](const auto& row) { return std::find(order.begin(), order.end(), row.key) - order.begin(); };
+        std::stable_sort(movable.begin(), movable.end(), [&](const auto& a, const auto& b) { return rank(a) < rank(b); });
+        size_t next = 0;
+        for (auto& row : rows) if (row.configurable) row = std::move(movable[next++]);
+    }
+    return rows;
+}
+
+bool ContextMenuPrefs::NodeEnabled(const std::wstring& key) const {
+    const auto found = item_enabled.find(key);
+    return found == item_enabled.end() || found->second;
+}
+
+bool ContextMenuPrefs::SetNodeEnabled(const std::wstring& key, bool on) {
+    const auto row = std::find_if(seen.begin(), seen.end(), [&](const auto& item) {
+        return item.tree_node && item.configurable && item.key == key;
+    });
+    if (row == seen.end() || NodeEnabled(key) == on) return false;
+    if (on) item_enabled.erase(key); else item_enabled[key] = false;
+    return true;
+}
+
+bool ContextMenuPrefs::SetNodeOrder(const std::wstring& parent_key, const std::vector<std::wstring>& keys) {
+    std::vector<std::wstring> valid;
+    for (const auto& key : keys) {
+        if (std::find(valid.begin(), valid.end(), key) != valid.end()) continue;
+        if (std::any_of(seen.begin(), seen.end(), [&](const auto& row) {
+            return row.tree_node && row.configurable && row.parent_key == parent_key && row.key == key;
+        })) valid.push_back(key);
+    }
+    if (NodeOrder(parent_key) == valid) return false;
+    if (valid.empty()) node_order.erase(parent_key); else node_order[parent_key] = std::move(valid);
+    return true;
+}
+
+bool ContextMenuPrefs::MoveNode(const std::wstring& key, int direction) {
+    const auto row = std::find_if(seen.begin(), seen.end(), [&](const auto& item) { return item.tree_node && item.key == key; });
+    if (row == seen.end() || !row->configurable || direction == 0) return false;
+    auto children = NodeChildren(row->parent_key);
+    const auto found = std::find_if(children.begin(), children.end(), [&](const auto& item) { return item.key == key; });
+    const auto at = found - children.begin();
+    const auto next = at + (direction < 0 ? -1 : 1);
+    if (next < 0 || next >= static_cast<ptrdiff_t>(children.size()) || !children[static_cast<size_t>(next)].configurable) return false;
+    std::swap(children[static_cast<size_t>(at)], children[static_cast<size_t>(next)]);
+    std::vector<std::wstring> keys;
+    for (const auto& child : children) keys.push_back(child.key);
+    return SetNodeOrder(row->parent_key, keys);
+}
+
+bool ContextMenuPrefs::ResetNodeGroup(const std::wstring& parent_key) {
+    bool changed = node_order.erase(parent_key) != 0;
+    for (const auto& row : seen) if (row.tree_node && row.parent_key == parent_key)
+        changed = (item_enabled.erase(row.key) != 0) || changed;
+    return changed;
 }
 
 bool ContextMenuPrefs::RecordComTiming(const std::wstring& key, uint32_t elapsed_ms) {
@@ -334,10 +582,37 @@ std::wstring ContextMenuPrefs::ToJson() const {
         out += ipc::CtxMenuCategoryId(item.category);
         out += L"\",\"source\":\"";
         out += item.from_com ? L"com" : L"static";
-        out += L"\"}";
+        out += L"\"";
+        if (item.tree_node) {
+            std::wstring parent, root, source;
+            pulse::json::Escape(item.parent_key, parent);
+            pulse::json::Escape(item.root_key, root);
+            pulse::json::Escape(item.source, source);
+            out += L",\"tree\":true,\"parent\":\"" + parent + L"\",\"root\":\"" + root +
+                L"\",\"node_source\":\"" + source + L"\",\"depth\":" + std::to_wstring(item.depth) +
+                L",\"default_order\":" + std::to_wstring(item.default_order) +
+                L",\"configurable\":" + (item.configurable ? L"true" : L"false");
+        }
+        out += L"}";
         out += (i + 1 == seen.size()) ? L"\n" : L",\n";
     }
-    out += L"  ],\n  \"slow_ext\":{\n";
+    out += L"  ],\n  \"node_order\":[";
+    bool first_node_group = true;
+    for (const auto& [parent_key, order] : node_order) {
+        std::wstring parent; pulse::json::Escape(parent_key, parent);
+        if (!first_node_group) out += L",";
+        first_node_group = false;
+        out += L"{\"parent\":\"" + parent + L"\",\"keys\":[";
+        bool first = true;
+        for (const auto& value : order) {
+            std::wstring key; pulse::json::Escape(value, key);
+            if (!first) out += L",";
+            first = false;
+            out += L"{\"key\":\"" + key + L"\"}";
+        }
+        out += L"]}";
+    }
+    out += L"],\n  \"slow_ext\":{\n";
     size_t se = 0;
     for (const auto& kv : slow_ext) {
         std::wstring key;
@@ -358,7 +633,30 @@ std::wstring ContextMenuPrefs::ToJson() const {
         ++se;
         out += (se == slow_ext.size()) ? L"\n" : L",\n";
     }
-    out += L"  }\n}\n";
+    out += L"  },\n  \"extensions\":{\n    \"placement\":{";
+    size_t ep = 0;
+    for (const auto& [pkg, mode] : extension_placement) {
+        if (mode == ExtensionMenuPlacement::Default) continue;
+        std::wstring key;
+        pulse::json::Escape(AsciiWide(pkg), key);
+        out += (ep == 0 ? L"\n      \"" : L",\n      \"");
+        out += key;
+        out += L"\":{\"mode\":\"";
+        out += PlacementKey(mode);
+        out += L"\"}";
+        ++ep;
+    }
+    out += ep == 0 ? L"},\n    \"commands\":{" : L"\n    },\n    \"commands\":{";
+    size_t ec = 0;
+    for (const auto& id : extension_hidden_commands) {
+        std::wstring key;
+        pulse::json::Escape(AsciiWide(id), key);
+        out += (ec == 0 ? L"\n      \"" : L",\n      \"");
+        out += key;
+        out += L"\":{\"visible\":false}";
+        ++ec;
+    }
+    out += ec == 0 ? L"}\n  }\n}\n" : L"\n    }\n  }\n}\n";
     return out;
 }
 
@@ -419,9 +717,26 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
         item.flyout = pulse::json::ExtractString(block, L"kind") == L"flyout";
         item.from_com = pulse::json::ExtractString(block, L"source") == L"com";
         item.category = ipc::ParseCtxMenuCategory(pulse::json::ExtractString(block, L"category"));
+        item.tree_node = pulse::json::ExtractBool(block, L"tree", false);
+        item.parent_key = pulse::json::ExtractString(block, L"parent");
+        item.root_key = pulse::json::ExtractString(block, L"root");
+        item.source = pulse::json::ExtractString(block, L"node_source");
+        item.depth = static_cast<uint32_t>(ClampCap(pulse::json::ExtractInt(block, L"depth", 0), 0, 16, 0));
+        item.configurable = pulse::json::ExtractBool(block, L"configurable", true);
+        item.default_order = static_cast<uint32_t>(ClampCap(pulse::json::ExtractInt(block, L"default_order", 0), 0, 65535, 0));
         if (!item.key.empty() && !item.text.empty()) seen.push_back(std::move(item));
     });
 
+    node_order.clear();
+    pulse::json::ForEachElement(pulse::json::ExtractArray(json, L"node_order"), [&](const std::wstring& block) {
+        const auto parent = pulse::json::ExtractString(block, L"parent");
+        std::vector<std::wstring> keys;
+        pulse::json::ForEachElement(pulse::json::ExtractArray(block, L"keys"), [&](const std::wstring& key) {
+            const auto value = pulse::json::ExtractString(key, L"key");
+            if (!value.empty() && keys.size() < kSeenCatalogLimit) keys.push_back(value);
+        });
+        SetNodeOrder(parent, keys);
+    });
     MigrateSeenKeys();
     CoalesceCompressCatalog();
 
@@ -443,6 +758,26 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
     // Purge disable state older builds persisted for SendTo (#77): the
     // exemption above keeps it clear, so this migration is idempotent.
     slow_ext.erase(ipc::SendToHandlerCatalogKey());
+
+    extension_placement.clear();
+    extension_hidden_commands.clear();
+    const std::wstring ext_obj = ExtractObject(json, L"extensions");
+    if (!ext_obj.empty()) {
+        pulse::json::ForEachMember(ExtractObject(ext_obj, L"placement"),
+            [&](const std::wstring& key, const std::wstring& block) {
+                std::string pkg;
+                if (!TryWideAscii(key, pkg)) return;
+                const auto mode = ParsePlacementKey(pulse::json::ExtractString(block, L"mode"));
+                if (mode != ExtensionMenuPlacement::Default) extension_placement[std::move(pkg)] = mode;
+            });
+        pulse::json::ForEachMember(ExtractObject(ext_obj, L"commands"),
+            [&](const std::wstring& key, const std::wstring& block) {
+                std::string id;
+                if (!TryWideAscii(key, id)) return;
+                if (!pulse::json::ExtractBool(block, L"visible", true))
+                    extension_hidden_commands.insert(std::move(id));
+            });
+    }
     const int version = pulse::json::ExtractInt(json, L"version", 1);
     if (version < 2) {
         // Drop the old heuristic's verdicts (every entry there was recorded
@@ -473,8 +808,16 @@ bool ContextMenuPrefs::FromJson(const std::wstring& json) {
         open_with_com = true;
         if (open_with_mru == 2) open_with_mru = -1;
     }
-    while (seen.size() > kSeenCatalogLimit) RetireOldestSeen(*this);
-    migrated = version < kPrefsVersion;
+    // Older tree catalogs merged every MRU application under the empty
+    // registry source. Retire that unconfigurable row once at load, not by
+    // scanning the historical catalog on every right-click.
+    constexpr std::wstring_view obsolete_open_with = L"n:0:11:registry:0:12:v:__openwith:v";
+    const bool retired_open_with = std::erase_if(seen, [=](const SeenMenuItem& item) {
+        return item.tree_node && !item.configurable && item.key == obsolete_open_with;
+    }) != 0;
+    TrimLegacySeen(*this, 400);
+    while (seen.size() > kSeenCatalogLimit) if (!RetireOldestSeen(*this)) break;
+    migrated = version < kPrefsVersion || retired_open_with;
     return true;
 }
 
@@ -513,7 +856,7 @@ void ContextMenuPrefs::MigrateSeenKeys() {
     merged.reserve(seen.size());
     for (auto& item : seen) {
         std::wstring canonical = item.key;
-        if (old_quick_access(item)) {
+        if (!item.tree_node && old_quick_access(item)) {
             repaired_aliases.insert(item.key);
             canonical = quick_access;
         } else if (display_key(item.key)) canonical = ipc::CatalogKey(item.text, item.flyout);
@@ -555,6 +898,7 @@ void ContextMenuPrefs::CoalesceCompressCatalog() {
     bool compress_forced_on = false;
     bool compress_forced_off = false;
     for (auto& item : seen) {
+        if (item.tree_node) { kept.push_back(std::move(item)); continue; }
         if (item.key == ipc::CompressCatalogKey()) {
             compress_seen = true;
             kept.push_back(std::move(item));
@@ -613,7 +957,16 @@ bool ContextMenuPrefs::Save() const {
     if (load_failed) return false;
     const std::wstring dir = GetPulseDataDir();
     if (dir.empty()) return false;
+    GlobalAsyncFileWriter().Flush();
     return WriteUtf8FileAtomic(dir + L"\\context_menu.json", ToJson());
+}
+
+bool ContextMenuPrefs::SaveAsync() const {
+    if (!persist) return true;
+    if (load_failed) return false;
+    const std::wstring dir = GetPulseDataDir();
+    if (dir.empty()) return false;
+    return GlobalAsyncFileWriter().Submit(dir + L"\\context_menu.json", ToJson());
 }
 
 } // namespace pulse::app

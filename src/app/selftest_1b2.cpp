@@ -328,6 +328,8 @@ struct FluentMenuTestPeer {
         clear.text = L"No color dot";
         menu.first_sub_.model.SetItems({strip, clear});
         menu.first_sub_.model.Layout(nullptr, scale);
+        // OpenSubmenu normally sizes the viewport; rows outside it never hit-test.
+        menu.first_sub_.viewport_px = static_cast<float>(menu.first_sub_.model.HeightPx());
         // Deliberately different parent width: submenu hits must use its own geometry.
         menu.model_.SetItems({clear});
         menu.model_.Layout(nullptr, scale, 800.0f);
@@ -780,6 +782,11 @@ void TestFilterControls() {
         (*entries)[1].name = L"Documents"; (*entries)[1].is_dir = true;
         tab->SetSnapshot(entries);
         ShowFilterEditor(*state);
+        BYTE filter_alpha = 0;
+        DWORD filter_flags = 0;
+        Check(GetLayeredWindowAttributes(state->hwndFilterEdit, nullptr, &filter_alpha, &filter_flags) &&
+            (filter_flags & LWA_ALPHA) && filter_alpha == 255,
+            L"filter: editor owns a redirected surface above the main composition frame");
         SetWindowTextW(state->hwndFilterEdit, L"11");
         SyncFilterEditor(*state);
         Check(BuildVm(*state).pane.EntryCount() == 1, L"filter: typing narrows directory");
@@ -1025,6 +1032,41 @@ void TestBlankPaneClickNavigation() {
                 }
                 Check(open_rail_hit,
                       L"sidebar geometry: an expanded section keeps its rail row");
+                // A folded section adds its own icon row under the short title;
+                // it reports sub_index 2 so it lights apart from the title (0).
+                bool fold_row_hit = false;
+                for (float y = 0.0f; y < height_px; y += scale) {
+                    const auto hit = renderer.HitTest(folded_vm, narrow_bounds, 24.0f * scale, y);
+                    if (hit.region == ui::HitTestResult::SidebarHeader && hit.sidebar_section == 0 &&
+                        hit.sub_index == 2) {
+                        fold_row_hit = true;
+                        break;
+                    }
+                }
+                Check(fold_row_hit, L"sidebar geometry: a folded rail section has its own icon row");
+                // An empty workspace section offers "save current" on the rail
+                // instead of leaving a blank cell.
+                ui::WindowViewModel workspace_vm;
+                {
+                    ui::SidebarGroup group;
+                    group.id = 0;
+                    group.header = L"WS";
+                    group.add_action = ui::SidebarAddAction::SaveWorkspace;
+                    ui::SidebarItem empty;
+                    empty.workspace_empty = true;
+                    empty.label = L"Empty";
+                    group.items.push_back(std::move(empty));
+                    workspace_vm.sidebar.push_back(std::move(group));
+                }
+                bool save_hit = false;
+                for (float y = 0.0f; y < height_px; y += scale) {
+                    const auto hit = renderer.HitTest(workspace_vm, narrow_bounds, 24.0f * scale, y);
+                    if (hit.region == ui::HitTestResult::SidebarWorkspaceAction && hit.sub_index == 4) {
+                        save_hit = true;
+                        break;
+                    }
+                }
+                Check(save_hit, L"sidebar rail: an empty workspace section offers save current");
             }
         }
     }
@@ -4946,30 +4988,32 @@ void TestSnapshotPatchHoldsRows() {
     MoveFileW(full(L"alpha.txt").c_str(), full(L"zeta.txt").c_str());
     Check(name_asc(entries, ev(FILE_ACTION_RENAMED_NEW_NAME, L"zeta.txt", L"alpha.txt"), dir) ==
               NotifyPatch::Applied &&
-          names(entries) == L"zeta.txt,beta.txt,gamma.txt",
-          L"patch hold: a renamed row keeps its place instead of re-sorting");
+          names(entries) == L"beta.txt,gamma.txt,zeta.txt",
+          L"patch sort: a renamed row moves to its current sort position");
     make(L"aardvark.txt", 1);
     Check(name_asc(entries, ev(FILE_ACTION_ADDED, L"aardvark.txt"), dir) == NotifyPatch::Applied &&
-          names(entries) == L"aardvark.txt,zeta.txt,beta.txt,gamma.txt",
+          names(entries) == L"aardvark.txt,beta.txt,gamma.txt,zeta.txt",
           L"patch hold: a new row goes before the first row that sorts after it");
+    SortEntries(entries, ui::SortColumn::Size, ui::SortDirection::Desc);
     make(L"beta.txt", 5000);
     Check(ApplyDirNotify(entries, dir, ev(FILE_ACTION_MODIFIED, L"beta.txt"),
                          ui::SortColumn::Size, ui::SortDirection::Desc) == NotifyPatch::Applied &&
-          names(entries) == L"beta.txt,aardvark.txt,zeta.txt,gamma.txt" &&
+          names(entries) == L"beta.txt,zeta.txt,gamma.txt,aardvark.txt" &&
           entries[0].size == 5000u,
-          L"patch sort: a modified size key moves the row to its descending sort position");
+          L"patch sort: modified size moves ahead of smaller peers");
 
     {
         const ScopedEntryGrouping grouping(static_cast<int>(GroupBy::Type));
+        SortEntries(entries, ui::SortColumn::Name, ui::SortDirection::Asc);
         CreateDirectoryW(full(L"new").c_str(), nullptr);
         make(L"notes.md", 1);
         name_asc(entries, ev(FILE_ACTION_ADDED, L"new"), dir);
         name_asc(entries, ev(FILE_ACTION_ADDED, L"notes.md"), dir);
-        Check(names(entries) == L"new,notes.md,beta.txt,aardvark.txt,zeta.txt,gamma.txt",
+        Check(names(entries) == L"new,notes.md,aardvark.txt,beta.txt,gamma.txt,zeta.txt",
               L"patch hold: grouped, a new row goes to its sort position in its group");
         MoveFileW(full(L"zeta.txt").c_str(), full(L"zeta.md").c_str());
         name_asc(entries, ev(FILE_ACTION_RENAMED_NEW_NAME, L"zeta.md", L"zeta.txt"), dir);
-        Check(names(entries) == L"new,notes.md,zeta.md,beta.txt,aardvark.txt,gamma.txt",
+        Check(names(entries) == L"new,notes.md,zeta.md,aardvark.txt,beta.txt,gamma.txt",
               L"patch hold: grouped, a rename into another group moves to its place there");
     }
 
@@ -5002,9 +5046,8 @@ void TestEntryOrderHold() {
         });
         return list;
     };
-    const auto keep = [](const std::vector<fs::DirEntry>& shown, const std::vector<fs::DirEntry>& fresh,
-                         const std::vector<EntryRename>& renames) {
-        return KeepEntryOrder(shown, fresh, renames, ui::SortColumn::Name, ui::SortDirection::Asc);
+    const auto keep = [](const std::vector<fs::DirEntry>& shown, const std::vector<fs::DirEntry>& fresh) {
+        return KeepEntryOrder(shown, fresh, ui::SortColumn::Name, ui::SortDirection::Asc);
     };
 
     const std::vector<fs::DirEntry> shown = {entry(L"alpha"), entry(L"echo"), entry(L"delta"),
@@ -5012,14 +5055,12 @@ void TestEntryOrderHold() {
     const std::vector<fs::DirEntry> fresh = sorted({entry(L"alpha", false, 42), entry(L"beta"),
                                                     entry(L"charlie"), entry(L"delta"),
                                                     entry(L"zulu")});
-    const auto held = keep(shown, fresh, {{L"echo", L"zulu"}});
-    Check(names(held) == L"alpha,charlie,zulu,delta,beta",
-          L"order hold: rows keep their place, a renamed row its old one, new rows merge in sorted");
+    const auto held = keep(shown, fresh);
+    Check(names(held) == L"alpha,beta,charlie,delta,zulu",
+          L"order refresh: fresh sort replaces previous displayed order");
     Check(!held.empty() && held[0].size == 42u,
           L"order hold: kept rows take the fresh metadata");
-    Check(names(keep(shown, fresh, {})) == L"alpha,charlie,delta,beta,zulu",
-          L"order hold: without a rename hint the new name is just a new row");
-    Check(names(keep({}, fresh, {})) == names(fresh),
+    Check(names(keep({}, fresh)) == names(fresh),
           L"order hold: nothing shown yet means plain sort order");
 
     {
@@ -5029,11 +5070,11 @@ void TestEntryOrderHold() {
         const auto fresh_grouped = sorted({entry(L"docs", true), entry(L"new", true),
                                            entry(L"z.md"), entry(L"a.txt"), entry(L"b.txt"),
                                            entry(L"c.txt")});
-        Check(names(keep(shown_grouped, fresh_grouped, {})) == L"docs,new,z.md,b.txt,c.txt,a.txt",
-              L"order hold: grouped, new rows merge in at their sort position");
+        Check(names(keep(shown_grouped, fresh_grouped)) == L"docs,new,z.md,a.txt,b.txt,c.txt",
+              L"order refresh: grouped rows adopt the fresh sort order");
         const auto fresh_moved = sorted({entry(L"docs", true), entry(L"a.md"), entry(L"c.txt")});
-        Check(names(keep(shown_grouped, fresh_moved, {{L"a.txt", L"a.md"}})) == L"docs,a.md,c.txt",
-              L"order hold: grouped, a rename into another group leaves its old row");
+        Check(names(keep(shown_grouped, fresh_moved)) == L"docs,a.md,c.txt",
+              L"order hold: grouped, a rename into another group merges in sorted");
     }
 
     {
@@ -5512,10 +5553,11 @@ void TestSplitLayout() {
     add_fake("app.exit", l10n::Get(l10n::StringId::ExitPulse).c_str(), L"应用");  // 5
     add_fake("settings.set", L"显示隐藏的文件", L"设置 · 文件列表").key = "show_hidden";  // 6
     const auto mixed_rows = [&](const wchar_t* needle) {
-        return act::PaletteRows(fake_actions, needle, act::PaletteMode::Mixed, {});
+        return act::PaletteRows(fake_actions, needle, act::PaletteMode::Mixed, {}, true);
     };
-    const auto command_rows = [&](const wchar_t* needle, const std::vector<int>& used = {}) {
-        return act::PaletteRows(fake_actions, needle, act::PaletteMode::Commands, used);
+    const auto command_rows = [&](const wchar_t* needle, const std::vector<int>& used = {},
+                                  bool offer_assistant = true) {
+        return act::PaletteRows(fake_actions, needle, act::PaletteMode::Commands, used, offer_assistant);
     };
     auto pal = BuildCommandPalette(L"", {}, { L"C:\\Users" }, {}, false);
     Check(!pal.empty() && pal.back().command == CmdRecentBase, L"menu: command palette recent");
@@ -5547,6 +5589,9 @@ void TestSplitLayout() {
         Check(none.size() == 2 && !none[0].enabled && none[1].command == act::kPaletteAskAssistant &&
               none[1].text.find(L"把上个月的截图挪到图片") != std::wstring::npos,
               L"palette: no match offers the assistant with the words");
+        const auto no_ai = command_rows(L"把上个月的截图挪到图片", {}, false);
+        Check(no_ai.size() == 1 && !no_ai[0].enabled && !no_ai[0].separator_after,
+              L"palette: no match hides the assistant suggestion when turned off");
         const auto start = command_rows(L"", { 4 });
         Check(start.size() >= 4 && start[0].heading && start[1].command == act::PaletteCommand(4) &&
               start[2].heading,
@@ -7965,7 +8010,7 @@ void TestViewLayouts() {
         std::vector<int> short_names(20, 1), with_dirs(20, 1), very_long(10, 5);
         std::vector<int> mixed(19, 1), long_names{1, 2, 3, 3, 3, 3, 3, 3};
         mixed.push_back(2);
-        Check(ui::AutoIconNameLines(short_names, false) == 1 && ui::AutoIconNameLines(with_dirs, true) == 2 &&
+        Check(ui::AutoIconNameLines(short_names, false) == 1 && ui::AutoIconNameLines(with_dirs, true) == 3 &&
               ui::AutoIconNameLines(mixed, false) == 2 && ui::AutoIconNameLines(long_names, false) == 3 &&
               ui::AutoIconNameLines(very_long, false) == 4,
               L"view: folder name lines follow the 75th/95th percentile rule (1..4)");

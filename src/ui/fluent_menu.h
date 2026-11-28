@@ -20,8 +20,10 @@
 // FluentMenuModel is the windowless layout/hit-test half; the console
 // self-test drives it directly with a standalone DWrite factory.
 #pragma once
+#include "store_icons.h"
 #include "fluent_components.h"
 #include "ui_motion.h"
+#include "native_menu_surface.h"
 #include "../common/menu_icon.h"
 
 #include <dwrite_3.h>
@@ -50,6 +52,9 @@ struct FluentMenuSwatch {
 struct FluentMenuItem {
     int command = 0;              // app-defined verb id; 0 is never returned
     std::wstring text;
+    // Optional second line under the label (caption, secondary colour): the
+    // result a plugin command will produce. It ellipsizes; never widens the menu.
+    std::wstring detail;
     std::wstring glyph;           // Segoe Fluent Icons codepoint string
     std::wstring shortcut;        // right-aligned caption, e.g. L"Ctrl+Shift+C"
     std::wstring badge_text;      // right-aligned Fluent badge (takes priority over shortcut)
@@ -77,6 +82,9 @@ struct FluentMenuItem {
     D2D1_COLOR_F glyph_color{};
     bool shortcut_inline = false; // Search paths follow a shared, compact filename column.
     int trailing_command = 0;     // Optional hover-revealed close action at the right edge.
+    bool trailing_on_hover = false; // the × takes the shortcut's place on hover; no column otherwise (tab list)
+    bool detail_inline = false;   // detail follows the label on its line, grey; single-height row (tab list .pp)
+    bool current = false;         // the selected entry: selection fill and a 3 DIP accent bar (tab list .on)
     std::wstring tooltip;
     // Keyboard access key like a native menu's "&X" (case-insensitive). 0 falls
     // back to a trailing "(X)" in text, which Explorer's CJK labels keep.
@@ -90,6 +98,13 @@ struct FluentMenuItem {
     uint16_t match_start = 0;
     uint16_t match_length = 0;
     int drag_command = 0;         // optional toolbar drag identity; never dispatched as a command
+    StoreIcon vector_icon = StoreIcon::None;
+    uint32_t custom_icon = 0;
+    // Opt-in extension group presentation; existing menus retain their metrics.
+    bool group_tint = false, group_start = false, group_end = false;
+    bool primary = false;
+    StoreIcon trailing_vector_icon = StoreIcon::None; // always visible trailing action
+
 };
 
 // Access key of a row: explicit mnemonic, else trailing "(X)" / "（X）" in text
@@ -159,6 +174,7 @@ private:
     float pad_v_ = 4.0f;      // surface inner padding (DIP*scale)
     float sep_h_ = 5.0f;      // separator slot height (line + gaps)
     float heading_h_ = 26.0f; // a heading row (26 DIP)
+    float detail_row_h_ = 48.0f; // a row with a detail line (row + 16 DIP)
     float inline_label_width_ = 0.0f;
     int width_ = 0;
     int locked_width_ = 0;    // PatchInPlace: Layout keeps this width
@@ -182,6 +198,24 @@ public:
     // (drawing happens on the UI thread between its own BeginDraw/EndDraw).
     bool Create(HWND owner, Compositor* compositor, float scale);
     void SetTheme(bool dark, D2D1_COLOR_F accent);
+    void SetGlassSurface(bool enabled) { glass_surface_ = enabled; }
+    void SetNativeAcrylic(bool enabled, NativeMenuSurface::BackdropFactory factory = {}) {
+        native_acrylic_requested_ = enabled;
+        native_backdrop_factory_ = std::move(factory);
+    }
+    using MaterialPainter = std::function<bool(ID2D1DeviceContext*, const D2D1_RECT_F&,
+        POINT, float, bool)>;
+    // Draws only the supplied wallpaper material, in physical pixels at 96 DPI.
+    void SetMaterialPainter(MaterialPainter painter) {
+        material_painter_ = std::move(painter);
+        ResetMaterialRefresh();
+    }
+    // A GPU-backed material can become ready after the first paint. Retry without
+    // blocking input, and stop after a bounded number of attempts on device failure.
+    void RequestMaterialRefresh();
+    // Corner radius in DIPs (0: the theme's flyout radius) and the hover highlight's radius and side inset.
+    void SetCornerRadiusDip(float dip) { corner_radius_dip_ = dip; }
+    void SetHoverPlate(float radius_dip, float inset_dip) { plate_radius_dip_ = radius_dip; plate_inset_dip_ = inset_dip; }
     // Row height of this menu and its submenus, in DIPs (follows list density, #27).
     void SetRowHeightDip(float dip);
 
@@ -199,7 +233,13 @@ public:
     int DraggedCommand() const { return dragged_command_; }
     POINT DragPoint() const { return drag_point_; }
     bool IsOpen() const { return open_; }
-    void Dismiss(); // immediate (no animation); safe anytime
+    void Dismiss();
+    // Stop this modal loop before a queued replacement opens. TrackPopup still owns cleanup.
+    void DismissImmediately() {
+        if (!open_) return;
+        result_ = 0;
+        open_ = false;
+    }
     // Safe from the owner window while TrackPopup's modal loop is running
     // (e.g. async index hits arrived). No-op if the menu is closed.
     void RequestFilterRefresh();
@@ -274,7 +314,9 @@ public:
 
 private:
     // ULW staging buffer (GDI DIB); the main menu and the flyout each own one.
+    int ShadowMargin() const noexcept { return native_acrylic_active_ ? 0 : kShadowMargin; }
     struct Surface {
+        NativeMenuSurface native;
         HDC mem_dc = nullptr;
         HBITMAP dib = nullptr;
         void* bits = nullptr;
@@ -294,28 +336,41 @@ private:
         ComPtr<ID2D1Bitmap1> readback;
     };
 
+    bool EnsurePresentationWindow(bool native);
     bool EnsureWindow();
+    std::wstring FilterPlaceholder() const;
     bool EnsureFilterEdit();
     void ApplyFilterLead();   // SetFilterLead's props on edit_ (none: removed)
     void PlaceFilterEdit(int y_offset_px);
     void HideFilterEdit();
+    void HideRootWindow();
     void SyncFilterFromEdit();
     bool IsPaletteHwnd(HWND hwnd) const;
     bool RenderSurface(const FluentMenuModel& model, int hover_row, int hover_swatch,
                        float header_px, bool draw_filter_field, Surface& s);
-    // Device bitmap for a row's app icon, created on first use and kept for
-    // the popup's lifetime (reset by TrackPopup along with the plates).
+    // Device bitmap for a row's app icon, created on first use and kept in
+    // a bounded cache across popups, invalidated with its device/theme/DPI.
     ID2D1Bitmap* IconBitmapFor(const common::MenuIconRef& pixels, ID2D1DeviceContext* dc);
     bool Render();                 // model_ -> dib_ (pixels), current hover state
+    void ResetMaterialRefresh();
     // Bakes s.plate for `card` (bitmap px) of a window at screen `origin` from
     // the owner compositor's frame copy; false keeps the solid plate.
     bool EnsurePlate(Surface& s, const D2D1_RECT_F& card, POINT origin, ID2D1Image* target);
+    void AbortNativePresentation();
     void Present(BYTE alpha, int y_offset_px);
     // Cascading flyouts share one modal loop and preserve each parent card.
     bool EnsureSubWindow();
     void OpenSubmenu(int row, size_t depth = 0);
     void CloseSubmenu();
     void OnSubMouse(POINT client_pt, bool button_up);
+    HWND SubmenuWheelTarget(POINT screen_pt) const;
+    float SubMaxScrollPx() const;
+    bool ScrollSubTo(float offset, bool keep_hover = false);
+    bool ScrollSubRows(int rows);
+    void SetSubKeyboardHover(int row, int swatch = -1);
+    fluent::ScrollbarSpec SubBarSpec() const;
+    bool SubBarPress(float x, float y);
+    bool SubBarDrag(float y);
     bool RenderSub();
     void PresentSub(BYTE alpha);
     bool TickSubMotion();            // flyout fade/slide or glide; true while running
@@ -396,6 +451,16 @@ private:
     bool topmost_ = false;
     bool activate_on_open_ = false;
     bool activation_confirmed_ = false;
+    MaterialPainter material_painter_;
+    unsigned material_retries_left_ = 16;
+    bool material_retry_pending_ = false;
+    float corner_radius_dip_ = 0.0f;
+    float plate_radius_dip_ = 5.0f;
+    float plate_inset_dip_ = 6.0f;
+    NativeMenuSurface::BackdropFactory native_backdrop_factory_;
+    bool native_acrylic_requested_ = false;
+    bool native_acrylic_active_ = false;
+    bool glass_surface_ = false;
     bool acrylic_active_ = false;  // decided when a popup opens
     HWND external_edit_ = nullptr; // borrowed; never moved, hidden or destroyed
     HWND edit_ = nullptr;
@@ -429,8 +494,10 @@ private:
     struct IconBitmap {
         common::MenuIconRef pixels;
         ComPtr<ID2D1Bitmap> bitmap;
+        ComPtr<ID2D1DeviceContext> context; // Strong key: a recreated context cannot reuse its address.
+        uint64_t last_used = 0;
     };
-    std::vector<IconBitmap> icon_bitmaps_;  // a menu holds a few dozen rows at most
+    std::vector<IconBitmap> icon_bitmaps_;  // bounded LRU retained across popup invocations
 
     struct SubmenuState {
         ~SubmenuState();
@@ -441,6 +508,8 @@ private:
         int hover = -1;
         int hover_swatch = -1;
         int x = 0, y = 0;
+        float viewport_px = 0.0f, scroll_y = 0.0f, bar_grab = 0.0f;
+        bool bar_hot = false, bar_drag = false;
         ::pulse::ui::motion::SpringRectMotion plate;
         uint64_t plate_frame = 0;
         bool animating = false, fade = false;

@@ -52,7 +52,9 @@ enum class AiPanelPart : uint8_t {
     Suggestion,     // index
     ContextChip,
     ContextRemove,
+    AttachRemove,   // index = attachment chip index
     AddFiles,
+    WebSearch,
     ModelButton,
     Send,
     Input,
@@ -70,6 +72,7 @@ enum class AiPanelPart : uint8_t {
     ResultUndo,
     ResultShow,
     ActCopy,
+    ActSave,        // save answer as .md in current folder
     ActRetry,
     ActThumb,
     ErrAction,      // index = block index * 4 + button (AiBlockView::actions)
@@ -177,7 +180,7 @@ enum class AiBlockKind : uint8_t {
     Confirm,    // amber confirmation, decided → one quiet line
     Result,     // 已整理 … with folder tags, 撤销 / 在 Pulse 中查看
     Acts,       // copy / retry / thumb + meta under a finished answer
-    Working,    // ✦ shimmer line while waiting for the next thing
+    Working,    // Activity spark and stable text while waiting for the next thing
     Note,       // centred line between rules (你撤销了这次整理)
     Error,      // the turn failed: tile + title + sub (+ detail, hint) + buttons
     Cut,        // amber strip under a partial answer: 回答中途断开了 · 重试
@@ -587,7 +590,7 @@ struct AiBlockView {
 // 语音输入: the composer while the microphone listens, and the mic button.
 struct AiVoiceView {
     bool available = false;           // the mic button is there
-    bool listening = false;           // .composer.listen: the filled mic and its ring
+    bool listening = false;           // Filled mic, live voice levels and recording time
     bool menu_open = false;           // the chevron's menu
     uint64_t shake_at = 0;            // the mic shakes (a precheck failed), ms
     std::array<float, 14> levels{};   // the waveform, oldest first, 0..1
@@ -657,6 +660,13 @@ struct AiHistoryView {
     int deleting = -1;                // row in its inline confirmation
 };
 
+struct AiAttachChipView {
+    std::wstring name;
+    std::wstring meta;        // size or WxH
+    bool is_image = false;
+    bool is_dir = false;
+};
+
 struct AiPanelViewModel {
     bool dark = false;
     bool high_contrast = false;
@@ -679,6 +689,9 @@ struct AiPanelViewModel {
     // Composer.
     bool context_visible = false;
     std::wstring context_text;        // 下载 · 12 项
+    std::vector<AiAttachChipView> attachments;
+    std::wstring attach_notice;       // privacy notice shown when attachments exist
+    bool drop_hot = false;            // files dragged over the panel
     bool composer_focused = false;
     bool composer_empty = true;
     int composer_lines = 1;           // the EDIT's line count (input grows to 6)
@@ -691,6 +704,8 @@ struct AiPanelViewModel {
     // 引用: the chosen words above the input (empty: none).
     std::wstring quote;
     std::wstring add_files;
+    bool web_search = false;
+    std::wstring web_search_label;
     std::wstring model_label;         // deepseek-flash
     std::wstring effort_label;        // " · 高", " · 始终思考" (empty when thinking is off)
     AiSendState send = AiSendState::Dim;
@@ -735,7 +750,7 @@ public:
     // to their own target, so switching modes crosses over.
     void SetState(bool open, AiPanelMode mode, bool animate);
     bool IsOpen() const noexcept { return open_; }
-    // New chat: the empty state's spark breathes again.
+    // New chat: reset the empty-state opening timestamp.
     void Rewake(uint64_t now_ms);
     AiPanelMode Mode() const noexcept { return mode_; }
     // Something of the panel is on screen (open, or still closing).
@@ -745,7 +760,7 @@ public:
     // Once per frame before layout: samples the motion. True while it runs.
     bool Tick(uint64_t now_ms);
     bool Animating() const noexcept { return dock_anim_ || float_anim_ || conv_anim_ || peek_anim_; }
-    // Decorative motion of the open panel (the breathing spark, spinners).
+    // Decorative activity of the open panel (running sparks and spinners).
     bool WantsDecorFrame() const noexcept { return (open_ && (decor_ || conv_decor_)) || chip_decor_; }
 
     // Width of the docked column this frame, in px (0 when floating or closed).
@@ -983,8 +998,10 @@ private:
     bool glass_drawn_ = false;
     float glass_alpha_ = 1.0f;
     D2D1_COLOR_F glass_frame_{};
-    D2D1_RECT_F add_files_{}, model_button_{}, send_button_{};
+    D2D1_RECT_F add_files_{}, web_search_{}, model_button_{}, send_button_{};
     D2D1_RECT_F mic_button_{}, mic_menu_{};
+    std::vector<D2D1_RECT_F> attach_removes_;
+    float attach_h_ = 0.0f;
     // 语音输入: menu motion, hit rects and formats (ai_panel_voice.h).
     struct VoiceGeom;
     std::shared_ptr<VoiceGeom> voice_;

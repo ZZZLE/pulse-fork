@@ -8,6 +8,8 @@
 
 #include "folder_picker_model.h"
 #include "../common/picker_places_snapshot.h"
+#include "../common/menu_icon.h"
+#include "window_effect_support.h"
 
 #include <d2d1.h>
 #include <windows.h>
@@ -28,7 +30,7 @@ struct PickerPlace {
     std::wstring glyph;
 };
 
-enum class PickerDialogEvent { Snapshot, Shown, Ready, FolderChanging, FolderChanged, SelectionChanged, TypeChanged, FileOk, ButtonClicked, ItemSelected, ControlActivating, OpenDropDownSelected, CheckToggled, EditChanged };
+enum class PickerDialogEvent { Snapshot, Shown, Ready, FolderChanging, FolderChanged, SelectionChanged, TypeChanged, FileOk, ButtonClicked, ItemSelected, ControlActivating, OpenDropDownSelected, CheckToggled, EditChanged, IncludeItem };
 struct PickerDialogSnapshot {
     uint64_t generation = 0;
     std::wstring folder, filename, selection, candidate;
@@ -39,6 +41,26 @@ struct PickerDialogSnapshot {
     std::wstring control_text;
 };
 struct PickerCustomItem { uint32_t id = 0, state = 3; std::wstring label; };
+// A jump panel result (HTML 输入跳转). group: 1 this program's recent, 2 favorites, 3 everywhere.
+struct PickerJumpResult {
+    std::wstring path;
+    std::wstring name;   // empty: the leaf of path
+    std::wstring note;   // quiet tag ("7 月 3 日", "网络位置")
+    int group = 3;
+    bool file = false;   // a file: going there opens its folder
+};
+// A folder this program used before (HTML 侧栏「微信 最近发送」), most used first.
+struct PickerRecentPlace {
+    std::wstring path;
+    std::wstring label;   // empty: the folder's own name
+    std::wstring detail;  // quiet tag on the right: "9 次", "今天"
+};
+// A folder open elsewhere, for the jump strip (HTML 跳转条). The host fills these.
+struct PickerOpenFolder {
+    std::wstring path;
+    std::wstring label;   // empty: the folder's own name
+    bool explorer = false; // an Explorer window rather than a Pulse tab
+};
 struct PickerCustomControl {
     uint32_t kind = 0, id = 0, parent_id = 0, state = 0;
     bool has_parent = false;
@@ -47,10 +69,15 @@ struct PickerCustomControl {
     std::vector<PickerCustomItem> items;
     bool has_selected = false;
     uint32_t selected_item_id = 0;
-    uint32_t property_layout = 0; // Internal: 1 vector edit, 2 inline remove, 3 add, 4 scalar, 5 label.
+    uint32_t property_layout = 0; // Internal: 1 vector edit, 2 inline remove, 3 add, 4 scalar, 5 label, 6 readonly, 7 heading.
     bool checked = false;
     std::wstring text;
 };
+inline bool PickerPropertiesNeedPanel(const std::vector<PickerCustomControl>& controls) {
+    for (const auto& control : controls)
+        if ((control.state & 2) && (control.property_layout == 6 || control.property_layout == 7)) return true;
+    return false;
+}
 // Internal same-STA update, never a cross-process message.
 HRESULT UpdatePickerCustomControl(HWND window, const PickerCustomControl& control);
 struct FilePickerResult;
@@ -64,21 +91,29 @@ struct FolderPickerSpec {
     bool persist_layout = false; // In-process takeover remembers presentation per host and mode.
     PickerMode mode = PickerMode::Folder;
     std::wstring title;         // empty: "Choose a folder" / "Choose background image" / "Open"
-    bool explicit_title = false, has_ok_button_label = false, has_file_name_label = false;
-    std::wstring ok_button_label, file_name_label;
+    bool explicit_title = false, has_ok_button_label = false, has_file_name_label = false, has_cancel_button_label = false;
+    std::wstring ok_button_label, file_name_label, cancel_button_label;
     std::wstring initial_path;  // empty: where the last pick of this mode was made
     std::vector<PickerFilter> filters;
     std::vector<PickerCustomControl> custom_controls;
     size_t filter_index = 0;
     std::wstring filename;
+    std::wstring original_file_path; // Optional source file path for Save "原文件位置" chip.
     std::wstring default_extension; // Without leading period
+    std::wstring navigation_root;
+    bool legacy_browse = false, hide_new_folder_button = false;
     bool use_open_default_extension = false;
     bool no_test_file_create = false;
     bool require_existing_save_parent = false;
     bool native_save_defaults = false;
+    bool prompt_overwrite = true;
     bool require_unencrypted_save = false;
     bool allow_multiselect = false;
-    bool show_hidden = false;
+    bool show_hidden = false; // explicit caller force; independent of Pulse preferences
+    bool show_hidden_files = false;
+    bool show_protected_os_files = false;
+    bool show_file_extensions = true;
+    bool shell_item_filter = false; // Enumerated views only; never typed navigation/result validation.
     // The main window's list style, so rows look the same in both places.
     bool selection_outline = false;
     float row_height_dip = 0.0f;          // 0: the renderer's default
@@ -90,8 +125,56 @@ struct FolderPickerSpec {
     int preview_trigger = 0;
     int hover_preview_delay_ms = 500;
     int hover_card_size = 1;
+    // The main window's 窗口效果 (Mica Alt, Mica, Acrylic or none); hosts without
+    // the user's preferences keep acrylic, the dialog material before this setting.
+    WindowEffect window_effect = WindowEffect::Acrylic;
+    int panel_transparency = 50;  // 界面透明度 (AppPrefs::wallpaper_look)
+    int frame_transparency = 10;  // 侧边栏与标题栏 (AppPrefs::frame_transparency)
+    // The main window's sort and group-by for a folder (its per-folder memory);
+    // empty: the dialog's own order. Called on the dialog thread, memory only.
+    std::function<PickerListOrder(const std::wstring& folder)> folder_order;
     uint32_t details_columns = 0;         // Without explicit_details_columns, 0 uses defaults.
     bool explicit_details_columns = false;
+    // ---- Jump strip (HTML 跳转条): all optional, filled by the host process. ----
+    std::wstring host_app_name;            // the program that opened the dialog ("Microsoft Word")
+    HICON host_app_icon = nullptr;         // its icon; borrowed until Show returns
+    // Preferred over host_app_icon: the icon extracted at the title icon's pixel size
+    // (20 DIP at the system DPI) on a worker, so nothing is stretched up.
+    common::MenuIconRef host_app_icon_pixels;
+    std::vector<PickerOpenFolder> open_folders; // Pulse tabs, then Explorer windows; Alt+1..9 in order
+                                                // (empty: the folders the shared Pulse places mark open)
+    // Snapshot only: acceptance must still validate paths and caller FileOk rules.
+    std::vector<picker_places::SelectedItem> pulse_selected_items;
+    bool pulse_selection_available = false;
+    std::vector<picker_places::TrayItem> pulse_tray_items;
+    bool pulse_tray_available = false;
+    uint64_t pulse_tray_shelf_id = 0, pulse_tray_revision = 0, pulse_tray_total_count = 0;
+    std::wstring pulse_tray_shelf_name;
+    DWORD pulse_tray_publisher_pid = 0;
+    HWND pulse_tray_source = nullptr, pulse_tray_endpoint = nullptr;
+    DWORD pulse_tray_endpoint_pid = 0;
+    bool enable_save_followup = false; // Observe writes only after explicit result delivery.
+    bool enable_archive_selection = false; // Requires a result delivery commit (V2).
+    bool enable_tray_consume = false; // Caller explicitly commits result delivery (V2).
+    std::vector<PickerRecentPlace> app_recent_places; // sidebar group "{host_app_name} 最近使用", first
+    PickerOpenFolder last_location;        // where this program last saved / opened; path empty: none
+    std::wstring last_location_source;     // "Word 上次"
+    // initial_path was chosen by the host over the program's own folder (the automatic
+    // jump to the folder open in Pulse); this is that original folder, offered as 回到 X.
+    std::wstring auto_jump_from;
+    // Typed names in the address row (not paths) open the jump panel. The panel itself
+    // matches open_folders and last_location; this adds the rest. Called on the dialog
+    // thread for every keystroke: answer from memory only (cache index results elsewhere).
+    std::function<std::vector<PickerJumpResult>(const std::wstring& query)> jump_search;
+    // Memory-only polling; producers own background I/O and retain icon resources.
+    std::function<bool(FolderPickerSpec&)> poll_jump_context;
+    // 常用: the user removed a folder from this program's history (after the undo window).
+    std::function<void(const std::wstring&)> forget_recent_place;
+    bool allow_auto_jump = false; // Explicit SetFolder and unknown caller contracts stay put.
+    int jump_index_status = 0; // 1 only after a connected per-user index is observed.
+    std::wstring jump_search_query; // Completed background query; never applies to newer input.
+    uint64_t jump_search_elapsed_ms = 0;
+    bool jump_search_complete = false;
     std::vector<PickerPlace> bottom_places;
     std::vector<PickerPlace> places;      // extra quick-access rows, shown first
     pulse::PickerOwnerGuard* owner_guard = nullptr; // borrowed through Show; acquired once by caller or detailed entry
@@ -105,6 +188,7 @@ struct FolderPickerSpec {
     // Explicit Open contract only. The loader still checks existence; it does
     // not implement a read-access probe for either value of this field.
     bool skip_access_validation = false;
+    bool reject_readonly_save = false;
     bool allow_missing_open = false;
     bool require_existing_open_parent = false;
     bool validate_local_open_access_v1 = false;
@@ -128,16 +212,35 @@ struct FolderPickerSpec {
 struct FilePickerResult {
     std::vector<std::wstring> paths;
     size_t filter_index = 0;
+    std::wstring navigation_source; // Original archive, never the staging directory.
+    std::function<void()> on_result_delivered; // Invoke only after caller result buffers succeed.
 };
 
 enum class FilePickerStatus { Accepted, Cancelled, Failed };
+// First failure observed inside the picker window, for release diagnostics.
+// stage is a fixed identifier literal (never user data); line is the failing
+// call site in folder_picker_dialog.cpp of the same build.
+struct FilePickerFailure {
+    const char* stage = nullptr;
+    uint32_t line = 0;
+    DWORD error = ERROR_SUCCESS;
+    HRESULT hr = S_OK;  // underlying D2D/DXGI HRESULT when the stage has one
+    DWORD rename_edit_error = ERROR_SUCCESS, filename_edit_error = ERROR_SUCCESS;
+    uint64_t painted_frame = 0;
+    bool first_present_occluded = false, submit_ready = false, rendering_frame = false;
+    uint32_t hidden = 0;  // window hidden from the user: 1 iconic, 2 owner iconic, 4 shell/owner cloaked, 8 not visible, 16 app cloaked
+};
 struct FilePickerOutcome {
     FilePickerStatus status = FilePickerStatus::Failed;
     DWORD error = ERROR_SUCCESS;
     FilePickerResult result;
+    FilePickerFailure failure;
 };
 
 HRESULT NavigatePickerFolder(HWND window, const std::wstring& path);
+HRESULT UpdatePickerText(HWND window, uint32_t kind, const std::wstring& text);
+HRESULT SetPickerPropertyValidation(HWND window, uint32_t index, bool invalid);
+HRESULT SetPickerNavigationRoot(HWND window, const std::wstring& root);
 
 // The bridge must not turn a window/message-loop failure into user cancellation.
 FilePickerOutcome ShowFilePickerDetailed(HWND owner, const FolderPickerSpec& spec, bool dark,

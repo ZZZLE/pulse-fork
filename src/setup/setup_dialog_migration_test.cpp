@@ -2,9 +2,12 @@
 #include "setup_transaction.h"
 #include "setup_file_locks.h"
 #include "setup_common.h"
+#include "../common/dialog_auto_ownership.h"
 #include <filesystem>
 #include <algorithm>
 #include <iostream>
+#include <array>
+#include <string_view>
 using namespace pulse::setup;
 namespace {
 unsigned checks = 0, failures = 0;
@@ -31,7 +34,141 @@ struct Fixture {
     }
 };
 }
-int main() {
+
+namespace {
+using Architecture = pulse::dialog_auto::Architecture;
+size_t Index(Architecture architecture) { return architecture == Architecture::X64 ? 0u : 1u; }
+void DualArchitectureTests() {
+    for (unsigned scenario = 0; scenario != 14; ++scenario) {
+        Fixture f(200 + scenario);
+        const std::array<std::wstring, 2> old_dir{L"DialogBridge\\" + std::wstring(64, L'a'), L"DialogBridge\\" + std::wstring(64, L'b')};
+        const std::array<std::wstring, 2> next_dir{L"DialogBridge\\" + std::wstring(64, L'c'), L"DialogBridge\\" + std::wstring(64, L'd')};
+        const std::array<Architecture, 2> architectures{Architecture::X64, Architecture::X86};
+        std::array<std::wstring, 2> old_path, next_path, old_rel, next_rel;
+        std::array<pulse::dialog_auto::Status, 2> status;
+        std::array<unsigned, 2> upgrades{}, restores{};
+        bool files_restored_first = true, no_op_restore = scenario == 8;
+        std::vector<std::pair<size_t, bool>> operations;
+        for (size_t i = 0; i < 2; ++i) {
+            old_rel[i] = old_dir[i] + L"\\" + pulse::dialog_auto::DllNameFor(architectures[i]);
+            next_rel[i] = next_dir[i] + L"\\" + pulse::dialog_auto::DllNameFor(architectures[i]);
+            old_path[i] = f.root + L"\\" + old_rel[i]; next_path[i] = f.root + L"\\" + next_rel[i];
+            Write(old_path[i], i == 0 ? "old64" : "old32");
+            status[i] = {true, false, ERROR_SUCCESS, old_path[i]};
+        }
+        if (scenario == 4) status[1].dll_path = L"C:\\OtherInstall\\PulseDialogAuto32.dll";
+        if (scenario == 5) status[1].enabled = false;
+        if (scenario == 12) { status[0].enabled = false; status[1].enabled = false; }
+        const auto initial_status = status;
+        DialogMigrationApi api;
+        api.inspect_arch = [&](Architecture architecture) { return status[Index(architecture)]; };
+        api.enable_arch = [&](Architecture architecture, const std::wstring& path) -> DWORD {
+            const size_t i = Index(architecture); const bool upgrading = path == next_path[i];
+            operations.emplace_back(i, upgrading);
+            if (upgrading) {
+                ++upgrades[i];
+                Check(Read(path) == (i == 0 ? "new64" : "new32"), "dual migration sees newly installed architecture files");
+                if ((scenario == 7 && i == 0) || (scenario == 13 && i == 1)) return ERROR_SUCCESS;
+                if (i == 1 && (scenario == 1 || scenario == 2 || scenario == 3 || scenario == 8 || scenario == 9 || scenario == 11)) {
+                    status[i].dll_path = scenario == 2 ? L"C:\\Concurrent\\PulseDialogAuto32.dll" : path;
+                    status[i].enabled = false;
+                    if (scenario == 3) status[0].enabled = false;
+                    if (scenario == 9) status[i].error = ERROR_ACCESS_DENIED;
+                    return ERROR_ACCESS_DENIED;
+                }
+            } else {
+                ++restores[i];
+                files_restored_first &= Read(f.root + L"\\pulse.exe") == "old-main" && Read(old_path[0]) == "old64" && Read(old_path[1]) == "old32";
+                if (i == 1 && no_op_restore) return ERROR_SUCCESS;
+                if (i == 0 && scenario == 11 && restores[i] == 1) {
+                    status[i] = {true, false, 0, L"C:\\Concurrent\\PulseDialogAuto64.dll"}; return ERROR_SUCCESS;
+                }
+            }
+            status[i] = {true, false, 0, path}; return ERROR_SUCCESS;
+        };
+        DialogLayoutMigration migration(f.root, true, api);
+        migration.SetVersionDirectory(next_dir[Index(pulse::dialog_auto::CurrentArchitecture)]);
+        migration.SetCompanionVersionDirectory(pulse::dialog_auto::CurrentArchitecture == Architecture::X64 ? Architecture::X86 : Architecture::X64,
+            next_dir[Index(pulse::dialog_auto::CurrentArchitecture == Architecture::X64 ? Architecture::X86 : Architecture::X64)]);
+        FileTransaction tx(f.root, [&](std::wstring& error) { return migration.Recover(error); });
+        std::wstring error;
+        Check(tx.Begin(error), "begin dual architecture file transaction");
+        Write(tx.StagingDir() + L"\\pulse.exe", "new-main");
+        Write(tx.StagingDir() + L"\\" + next_rel[0], "new64");
+        Write(tx.StagingDir() + L"\\" + next_rel[1], "new32");
+        Check(migration.Prepare(error), "prepare both architecture intents before mutations");
+        const auto marker = f.root + L"\\.pulse-setup\\dialog-migration";
+        const auto intent = Read(marker);
+        Check(scenario == 12 ? intent.empty() : intent.starts_with("4\n"), "dual journal is durable version four or absent when nothing is enabled");
+        const bool committed = tx.Commit({L"pulse.exe", next_rel[0], next_rel[1]}, error, {old_rel[0], old_rel[1]}, [&](std::wstring& failure) {
+            if (scenario == 6) status[1] = {true, false, 0, L"C:\\Concurrent\\PulseDialogAuto32.dll"};
+            if (scenario == 10) status[1].enabled = false;
+            return migration.Apply(failure);
+        });
+        const bool success = scenario == 0 || scenario == 4 || scenario == 5 || scenario == 12;
+        Check(committed == success, "dual migration commit result matches the injected architecture matrix");
+        if (success) {
+            Check(upgrades[0] == (scenario == 12 ? 0u : 1u) && upgrades[1] == (scenario == 0 ? 1u : 0u),
+                "disabled or foreign companion is never migrated or enabled");
+            if (scenario == 4 || scenario == 5 || scenario == 12)
+                Check(status[1].dll_path == initial_status[1].dll_path && status[1].enabled == initial_status[1].enabled, "skipped companion state remains byte-for-byte intended");
+            tx.Finish();
+        } else {
+            Check(Read(f.root + L"\\pulse.exe") == "old-main" && Read(old_path[0]) == "old64" && Read(old_path[1]) == "old32",
+                "dual failure restores shared and both old architecture files");
+            Check(files_restored_first, "registry recovery occurs only after all original files have restored");
+            if (scenario == 1) {
+                Check(restores[0] == 1 && restores[1] == 1 && operations.size() == 4 && operations[2] == std::pair<size_t, bool>{1, false} && operations[3] == std::pair<size_t, bool>{0, false},
+                    "second architecture failure restores companion then first architecture in reverse order");
+            }
+            if (scenario == 3) Check(!status[0].enabled && status[0].dll_path == next_path[0] && restores[0] == 0, "completed migration followed by user disable is not re-enabled");
+            else if (scenario == 11) Check(status[0].dll_path == L"C:\\Concurrent\\PulseDialogAuto64.dll", "post-restore concurrent replacement is preserved and not falsely verified");
+            else Check(status[0].enabled && status[0].dll_path == old_path[0], "first architecture is restored even if the second remains blocked");
+            if (scenario == 6) Check(operations.empty() && status[1].dll_path == L"C:\\Concurrent\\PulseDialogAuto32.dll", "pre-apply foreign change prevents all registry mutations");
+            if (scenario == 10) Check(operations.empty() && !status[1].enabled, "pre-apply user disable remains disabled");
+            if (scenario == 7 || scenario == 13) Check(upgrades[0] == 1 && upgrades[1] == (scenario == 13 ? 1u : 0u), "successful no-op enable cannot falsely commit migration");
+            if (scenario == 2 || scenario == 8 || scenario == 9 || scenario == 11) {
+                Check(GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES, "blocked or unverified recovery retains durable evidence");
+                if (scenario == 2) Check(status[1].dll_path == L"C:\\Concurrent\\PulseDialogAuto32.dll", "failed enable does not overwrite a concurrent foreign registration");
+                if (scenario == 8) Check(restores[1] == 1 && !status[1].enabled, "successful no-op restore remains an explicit recovery failure");
+                no_op_restore = false;
+                if (scenario == 2 || scenario == 9) status[1] = {true, false, 0, old_path[1]};
+                if (scenario == 11) status[0] = {true, false, 0, old_path[0]};
+                DialogLayoutMigration restarted(f.root, true, api);
+                Check(FileTransaction::RecoverInterrupted(f.root, error, [&](std::wstring& failure) { return restarted.Recover(failure); }), "fresh migration object retries the persisted dual journal after files restore");
+            }
+        }
+        Check(GetFileAttributesW((f.root + L"\\.pulse-setup").c_str()) == INVALID_FILE_ATTRIBUTES, "dual transaction evidence clears only after successful recovery or commit");
+        for (size_t i = 0; i < 2; ++i) {
+            DeleteFileW(old_path[i].c_str()); DeleteFileW(next_path[i].c_str());
+            RemoveDirectoryW((f.root + L"\\" + old_dir[i]).c_str()); RemoveDirectoryW((f.root + L"\\" + next_dir[i]).c_str());
+        }
+    }
+    for (unsigned version = 0; version < 4; ++version) {
+        Fixture f(300 + version);
+        const auto name = std::wstring(pulse::dialog_auto::DllName);
+        const auto old_rel = version < 2 ? L"DialogBridge\\" + name : L"DialogBridge\\" + std::wstring(64, L'a') + L"\\" + name;
+        const auto next_rel = version < 2 ? name : L"DialogBridge\\" + std::wstring(64, L'b') + L"\\" + name;
+        const auto old_path = f.root + L"\\" + old_rel, next_path = f.root + L"\\" + next_rel;
+        pulse::dialog_auto::Status status{true, false, 0, version % 2 ? next_path : L"C:\\UserChanged\\different.dll"};
+        unsigned enables = 0;
+        DialogMigrationApi api{[&] { return status; }, [&](const std::wstring& path) { ++enables; status = {true, false, 0, path}; return ERROR_SUCCESS; }};
+        const std::string marker = version < 2 ? (version ? "2\n" : "1\n") : "3\n" + std::string(version % 2 ? "2\n" : "1\n") + WideToUtf8(old_rel) + "\n" + WideToUtf8(next_rel) + "\n";
+        Write(f.root + L"\\.pulse-setup\\dialog-migration", marker);
+        DialogLayoutMigration migration(f.root, true, api); std::wstring error;
+        Check(migration.Recover(error) && enables == (version % 2 ? 1u : 0u), "legacy journal formats one two and three remain recoverable");
+        Check(version % 2 ? status.dll_path == old_path && status.enabled : status.dll_path == L"C:\\UserChanged\\different.dll", "legacy prepared journal preserves changes and attempted journal restores native architecture");
+        DeleteFileW((f.root + L"\\.pulse-setup\\dialog-migration").c_str()); RemoveDirectoryW((f.root + L"\\.pulse-setup").c_str());
+    }
+}
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--dual-architecture") {
+        DualArchitectureTests();
+        std::cout << checks << " checks, " << failures << " failures\n"; return failures ? 1 : 0;
+    }
+    if (argc != 1) return 2;
     {
         const std::wstring app = L"C:\\IsolatedPulse";
         const auto old_version = app + L"\\DialogBridge\\" + std::wstring(64,L'a') + L"\\" + pulse::dialog_auto::DllName;
@@ -49,6 +186,62 @@ int main() {
         status.error=ERROR_ACCESS_DENIED;
         Check(DisableOwnedDialogRegistration(app,status,disable)==ERROR_ACCESS_DENIED && calls==1,
             "uninstall inspection error blocks deletion instead of assuming registration is absent");
+
+        // Exercise RestoreDialogRegistrationsForUninstall with injected state (zero native registry mutations).
+        std::array<UninstallDialogConfigState, 2> cfgs{};
+        std::array<std::array<UninstallDialogClsidState, 2>, 2> clsids{};
+        bool deny_clear = false;
+        UninstallDialogRestoreApi restore_api{
+            [&](Architecture arch, size_t idx, UninstallDialogClsidState& out) -> DWORD {
+                out = clsids[Index(arch)][idx];
+                return ERROR_SUCCESS;
+            },
+            [&](Architecture arch, size_t idx, bool /*force_tree*/) -> DWORD {
+                if (deny_clear) return ERROR_ACCESS_DENIED;
+                clsids[Index(arch)][idx] = {};
+                return ERROR_SUCCESS;
+            },
+            [&](Architecture arch, UninstallDialogConfigState& out) -> DWORD {
+                out = cfgs[Index(arch)];
+                return ERROR_SUCCESS;
+            },
+            [&](Architecture arch, bool clear_dll) -> DWORD {
+                if (clear_dll) { cfgs[Index(arch)].dll_path.clear(); cfgs[Index(arch)].dll_corrupt = false; }
+                return ERROR_SUCCESS;
+            },
+        };
+        const auto other_hash = app + L"\\DialogBridge\\" + std::wstring(64, L'b') + L"\\PulseDialogAuto64.dll";
+
+        // 1) Corrupted DllPath (error 13) + mismatched owned hash in InprocServer32:
+        cfgs[0] = {true, {}, true};
+        clsids[0][0] = {true, L"Pulse.DialogAuto.v1", false, true, other_hash, false};
+        Check(RestoreDialogRegistrationsForUninstall(app, restore_api) == ERROR_SUCCESS &&
+            !clsids[0][0].present && !cfgs[0].dll_corrupt,
+            "uninstall restores dialogs despite corrupted DllPath (error 13) and hash mismatch");
+
+        // 2) Stale owned DllPath in DialogAuto while a third-party app owns the CLSID:
+        cfgs[0] = {true, old_version, false};
+        clsids[0][1] = {true, {}, false, true, L"C:\\ThirdParty\\DialogHook.dll", false};
+        Check(RestoreDialogRegistrationsForUninstall(app, restore_api) == ERROR_SUCCESS &&
+            clsids[0][1].present && clsids[0][1].inproc_dll == L"C:\\ThirdParty\\DialogHook.dll" &&
+            cfgs[0].dll_path.empty(),
+            "uninstall succeeds when Pulse is disabled and preserves third-party CLSID byte-for-byte");
+
+        // 3) Foreign Pulse installation owns both DialogAuto and CLSID:
+        const auto foreign_dll = L"D:\\OtherPulse\\DialogBridge\\" + std::wstring(64, L'c') + L"\\PulseDialogAuto64.dll";
+        cfgs[0] = {true, foreign_dll, false};
+        clsids[0][0] = {true, L"Pulse.DialogAuto.v1", false, true, foreign_dll, false};
+        Check(RestoreDialogRegistrationsForUninstall(app, restore_api) == ERROR_SUCCESS &&
+            clsids[0][0].present && clsids[0][0].inproc_dll == foreign_dll && cfgs[0].dll_path == foreign_dll,
+            "uninstall preserves another Pulse copy's dialog registration");
+
+        // 4) Access denied removing an owned CLSID fails closed so installation files are kept:
+        cfgs[0] = {true, old_version, false};
+        clsids[0][0] = {true, L"Pulse.DialogAuto.v1", false, true, old_version, false};
+        deny_clear = true;
+        Check(RestoreDialogRegistrationsForUninstall(app, restore_api) == ERROR_ACCESS_DENIED &&
+            clsids[0][0].inproc_dll == old_version,
+            "uninstall fails closed when owned CLSID removal is denied");
     }
     {
         Fixture f(99);
@@ -146,6 +339,54 @@ int main() {
         }
         Check(Read(f.root + L"\\DialogBridge\\personal.txt") == "user", "unregistered user file preserved");
         Check(GetFileAttributesW((f.root + L"\\.pulse-setup").c_str()) == INVALID_FILE_ATTRIBUTES, "transaction evidence cleaned only after completion");
+    }
+    {
+        const std::wstring app = L"C:\\IsolatedPulse";
+        Check(IsOwnedDialogDll(app, app + L"\\DialogBridge\\x86\\PulseDialogAuto32.dll", Architecture::X86),
+            "owned helper recognizes DialogBridge x86 layout");
+        Check(IsOwnedDialogDll(app, app + L"\\DialogBridge\\" + std::wstring(64, L'A') + L"\\PulseDialogAuto32.dll", Architecture::X86),
+            "owned helper accepts uppercase 64-hex digest directories");
+        Check(!IsOwnedDialogDll(app, L"C:\\OtherPulse\\DialogBridge\\x86\\PulseDialogAuto32.dll", Architecture::X86),
+            "owned helper rejects paths outside the installation root");
+        Check(!IsOwnedDialogDll(app, app + L"\\DialogBridge\\..\\PulseDialogAuto32.dll", Architecture::X86),
+            "owned helper rejects traversal segments");
+
+        const auto orphan_root = std::filesystem::absolute(L"bench_data").wstring() + L"\\orphan-ownership-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+        CreateDirectoryW(orphan_root.c_str(), nullptr);
+        const std::wstring existing_dir = orphan_root + L"\\existing";
+        CreateDirectoryW(existing_dir.c_str(), nullptr);
+        const std::wstring live_dll = existing_dir + L"\\PulseDialogAuto32.dll";
+        Write(live_dll, "live");
+
+        const std::wstring missing_dir_dll = orphan_root + L"\\missing-dir\\PulseDialogAuto32.dll";
+        const std::wstring missing_leaf_dll = existing_dir + L"\\missing-subdir\\PulseDialogAuto32.dll";
+        const std::wstring missing_in_existing_dir = orphan_root + L"\\PulseDialogAuto32.dll";
+
+        Check(pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, missing_dir_dll}),
+            "active consistent registration with missing directory on fixed drive is reclaimed");
+        Check(pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, missing_leaf_dll}),
+            "active consistent registration with missing nested directory is reclaimed");
+        Check(pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, missing_in_existing_dir}),
+            "active consistent registration with missing leaf DLL in existing directory is reclaimed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, live_dll}),
+            "active registration with live DLL on disk is never treated as orphaned");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {false, false, 0, missing_dir_dll}),
+            "disabled registration with missing directory is not reclaimed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, true, 0, missing_dir_dll}),
+            "conflicting registration with missing directory fails closed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, ERROR_ACCESS_DENIED, missing_dir_dll}),
+            "registration inspect error fails closed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, orphan_root + L"\\missing-dir\\PulseDialogAuto64.dll"}),
+            "mismatched architecture DLL filename fails closed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, orphan_root + L"\\..\\missing\\PulseDialogAuto32.dll"}),
+            "noncanonical traversal path fails closed");
+        Check(!pulse::dialog_auto::IsOrphanedMissingPulseDialogDll(Architecture::X86, {true, false, 0, L"\\\\server\\share\\PulseDialogAuto32.dll"}),
+            "UNC path is never treated as local reclaimed orphan");
+
+        DeleteFileW(live_dll.c_str());
+        RemoveDirectoryW(existing_dir.c_str());
+        RemoveDirectoryW(orphan_root.c_str());
     }
     std::cout << checks << " checks, " << failures << " failures\n";
     return failures ? 1 : 0;

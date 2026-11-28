@@ -1,5 +1,34 @@
 # 第三方打开 / 保存兼容性验收
 
+## 2026-11-19 非 Adobe 入口复核
+
+**补充：打开窗口的问号筛选。** 在 28 个本地文件样本上，实际读取 Windows 打开窗口的列表；16 个模式（含混合列表）与 Shell 匹配函数返回的文件集合逐项相同。比如 `Makefile?` 列出 `Makefile`、`Makefile1`，排除 `Makefile12`；`frame-??.png` 中的两个问号还可以匹配一个占两个 UTF-16 码元的字符。Pulse 对声明了建议性筛选的 Open 调用使用这项语义；扩展名含 `?` 时保留调用方默认后缀，不遍历后续类型猜测。未将规则推广到 Save。[实机对照与回归记录](../bench_data/non-adobe-next-20261119/VERIFICATION.txt)
+
+| 实际调用者和版本 | 已核验的结果 | 尚未证明 |
+|---|---|---|
+| Excel LTSC 2024 x64，安装版 Pulse 1.0.61 | Excel 的“另存为”经 Pulse 返回，实际写出工作簿；关闭并重新只读打开后，标记、公式和结果 42 均正确。同一 Excel PID 有保存成功记录。 | 不是未安装的工作树二进制；不涉及覆盖已有工作簿。 |
+| Edge 157，本地 HTML 文件输入 | Windows 原生窗口保留浏览器的移动设备入口，下方显示 Pulse 跳转栏。页面第一次选取后读回专用样本的完整 51 字节。 | 不是 Pulse 完整接管；第二次未完成，下载另存未测。 |
+| 工程文件宿主，x86 / x64 工作树 | 通过真实 Pulse 窗口打开 `Makefile;report-*.csv;CMakeLists.txt`：列表选取只返回三个匹配条目；手输两个名字得到 `probe.csv` 和显式的 `explicit.dat`。两种位数均核对有序 Shell 结果。 | 调用契约验收，不代表特定 CAD、IDE 或浏览器版本通过。 |
+
+在提供器能力相同的 14 项 Windows 调用对照中，能交给 Pulse 的从 5 项增至 14 项。保存另以 16 个真实窗口场景比较最终路径、切换类型、覆盖否决和取消后的类型索引；一次早期的访问被拒绝保留在报告中。这里的分母是指定样本，不是软件覆盖率。
+
+证据：[实际应用与版本](../bench_data/non-adobe-app-roundtrip-20261119/VERIFICATION.md)、[筛选与窗口返回](../bench_data/non-adobe-compat-20261119/VERIFICATION.txt)、[保存文件名与取消](../bench_data/save-filter-parity-20261119/VERIFICATION.txt)、[旧式 A/W 打开和保存](../bench_data/legacy-flags-20261119/VERIFICATION.txt)。下文按日期保留历史状态。
+
+## 2026-11-12 通用接口增量验收
+
+以下是隔离宿主的接口与真实 Pulse 窗口验收，不自动升级下方第三方应用历史表。
+
+- 动态标题、按钮/文件名标签、文件名、默认扩展名及控件项目增删：契约 139/0；同名 `SetFileName` 保留原生 `S_FALSE`，不再误关窗口或污染下一次 Show。
+- SaveAsItem 与属性组合：契约 110/0、真实窗口 38/0；属性模型 86/0，覆盖类型保真、无效编辑、取消恢复及只读字段。只读字段在本地/远程宽窗各 21/0、窄窗各 22/0，已检查截图及滚动后的完整内容。
+- 首帧之前的确认请求：合并为准备完成后的提交，保留 FileOk veto；提前取消仍立即结束。定向窗口 11/0，旧式模板早期提交旧版 4 失败、新版 4 通过。
+- x64 本地旧式 Hook，以及附加式 handle/resource 模板：A/W 接受、veto、取消和真实子控件交互各 4/4。晚选超长路径 A/W 2/2，正确返回 `FNERR_BUFFERTOOSMALL`、所需长度且不越界，不返回截断成功。
+- 文件系统 NavigationRoot：本地/远程真实树各 7/0；旧端能力拒绝 2/0；COM 契约 24/0；队列 11/0、协议 166/0。原生实测允许用户 Up 越过根，因此这里是导航树根，不是路径访问边界。
+- 接管历史区分“已显示后取消/关闭”与“返回选中文件”，34/0。
+
+仍保留原生的边界：虚拟 Shell 根、要求重排原生控件的 stc32 模板、带 Hook 的多选，以及薄 x86 组件无法同进程承载的自定义窗口。`SetCollectedProperties(..., TRUE)` 的默认字段来源和有界后台解析已验证，但完整动态 schema 接入未完成，尚未开放。UNC/慢盘的 NavigationRoot 本机实跑仍缺失，不以协议往返测试替代。
+
+证据目录：`bench_data/dialog-compat-20261112`、`bench_data/legacy-hook-template-20261112`、`bench_data/property_schema`，以及 `bench_data/navigation-root-*.log`。旧失败日志保留，未计作通过。
+
 2026-10-31 工作树的共性契约实现与实际测试见 [原生对话框契约进展](native-dialog-contract-progress-2026-10-31.md)。下列应用表保留历史测试包证据，不自动升级为当前版本通过。
 
 固定测试包：既有 R24 记录保留；微信当前使用 20261030-r27-x64，QQ R40用户确认透明闪现及换位已解决，显示与取消通过；Excel已通过同一R40包启动待测。日期：2026-10-30。

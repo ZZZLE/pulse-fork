@@ -14,6 +14,22 @@ struct OpsManagerAuditAccess {
             status.phase = active ? OpPhase::Running : OpPhase::Completed;
         });
     }
+    static void GeneratedBuiltin(OpsManager& manager, bool active) {
+        {
+            std::lock_guard<std::mutex> lock(manager.mutex_);
+            if (active) {
+                OpsManager::QueueItem item;
+                item.seq = 9999;
+                item.req.type = OpType::Move;
+                item.req.generated_output = true;
+                item.req.is_undo = false;
+                manager.active_item_ = std::move(item);
+            } else {
+                manager.active_item_.reset();
+            }
+        }
+        Builtin(manager, active);
+    }
 };
 }
 int main() {
@@ -49,6 +65,47 @@ int main() {
     check(manager.Status().task_id == second && manager.RecentStatuses().front().task_id == second, "newest external terminal is visible in status and history");
     OpsManagerAuditAccess::Builtin(manager, true); OpsManagerAuditAccess::Builtin(manager, false);
     check(manager.Status().task_id == 9999, "newer builtin terminal takes display priority");
+    {
+        // A plugin task waiting on a host operation stands in for it while that runs.
+        const auto waiting = manager.CreateExternalTask(L"Extract a.7z", L"Archive", L"a.7z", L"D:\\out", {L"Unpack", L"Write"});
+        OpStatus step = progress; step.external_step = 2; step.external_linked = 9999; step.external_note = L"undoable";
+        manager.UpdateExternalTask(waiting, step);
+        OpsManagerAuditAccess::Builtin(manager, true);
+        const auto shown = manager.Status();
+        check(shown.task_id == waiting && shown.external_step == 2 && shown.source_label == L"a.7z" &&
+              shown.destination_label == L"D:\\out" && shown.external_note == L"undoable", "linked plugin task stands in for its running operation");
+        step.external_linked = 0; manager.UpdateExternalTask(waiting, step);
+        check(manager.Status().task_id == 9999, "unlinked running operation shows itself");
+        OpsManagerAuditAccess::GeneratedBuiltin(manager, true);
+        const auto bridged = manager.Status();
+        check(bridged.task_id == waiting && bridged.external_linked == 9999,
+              "active generated_output staging bridges single external task before link arrives");
+        OpsManagerAuditAccess::GeneratedBuiltin(manager, false);
+        OpsManagerAuditAccess::Builtin(manager, false);
+        int calls = 0; std::string picked;
+        manager.SetExternalTaskActionHandler(waiting, [&](const std::string& action) { ++calls; picked = action; });
+        check(!manager.InvokeExternalTaskAction(waiting, "retry") && calls == 0, "actions wait until the task has ended");
+        OpStatus failed = step; failed.external_actions = {{"retry", L"Retry", true}};
+        manager.FinishExternalTask(waiting, ExternalOutcome::Failed, failed);
+        const auto final_status = manager.FinalStatus(waiting);
+        check(final_status && final_status->external_actions.size() == 1 && final_status->external_linked == 0,
+              "terminal snapshot keeps actions and drops the link");
+        check(manager.InvokeExternalTaskAction(waiting, "retry") && !manager.InvokeExternalTaskAction(waiting, "retry") &&
+              calls == 1 && picked == "retry", "an ended task's action runs once");
+    }
+    {
+        const auto graphed = manager.CreateExternalTask(L"Extract bundle.zip", L"Archive");
+        OpStatus p1; p1.percent = 30; p1.total_bytes = 200; p1.transferred_bytes = 60;
+        manager.UpdateExternalTask(graphed, p1);
+        Sleep(20);
+        OpStatus p2; p2.percent = 100; p2.total_bytes = 200; p2.transferred_bytes = 200;
+        manager.FinishExternalTask(graphed, ExternalOutcome::Completed, p2);
+        const auto finished = manager.FinalStatus(graphed);
+        const auto graph = manager.SpeedGraph(graphed);
+        check(finished && finished->started_tick != 0 && finished->ended_tick >= finished->started_tick &&
+              graph.points.size() >= 2,
+              "external task records started/ended ticks and speed graph across finish");
+    }
     for (int i = 0; i < 20; ++i) { const auto id = manager.CreateExternalTask(L"Task", L"Test"); manager.FinishExternalTask(id, ExternalOutcome::Completed); }
     check(!manager.FinalStatus(first) && manager.RecentStatuses().size() == 16, "external terminal history retains at most sixteen");
     for (int i = 0; i < 32; ++i) check(manager.CreateExternalTask(L"Task", L"Test") != 0, "external active task within bound accepted");

@@ -137,6 +137,7 @@ std::wstring NameHowLabel(app::NameMatchHow how) {
     switch (how) {
     case app::NameMatchHow::StartsWith: return l10n::Get(I::AdvSearchStarts);
     case app::NameMatchHow::Exact: return l10n::Get(I::AdvSearchExact);
+    case app::NameMatchHow::Regex: return l10n::Get(I::AdvSearchRegex);
     default: return l10n::Get(I::AdvSearchContains);
     }
 }
@@ -223,7 +224,6 @@ constexpr SvgPart kIcoFolder[] = {
 constexpr SvgPart kIcoFolderAdd[] = {
     {"M1.8 4.5a1 1 0 0 1 1-1h3.4l1.4 1.5h5.6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H2.8a1 1 0 0 1-1-1z", false, 1.3f, 1.0f},
     {"M8 7.5v3.5M6.3 9.2H9.7", false, 1.3f, 1.0f}};
-constexpr SvgPart kIcoX[] = {{"M3 3l8 8M11 3l-8 8", false, 1.3f, 1.0f}};
 constexpr SvgPart kIcoChevRight[] = {{"M4.5 2.5L8 6l-3.5 3.5", false, 1.3f, 1.0f}};
 constexpr SvgPart kIcoChevDown[] = {{"M2.5 4.5L6 8l3.5-3.5", false, 1.3f, 1.0f}};
 
@@ -256,6 +256,12 @@ public:
                                          const std::wstring& value) {
         spec_ = std::move(spec);
         content_mode_ = !spec_.content.empty();
+        if (field >= 10) {
+            more_ = true;
+            dark_ = (field % 2) != 0;
+            scale_ = field < 12 ? 1.0f : field < 14 ? 1.5f : 2.0f;
+            accent_ = D2D1::ColorF(0.15f, 0.4f, 0.9f);
+        }
         WNDCLASSEXW wc{sizeof(wc)};
         wc.hInstance = GetModuleHandleW(nullptr); wc.lpfnWndProc = WndProc;
         wc.lpszClassName = kClass;
@@ -267,7 +273,33 @@ public:
         if (field == 1) SetWindowTextW(edit_kw_, value.c_str());
         if (field == 2) SetWindowTextW(edit_exts_, value.c_str());
         if (field == 3) SetWindowTextW(edit_exclude_, value.c_str());
-        SendMessageW(hwnd_, WM_COMMAND, IDOK, 0);
+        if (field == 4 || field == 5) {
+            SetWindowTextW(edit_kw_, value.c_str());
+            Click(kHitNameHow + static_cast<int>(app::NameMatchHow::Regex));
+            if (field == 5) SetWindowTextW(edit_kw_, L"^alpha");
+        }
+        if (field >= 10) {
+            SetWindowPos(hwnd_, nullptr, 0, 0, static_cast<int>(kDlgW * scale_),
+                         static_cast<int>(std::ceil(height_px_)), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            snapshot_path_ = value;
+            Render();
+            bool valid = snapshot_saved_;
+            int regex_pills = 0;
+            for (const auto& pill : pills_) {
+                if (pill.id == kHitNameHow + static_cast<int>(app::NameMatchHow::Regex)) {
+                    ++regex_pills;
+                    valid = valid && pill.selected && pill.bounds.left >= card_[1].left &&
+                        pill.bounds.right <= card_[1].right && pill.bounds.bottom <= card_[1].bottom;
+                }
+            }
+            for (size_t i = 0; i < pills_.size(); ++i) for (size_t j = i + 1; j < pills_.size(); ++j) {
+                const auto& a = pills_[i].bounds; const auto& b = pills_[j].bounds;
+                if (std::min(a.right, b.right) > std::max(a.left, b.left) &&
+                    std::min(a.bottom, b.bottom) > std::max(a.top, b.top)) valid = false;
+            }
+            result_.accepted = valid && regex_pills == 1;
+            result_.query = preview_;
+        } else SendMessageW(hwnd_, WM_COMMAND, IDOK, 0);
         if (IsWindow(hwnd_)) DestroyWindow(hwnd_);
         hwnd_ = nullptr;
         return result_;
@@ -294,9 +326,12 @@ public:
         if (!GetClassInfoExW(wc.hInstance, kClass, &wc)) RegisterClassExW(&wc);
 
         const int width = static_cast<int>(kDlgW * scale_);
+        // Born on the owner's monitor: CW_USEDEFAULT lands on the primary one and
+        // the move to a screen of another scale rescaled the size (WM_DPICHANGED).
+        const POINT origin = OwnedWindowOrigin(owner, width, static_cast<int>(560.0f * scale_));
         hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, kClass,
             l10n::Get(I::AdvancedSearch).c_str(),
-            WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, width,
+            WS_POPUP | WS_SYSMENU, origin.x, origin.y, width,
             static_cast<int>(560.0f * scale_), owner, nullptr, wc.hInstance, this);
         if (!hwnd_) return result_;
         Recompute(false);
@@ -398,7 +433,7 @@ private:
     }
 
     D2D1_RECT_F R(float x, float y, float w, float h) const { return DipRect(scale_, x, y, w, h); }
-    D2D1_RECT_F CloseRect() const { return R(kDlgW - 8 - 36, 8, 36, 36); }
+    D2D1_RECT_F CloseRect() const { return R(kDlgW - 46, 0, 46, kTitleH); }
 
     // ---- state helpers -------------------------------------------------------------
 
@@ -498,6 +533,10 @@ private:
 
     std::wstring CountLine(bool& danger) const {
         danger = false;
+        if (regex_error_) {
+            danger = true;
+            return l10n::Get(I::AdvSearchRegexInvalid);
+        }
         if (scope_error_) {
             danger = true;
             return l10n::Get(I::AdvancedSearchNeedScopeMessage);
@@ -572,7 +611,7 @@ private:
             const float w1 = X(12 + 14 + 6 + 12) + Measure(b, kF13);
             const float mw = w0 + w1 + X(6);
             const D2D1_RECT_F close = CloseRect();
-            seg_rect_ = D2D1::RectF(close.left - X(6) - mw, X(9), close.left - X(6), X(9 + 34));
+            seg_rect_ = D2D1::RectF(close.left - X(8) - mw, X(9), close.left - X(8), X(9 + 34));
             mode_rect_[0] = D2D1::RectF(seg_rect_.left + X(3), seg_rect_.top + X(3), seg_rect_.left + X(3) + w0,
                                         seg_rect_.bottom - X(3));
             mode_rect_[1] = D2D1::RectF(mode_rect_[0].right, mode_rect_[0].top, mode_rect_[0].right + w1,
@@ -685,7 +724,7 @@ private:
                 separators_.push_back(row_top);
             }
             std::vector<Pill> row;
-            for (int v = 0; v < 3; ++v) {
+            for (int v = 0; v < (content_mode_ ? 3 : 4); ++v) {
                 if (content_mode_) {
                     const auto mode = static_cast<index::ContentMatchMode>(v);
                     row.push_back({{}, ContentModeLabel(mode), Ico::None, kHitContentMode + v, spec_.content_mode == mode, true});
@@ -722,7 +761,10 @@ private:
     D2D1_COLOR_F EditForeground() const { return ColorFromRef(EditTextColor(dark_)); }
     D2D1_COLOR_F EditBackground() const { return ColorFromRef(EditBackColor(dark_)); }
 
-    I KeywordHint() const { return content_mode_ ? I::AdvKeywordContentHint : I::AdvKeywordNameHint; }
+    I KeywordHint() const {
+        if (content_mode_) return I::AdvKeywordContentHint;
+        return spec_.name_how == app::NameMatchHow::Regex ? I::AdvSearchRegexHint : I::AdvKeywordNameHint;
+    }
     I ExcludeHint() const { return content_mode_ ? I::AdvExcludeContentHint : I::AdvExcludeNameHint; }
 
     HWND CreateField(int id, const std::wstring& text, I cue_id) {
@@ -847,6 +889,7 @@ private:
         if (!edits_ready_) return;
         SyncFromEdits();
         preview_ = app::CompileSearchQuery(spec_);
+        regex_error_ = index::QueryHasInvalidRegex(index::ParseQuery(preview_));
         const auto split = app::SplitSearchQueryText(preview_);
         scope_error_ = split.content.present() && app::ContentSearchNeedsScope(split) &&
                        spec_.location == app::LocationScope::Indexed;
@@ -865,7 +908,7 @@ private:
     }
 
     void RequestCountSoon() {
-        if (!hwnd_ || !count_request_ || content_mode_ || scope_error_) {
+        if (!hwnd_ || !count_request_ || content_mode_ || scope_error_ || regex_error_) {
             count_pending_ = false;
             return;
         }
@@ -973,6 +1016,7 @@ private:
             }
         } else if (id >= kHitNameHow && id < kHitNameHow + 100) {
             spec_.name_how = static_cast<app::NameMatchHow>(id - kHitNameHow);
+            SetCue(edit_kw_, KeywordHint());
         } else if (id >= kHitContentMode && id < kHitContentMode + 100) {
             spec_.content_mode = static_cast<index::ContentMatchMode>(id - kHitContentMode);
         }
@@ -982,7 +1026,7 @@ private:
     void Complete(bool accepted) {
         if (accepted) {
             Recompute();
-            if (scope_error_) return;
+            if (scope_error_ || regex_error_) return;
             result_.accepted = true;
             result_.query = preview_;
         }
@@ -1279,9 +1323,10 @@ private:
                 Text(l10n::Get(mode_labels[i]), kF13, D2D1::RectF(r.left + X(32), r.top, r.right, r.bottom), c);
             }
             const D2D1_RECT_F close = CloseRect();
-            if (hover_ == kHitClose || pressed_ == kHitClose)
-                Fill(close, X(8), pressed_ == kHitClose ? Mix(pal_.hover, pal_.text, 0.06f) : pal_.hover);
-            Icon(kIcoX, 14, close.left + X(11), close.top + X(11), X(14), pal_.text2);
+            fluent::ControlState close_state{};
+            close_state.hovered = hover_ == kHitClose;
+            close_state.pressed = pressed_ == kHitClose && hover_ == kHitClose;
+            painter_.DrawTitleBarButton(close, fluent::TitleBarButtonRole::Close, {}, close_state);
 
             // Fields (shared look: focus = 2 px accent line at the bottom).
             auto field = [&](const D2D1_RECT_F& bounds, HWND edit, I placeholder) {
@@ -1365,12 +1410,12 @@ private:
             search.kind = fluent::ButtonKind::Primary;
             search.state.hovered = hover_ == kHitSearch;
             search.state.pressed = pressed_ == kHitSearch;
-            search.state.enabled = !scope_error_;
+            search.state.enabled = !scope_error_ && !regex_error_;
             painter_.DrawButton(search);
             brush_->Release();
             brush_ = nullptr;
         }
-#ifdef PULSE_WITH_SELFTEST
+#if defined(PULSE_WITH_SELFTEST) || defined(PULSE_ADVANCED_QUERY_TEST)
         if (!snapshot_path_.empty()) {
             // A flip-chain back buffer is no longer the submitted frame after Present.
             const HRESULT drawn = compositor_.Dc()->EndDraw();
@@ -1429,7 +1474,7 @@ private:
             if (wparam == kCountTimer) {
                 KillTimer(hwnd_, kCountTimer);
                 count_timer_ = false;
-                if (count_request_ && !content_mode_ && !scope_error_) {
+                if (count_request_ && !content_mode_ && !scope_error_ && !regex_error_) {
                     counted_query_ = preview_;
                     count_request_(hwnd_, preview_);
                 }
@@ -1489,6 +1534,7 @@ private:
         case WM_NCHITTEST: {
             // The title bar drags, except over the close button and the mode switch.
             const LRESULT hit = BorderlessHitTest(hwnd_, lparam, kTitleH * scale_, CloseRect());
+            if (hit >= HTLEFT && hit <= HTBOTTOMRIGHT) return HTCLIENT;
             if (hit == HTCAPTION) {
                 POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
                 ScreenToClient(hwnd_, &pt);
@@ -1612,12 +1658,15 @@ private:
     bool done_ = false;
     bool edits_ready_ = false;
     bool scope_error_ = false;
+    bool regex_error_ = false;
     float scale_ = 1.0f;
     bool selection_outline_ = false;
     ULONGLONG next_recovery_ = 0;
     UINT recovery_delay_ = 250;
 #ifdef PULSE_WITH_SELFTEST
     unsigned recovery_attempts_ = 0;
+#endif
+#if defined(PULSE_WITH_SELFTEST) || defined(PULSE_ADVANCED_QUERY_TEST)
     std::wstring snapshot_path_;
     bool snapshot_saved_ = false;
 #endif

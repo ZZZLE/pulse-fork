@@ -7,6 +7,7 @@
 #include "ffmpeg_playback.h"
 #include "snack_style.h"
 #include "typography.h"
+#include "ui_motion.h"
 #include "../common/localization.h"
 #include "../common/text_format.h"
 #include <algorithm>
@@ -138,7 +139,7 @@ bool GuessBare(const std::wstring& path, const std::wstring& name) {
     const size_t dot = name.find_last_of(L'.');
     std::wstring ext = dot == std::wstring::npos ? std::wstring() : name.substr(dot);
     for (auto& c : ext) c = static_cast<wchar_t>(towlower(c));
-    for (const wchar_t* bare : {L".exe", L".dll", L".msi", L".sys", L".zip", L".rar", L".7z", L".cab",
+    for (const wchar_t* bare : {L".lnk", L".exe", L".dll", L".msi", L".sys", L".zip", L".rar", L".7z", L".cab",
                                 L".iso", L".tar", L".gz", L".tgz", L".bz2", L".xz", L".zst"})
         if (ext == bare) return true;
     return false;
@@ -290,6 +291,15 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
         hover_card_w_ = hover_well_h_ = 0.0f;
     }
     if (view.video && hover_shape_kind_ == kShapeBare) hover_shape_kind_ = kShapeGuess;  // the loop still plays
+    if (hover_shape_kind_ == kShapeGuess) {
+        uint32_t cached_w = 0, cached_h = 0;
+        if ((hover_cache_.CachedDimensions(view.path, view.modified, view.size, cached_w, cached_h) ||
+             thumbnail_cache_.CachedDimensions(view.path, view.modified, view.size, cached_w, cached_h)) &&
+            cached_w && cached_h) {
+            hover_shape_kind_ = kShapePicture;
+            hover_shape_aspect_ = static_cast<float>(cached_w) / static_cast<float>(cached_h);
+        }
+    }
     const bool bare = hover_shape_kind_ == kShapeBare;
     const bool textual_shape = hover_shape_kind_ == kShapeText;
     const int laid_kind = hover_shape_kind_;
@@ -338,7 +348,7 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
     // Eased toward a new shape (the preview arrived, Ctrl went down or up);
     // a new card opens at its size.
     const unsigned long long now = GetTickCount64();
-    if (view.instant || hover_card_w_ <= 0.0f) {
+    if (view.instant || !motion::SystemAnimationsEnabled() || hover_card_w_ <= 0.0f) {
         hover_card_w_ = target_w;
         hover_well_h_ = target_h;
     } else {
@@ -416,7 +426,7 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
     const bool video_showing = !hover_video_failed_ && video.ready && SUCCEEDED(video.error) &&
         (!video.missing_decoder || video.ffmpeg) &&
         (video.ffmpeg ? picture && picture->width && picture->height : video.position > 0);
-    uint32_t decoded_w = 0, decoded_h = 0;
+    uint32_t decoded_w = 0, decoded_h = 0, source_w = 0, source_h = 0;
     std::wstring preview_text;
     // Office documents ask for the thumbnail kind of preview: the embedded
     // or shell thumbnail, else the first-page sketch. The details kind only
@@ -439,7 +449,7 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
         view.modified, view.size, show_well ? 1.0f : 0.0f, &preview_text, nullptr, nullptr,
         !OfficeDocument(view.name), nullptr, nullptr, nullptr, nullptr, nullptr,
         animation_frame, &animation_count, &animation_delay, nullptr,
-        &decoded_w, &decoded_h);
+        &decoded_w, &decoded_h, &source_w, &source_h);
     if (!view.video && !view.instant) {
         if (result == PreviewDrawResult::Bitmap)
             hover_image_animation_.Commit(animation_count, animation_delay, animation_now);
@@ -447,7 +457,7 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
             const auto fallback = hover_cache_.Draw(dc, content, view.path, view.attrs, 1024u, 1,
                 view.modified, view.size, show_well ? 1.0f : 0.0f, nullptr, nullptr, nullptr, true,
                 nullptr, nullptr, nullptr, nullptr, nullptr, hover_image_animation_.Current(),
-                nullptr, nullptr, nullptr, &decoded_w, &decoded_h);
+                nullptr, nullptr, nullptr, &decoded_w, &decoded_h, &source_w, &source_h);
             if (result != PreviewDrawResult::Pending) hover_image_animation_.Stop();
             if (fallback == PreviewDrawResult::Bitmap) result = fallback;
         }
@@ -462,9 +472,11 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
     hover_cache_.Properties(view.path, view.attrs, 1, view.modified, view.size, properties);
     // What this frame learned of the shape; the next frame eases to it.
     if (result == PreviewDrawResult::Bitmap && decoded_w && decoded_h) {
+        const uint32_t sw = source_w && source_h ? source_w : decoded_w;
+        const uint32_t sh = source_w && source_h ? source_h : decoded_h;
         hover_shape_kind_ = kShapePicture;
-        if (!view.video || hover_shape_aspect_ <= 0.0f)
-            hover_shape_aspect_ = static_cast<float>(decoded_w) / static_cast<float>(decoded_h);
+        if (!(video.width && video.height))
+            hover_shape_aspect_ = static_cast<float>(sw) / static_cast<float>(sh);
     } else if (textual && result != PreviewDrawResult::Hex) {
         hover_shape_kind_ = kShapeText;
     } else if (result != PreviewDrawResult::Pending && !view.video) {
@@ -605,7 +617,7 @@ void MainRenderer::DrawHoverPreview(const HoverPreviewView& view, const D2D1_REC
         dc->PushAxisAlignedClip(track, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         fill(D2D1::RectF(head, track.top, head + seg, track.bottom), 1.0f * s, palette.accent);
         dc->PopAxisAlignedClip();
-        hover_frame_ms_ = 33;
+        if (motion::SystemAnimationsEnabled()) hover_frame_ms_ = 50;
     }
 
     // Still easing, or this frame learned a new shape: another frame soon.
@@ -825,7 +837,7 @@ void MainRenderer::DrawHoverFolderCard(const HoverPreviewView& view, const D2D1_
             dc->PushAxisAlignedClip(track, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             fill(D2D1::RectF(head, track.top, head + seg, track.bottom), 1.0f * s, palette.accent);
             dc->PopAxisAlignedClip();
-            hover_frame_ms_ = 33;
+            if (motion::SystemAnimationsEnabled()) hover_frame_ms_ = 50;
         } else if (mosaic) {
             const uint32_t pixels = tile_w <= 120.0f ? 128u : 256u;
             ComPtr<ID2D1Factory> factory;

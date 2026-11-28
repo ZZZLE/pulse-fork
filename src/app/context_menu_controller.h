@@ -48,6 +48,7 @@ public:
         std::function<void(const std::wstring&, const std::wstring&)> execute_verb;
         std::function<void(const std::wstring&, const std::wstring&)> open_with_app;
         std::function<void(const std::wstring&, const std::wstring&)> execute_command;
+        std::function<void(const std::vector<std::wstring>&, const std::wstring&, bool)> execute_shell_verb;
     };
     struct QueryCompletion {
         bool accepted = false;
@@ -83,6 +84,9 @@ public:
     std::vector<ui::FluentMenuItem> ReconcileDisplay(ContextMenuPrefs& prefs, bool& prefs_changed,
                                                      uint64_t now);
     void CommitDisplay(std::vector<ui::FluentMenuItem> shown);
+    bool TryReplaceBaseFlyout(const std::wstring& text,
+        std::vector<ui::FluentMenuItem> children, ContextMenuPrefs& prefs,
+        const std::function<bool(std::vector<ui::FluentMenuItem>)>& accept);
     // True while shell rows can still arrive that the first frame could not
     // predict: no stored layout for the key, a handler that never finished
     // under it, or static verbs still being read for the first time. Such
@@ -124,6 +128,9 @@ public:
     static constexpr uint32_t kPredictedIdFirst = 0x7F00;
     static constexpr uint32_t kPredictedIdLast = 0x7FFF;
     bool SeedComItemsFromCache();
+    // Fills com_items_ for a file type with no layout yet from the rows every
+    // file shows (an extensionless file's layout, or what all types share).
+    bool BorrowComRows(bool multi);
 
     // Persistent layout (ctx_layout_cache.h). Rows are kept with the item
     // names templated; SeedComItemsFromCache fills in the current names.
@@ -164,11 +171,17 @@ public:
     std::map<std::wstring, std::vector<std::wstring>> ComHandlerLabels() const;
 
     void OpenMenu(std::vector<ui::FluentMenuItem> base_items);
+    // A deferred provider may add rows, but may not reposition existing rows.
+    void DeferBaseItems(std::function<std::vector<ui::FluentMenuItem>()> resolve);
+    bool AppendDeferredBaseItems();
+    bool DeferredBaseItemsPending() const noexcept { return deferred_base_items_pending_; }
     void NotePatchedDisplay() { menu_com_items_ = com_items_; menu_static_verbs_ = static_verbs_; }
     void CloseMenu() noexcept {
         menu_open_ = false;
         shown_.clear();
         may_grow_at_open_ = false;
+        deferred_base_items_ = {};
+        deferred_base_items_pending_ = false;
     }
     bool menu_open() const noexcept { return menu_open_; }
     const std::vector<ui::FluentMenuItem>& base_items() const noexcept {
@@ -192,6 +205,8 @@ private:
                                             uint32_t id) const;
     uint32_t FindLiveComId(const std::wstring& text) const;
     uint32_t FindLiveComId(const std::wstring& verb, const std::wstring& text) const;
+    uint32_t ResolveLiveComId(const ops::ShellMenuItem& snapshot,
+                              const std::wstring& parent_key) const;
 
     uint32_t token_ = 0;
     std::vector<std::wstring> paths_;
@@ -208,6 +223,8 @@ private:
     bool display_snapshot_valid_ = false;
     std::wstring extension_;
     std::vector<ui::FluentMenuItem> base_items_;
+    std::function<std::vector<ui::FluentMenuItem>()> deferred_base_items_;
+    bool deferred_base_items_pending_ = false;
     std::vector<ui::FluentMenuItem> shown_;  // rows on screen (BuildOpenDisplay)
     bool may_grow_at_open_ = false;          // MayGrowAfterOpen at the first frame
     uint64_t late_since_ = 0;                // first withheld late row (0 = none)
@@ -247,6 +264,7 @@ private:
     std::unordered_map<std::wstring, uint64_t> static_read_at_; // last enumeration request
     uint32_t cache_generation_ = 0;  // bumped by InvalidateCaches()
     uint64_t query_started_at_ = 0;
+    uint32_t query_cache_generation_ = 0;
     CtxMenuTiming timing_;
     bool timing_active_ = false;
     uint64_t opened_at_ = 0;

@@ -29,6 +29,96 @@ bool NativeReasonIs(const ContractDecision& d, NativeReason reason) {
 }
 }
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--shell-filter-negative") {
+        auto calls = Baseline(); auto filter = Text(Setting::ShellFilter); filter.value = 1; calls.push_back(filter);
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, calls, Id()), NativeReason::ShellFilter), "active unsupported Shell filter retains its explicit native-only reason");
+        calls.back().value = 0;
+        Check(PrepareFileDialogContract(DialogFactory::Open, calls, Id()).request.has_value(), "successful null Shell filter clear is not misclassified as an active unsupported filter");
+        std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--save-as-item") {
+        auto calls = Baseline(DialogFactory::Save); auto item = Text(Setting::SaveAsItem); item.value = 1; calls.push_back(item);
+        PreparationContext context; context.native_save_defaults_supported = true;
+        context.resolved_initial_directory = u"C:\\owned\\source"; context.resolved_save_as_filename = u"source.txt";
+        auto prepare = [&](const PreparationContext& value) { return PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, value); };
+        Check(!prepare(context).request, "SaveAsItem path strings alone never authorize the Shell identity contract");
+        context.filesystem_save_as_item_owned = true;
+        auto decision = prepare(context);
+        Check(decision.request && RuntimeLocalSaveContractCertified(decision), "owned plain filesystem initial-item contract uses existing certified Save path");
+        Check(decision.request && std::get<wire::Request>(decision.request->body).initial_directory == u"C:\\owned\\source" &&
+            std::get<wire::Request>(decision.request->body).filename == u"source.txt", "native effective folder/name evidence overrides earlier independent setters");
+        Check(!PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::None, context).request, "SaveAsItem never enters an unspecified access policy");
+        auto missing = context; missing.resolved_save_as_filename.reset(); Check(!prepare(missing).request, "missing native filename observation keeps native");
+        missing = context; missing.resolved_initial_directory.reset(); Check(!prepare(missing).request, "missing native folder observation keeps native");
+        auto bad = context; bad.resolved_save_as_filename = u"a\\b.txt"; Check(!prepare(bad).request, "unsupported effective filename never crosses provider");
+        calls.push_back(Text(Setting::FileName, u"later.txt")); context.resolved_save_as_filename = u"native-later.txt";
+        Check(prepare(context).request && std::get<wire::Request>(prepare(context).request->body).filename == u"native-later.txt", "complete native getter state controls later-setter precedence");
+        calls.push_back(Text(Setting::SaveAsItem)); context.resolved_save_as_filename = u"";
+        Check(prepare(context).request && std::get<wire::Request>(prepare(context).request->body).filename.empty(), "successful nullable clear removes old initial filename");
+        calls.push_back(Text(Setting::SaveProperties)); context.save_properties_owned = true;
+        Check(prepare(context).request && RuntimeLocalSaveContractCertified(prepare(context)), "owned filesystem seed combines with independently owned metadata store");
+        auto unowned = context; unowned.save_properties_owned = false;
+        Check(NativeReasonIs(prepare(unowned), NativeReason::SaveMetadata), "SaveAsItem never authorizes an unowned metadata store");
+        for (const bool metadata_first : {false, true}) {
+            auto combined = Baseline(DialogFactory::Save);
+            auto source = Text(Setting::SaveAsItem); source.value = 1;
+            if (metadata_first) combined.push_back(Text(Setting::SaveProperties));
+            combined.push_back(source);
+            if (!metadata_first) combined.push_back(Text(Setting::SaveProperties));
+            auto owned = context; owned.resolved_save_as_filename = u"combined-source.txt";
+            const auto accepted = PrepareFileDialogContract(DialogFactory::Save, combined, Id(), AccessPolicy::LocalSaveV1, owned);
+            Check(accepted.request && RuntimeLocalSaveContractCertified(accepted),
+                metadata_first ? "owned metadata then SaveAsItem keeps both contracts" : "SaveAsItem then owned metadata keeps both contracts");
+            owned.filesystem_save_as_item_owned = false;
+            Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, combined, Id(), AccessPolicy::LocalSaveV1, owned), NativeReason::SaveMetadata),
+                "owned metadata never authorizes an unverified Shell source");
+        }
+        calls.pop_back(); calls.back().native_result = E_ACCESSDENIED;
+        Check(NativeReasonIs(prepare(context), NativeReason::SetterFailed), "failed item setter remains sticky and cannot be masked by final snapshot");
+        calls.back().native_result = S_OK; calls.back().value = 2;
+        Check(!prepare(context).request, "invalid item-presence discriminator is rejected");
+        std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--save-no-overwrite") {
+        for (uint32_t flags : {0x18808u, 0x10008u, 0x108u}) {
+            auto calls = Baseline(DialogFactory::Save); calls[0].value = flags;
+            PreparationContext context; context.native_save_defaults_supported = true;
+            context.save_no_test_create_supported = true; context.save_caller_validation_supported = true;
+            Check(!PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context).request,
+                "old provider retains missing-overwrite native fallback");
+            context.save_no_overwrite_supported = true;
+            auto d = PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context);
+            Check(d.request && d.no_overwrite_prompt && RuntimeLocalSaveContractCertified(d), "explicit provider admits no-prompt Save without weakening access policy");
+            Check(d.request && !(std::get<wire::Request>(d.request->body).options & wire::OverwritePrompt), "caller omission is not changed into overwrite consent UI");
+            Check(!BridgeRequestFor(d), "old basic host cannot silently reinterpret no-prompt request");
+            auto bad = d; bad.no_overwrite_prompt = false;
+            Check(!RuntimeLocalSaveContractCertified(bad), "runtime binds prompt omission to original native flags");
+            calls[0].value |= FOS_OVERWRITEPROMPT;
+            d = PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context);
+            Check(d.request && !d.no_overwrite_prompt && RuntimeLocalSaveContractCertified(d), "overwrite-enabled Save preserves prior contract");
+        }
+        std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--cancel-label") {
+        for (auto factory : {DialogFactory::Open, DialogFactory::Save}) {
+            auto calls = Baseline(factory);
+            const auto policy = factory == DialogFactory::Open ? AccessPolicy::LocalOpenV1 : AccessPolicy::LocalSaveV1;
+            calls.push_back(Text(Setting::CancelButtonLabel, u"First"));
+            calls.push_back(Text(Setting::CancelButtonLabel, u"Leave"));
+            auto d = PrepareFileDialogContract(factory, calls, Id(), policy);
+            Check(d.request && d.cancel_button_label == u"Leave", "last successful cancel label is retained for Open/Save");
+            Check(!BridgeRequestFor(d), "basic bridge cannot silently discard a cancel label");
+            calls.push_back(Text(Setting::CancelButtonLabel));
+            d = PrepareFileDialogContract(factory, calls, Id(), policy);
+            Check(d.request && d.cancel_button_label && d.cancel_button_label->empty(), "explicit empty cancel label remains present");
+            calls.back().native_result = E_INVALIDARG;
+            d = PrepareFileDialogContract(factory, calls, Id(), policy);
+            Check(d.disposition == Disposition::NativeOnly && d.observed_result == E_INVALIDARG, "failed native cancel setter is not reinterpreted as success");
+            calls.back().native_result = S_OK; calls.back().text = u"bad\nlabel";
+            Check(!PrepareFileDialogContract(factory, calls, Id(), policy).request, "unrepresentable cancel label stays native");
+        }
+        std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--yjk-open-contract") {
         for (const auto* pattern : {u"*.*", u"*.dwg", u"*.dwg;*.dxf||", u"*.dxf||;*.dwg"}) {
             auto calls = Baseline();
@@ -118,7 +208,7 @@ int main(int argc, char** argv) {
         PreparationContext context;
         context.native_save_defaults_supported = true;
         context.save_no_test_create_supported = true;
-        for (uint32_t flags : {0x1000au, 0x1880au}) {
+        for (uint32_t flags : {0x1000au, 0x1880au, 0x11842u}) {
             auto calls = Baseline(DialogFactory::Save); calls[0].value = flags;
             calls.push_back(Text(Setting::DefaultExtension, u"pdf"));
             auto types = Types(); types.filters = {{u"PDF",u"*.pdf"},{u"All",u"*.*"}}; calls.push_back(types);
@@ -134,11 +224,22 @@ int main(int argc, char** argv) {
             calls[0].value &= ~FOS_OVERWRITEPROMPT;
             Check(!PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context).request, "no-test-create retains overwrite confirmation");
             calls[0].value = flags | FOS_NOVALIDATE;
+            Check(!PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context).request, "combined NOVALIDATE+NOTESTFILECREATE still requires caller validation capability");
             context.save_caller_validation_supported = true;
-            Check(!PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context).request, "unverified combined NOVALIDATE policy remains native");
+            context.save_caller_readonly_supported = (flags & FOS_NOREADONLYRETURN) != 0;
+            auto combined = PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1, context);
+            Check(combined.request && combined.skip_save_access_validation && !combined.no_test_file_create && RuntimeLocalSaveContractCertified(combined),
+                "Save NOVALIDATE+NOTESTFILECREATE prepares with caller validation capability");
+            context.save_caller_validation_supported = false;
+            context.save_caller_readonly_supported = false;
         }
         auto calls = Baseline(); calls[0].value |= FOS_NOTESTFILECREATE;
-        Check(!PrepareFileDialogContract(DialogFactory::Open,calls,Id(),AccessPolicy::LocalOpenV1,context).request, "Save-only flag does not loosen Open");
+        auto open_notest = PrepareFileDialogContract(DialogFactory::Open, calls, Id(), AccessPolicy::LocalOpenV1, context);
+        Check(open_notest.request && RuntimeContractCertified(open_notest), "Open admits no-op FOS_NOTESTFILECREATE");
+        calls = Baseline(); calls[0].value = 0x02011968u;
+        context.caller_validation_supported = true;
+        auto folder_notest = PrepareFileDialogContract(DialogFactory::Open, calls, Id(), AccessPolicy::LocalOpenV1, context);
+        Check(folder_notest.request && RuntimeContractCertified(folder_notest), "PickFolders admits no-op FOS_NOTESTFILECREATE");
         std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
     }
 
@@ -180,7 +281,7 @@ int main(int argc, char** argv) {
             calls[0].value = options | FOS_NOVALIDATE;
             Check(!PrepareFileDialogContract(DialogFactory::Save,calls,Id(),AccessPolicy::LocalSaveV1,context).request, "new Save defaults cannot bypass access validation");
         }
-        for (const auto* bad : {u"*.a/b",u"*.html;txt",u"*.*",u".html"}) {
+        for (const auto* bad : {u"*.a/b",u"*.html;txt",u"*.*",u"..html"}) {
             auto calls = Baseline(DialogFactory::Save); calls.push_back(Text(Setting::DefaultExtension,bad));
             Check(!PrepareFileDialogContract(DialogFactory::Save,calls,Id(),AccessPolicy::LocalSaveV1,context).request, "unverified Save extension shape stays native");
         }
@@ -261,7 +362,7 @@ int main(int argc, char** argv) {
     }
 
     if (argc == 2 && std::string_view(argv[1]) == "--extension-masks") {
-        for (const auto* pattern : {u"*.xl*", u"*.xl*;*.xlsx", u"*.a*b", u"*.TXT;*.x*", u"*.*"}) {
+        for (const auto* pattern : {u"*.xl*", u"*.xl*;*.xlsx", u"*.a*b", u"*.TXT;*.x*", u"*.*", u"Makefile?", u"report*.tx?", u"*.x?", u"frame-??.png"}) {
             auto calls = Baseline(); auto types = Types(); types.filters = {{u"Generic extension mask", pattern}}; calls.push_back(types);
             const auto open = PrepareFileDialogContract(DialogFactory::Open, calls, Id(), AccessPolicy::LocalOpenV1);
             Check(open.disposition == Disposition::Prepared && open.request &&
@@ -270,12 +371,23 @@ int main(int argc, char** argv) {
                 calls = Baseline(DialogFactory::Save); calls.push_back(types);
                 Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, calls, Id(), AccessPolicy::LocalSaveV1), NativeReason::UnsupportedFilter),
                     "Open mask support does not widen Save contract");
+                if (std::u16string_view(pattern).find(u'?') != std::u16string_view::npos) {
+                    PreparationContext ctx; ctx.native_save_defaults_supported=true;
+                    Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save,calls,Id(),AccessPolicy::LocalSaveV1,ctx),NativeReason::UnsupportedFilter),
+                        "even a native-defaults capable Save provider defers Shell question marks");
+                }
             }
         }
-        for (const auto* pattern : {u"report*.txt", u"C:\\*.xlsx", u"../*.xls", u"*.x?", u";;;", u"*.xl*;;bad*", u"*.a b", u"*."}) {
+        for (const auto* pattern : {u"report*.txt", u"Makefile", u"CMakeLists.txt", u"*.txt;Makefile"}) {
+            auto calls = Baseline(); auto types = Types(); types.filters = {{u"Projects",pattern}}; calls.push_back(types);
+            auto decision = PrepareFileDialogContract(DialogFactory::Open,calls,Id(),AccessPolicy::LocalOpenV1);
+            Check(decision.request && std::get<wire::Request>(decision.request->body).filters[0].pattern == pattern,
+                "native-verified basename and prefix filters admitted without substituting all files");
+        }
+        for (const auto* pattern : {u"report*.t:x?", u"C:\\*.xlsx", u"../*.xls", u"../*.x?", u";;;", u"*.xl*;;bad*", u"*.a b", u"*."}) {
             auto calls = Baseline(); auto types = Types(); types.filters = {{u"Unsupported", pattern}}; calls.push_back(types);
             Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, calls, Id(), AccessPolicy::LocalOpenV1), NativeReason::UnsupportedFilter),
-                "unsupported filename/path/question/empty filter syntax remains rejected");
+                "unsupported path, malformed and empty filter syntax remains rejected");
         }
         std::cout << "Checks=" << checks << " failures=" << failures << '\n'; return failures ? 1 : 0;
     }
@@ -461,6 +573,7 @@ int main(int argc, char** argv) {
         {Setting::SaveProperties, NativeReason::SaveMetadata}, {Setting::SaveAsItem, NativeReason::SaveMetadata},
         {Setting::ShellFilter, NativeReason::ShellFilter}, {Setting::Unknown, NativeReason::UnknownSetting}}) {
         calls = Baseline(); calls.push_back(Text(pair.first));
+        if (pair.first == Setting::ShellFilter) calls.back().value = 1;
         Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, calls, Id()), pair.second), "unsupported setter retained as explicit native-only reason");
     }
     calls = Baseline(); calls[0].value |= FOS_PICKFOLDERS;
@@ -662,6 +775,142 @@ int main(int argc, char** argv) {
     }
     caller_save_calls[0].value = 0x20000100;
     Check(!PrepareFileDialogContract(DialogFactory::Save, caller_save_calls, Id(), AccessPolicy::LocalSaveV1, save_context).request, "caller Save still requires overwrite prompt");
+    {
+        auto ro_save_ctx = save_context; ro_save_ctx.save_caller_readonly_supported = true;
+        auto tk_save_calls = Baseline(DialogFactory::Save);
+        tk_save_calls[0].value = 0x894Au;
+        const auto tk_save = PrepareFileDialogContract(DialogFactory::Save, tk_save_calls, Id(), AccessPolicy::LocalSaveV1, ro_save_ctx);
+        Check(tk_save.request && tk_save.skip_save_access_validation && tk_save.reject_readonly_save &&
+            RuntimeLocalSaveContractCertified(tk_save) && !BridgeRequestFor(tk_save),
+            "Save NOVALIDATE+NOREADONLYRETURN routes via provider with explicit readonly rejection");
+        auto bad_ro = tk_save; bad_ro.reject_readonly_save = false;
+        Check(!RuntimeLocalSaveContractCertified(bad_ro), "Save NOVALIDATE+NOREADONLYRETURN requires matching readonly policy");
+    }
+    {
+        PreparationContext folder_ctx; folder_ctx.caller_validation_supported = true;
+        auto office_folder = Baseline();
+        office_folder[0].value = 0x20001920u;
+        office_folder.push_back(Text(Setting::DefaultExtension, u""));
+        const auto d = PrepareFileDialogContract(DialogFactory::Open, office_folder, Id(), AccessPolicy::LocalOpenV1, folder_ctx);
+        Check(d.request && d.skip_open_access_validation && !d.open_default_extension &&
+            RuntimeContractCertified(d) && !BridgeRequestFor(d),
+            "FolderPicker with FOS_NOVALIDATE and empty SetDefaultExtension prepares via provider");
+        office_folder.back().text = u"txt";
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, office_folder, Id(), AccessPolicy::LocalOpenV1, folder_ctx), NativeReason::FolderFileSettings),
+            "FolderPicker still rejects non-empty SetDefaultExtension");
+        auto no_cap = folder_ctx; no_cap.caller_validation_supported = false;
+        office_folder.pop_back();
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, office_folder, Id(), AccessPolicy::LocalOpenV1, no_cap), NativeReason::UnsupportedOptions),
+            "FolderPicker NOVALIDATE requires caller_validation_supported");
+    }
+    {
+        PreparationContext pc_ctx; pc_ctx.computer_initial_folder_supported = true;
+        auto pc_calls = Baseline();
+        pc_calls[1].text = u"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+        pc_calls[1].filesystem_folder = false;
+        const auto pc_open = PrepareFileDialogContract(DialogFactory::Open, pc_calls, Id(), AccessPolicy::LocalOpenV1, pc_ctx);
+        Check(pc_open.request && std::get<wire::Request>(pc_open.request->body).initial_directory == u"pulse:computer" &&
+            RuntimeContractCertified(pc_open) && !BridgeRequestFor(pc_open),
+            "This PC initial folder on Open maps to pulse:computer via provider");
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, pc_calls, Id(), AccessPolicy::None, pc_ctx), NativeReason::NonFilesystemFolder),
+            "This PC initial folder remains rejected under AccessPolicy::None");
+        auto pc_save = Baseline(DialogFactory::Save);
+        pc_save[1].text = pc_calls[1].text; pc_save[1].filesystem_folder = false;
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, pc_save, Id(), AccessPolicy::LocalSaveV1, pc_ctx), NativeReason::NonFilesystemFolder),
+            "This PC initial folder remains rejected on Save");
+        auto recycle_calls = pc_calls;
+        recycle_calls[1].text = u"::{645FF040-5081-101B-9F08-00AA002F954E}";
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Open, recycle_calls, Id(), AccessPolicy::LocalOpenV1, pc_ctx), NativeReason::NonFilesystemFolder),
+            "non-This-PC virtual folder remains rejected without FOS_ALLNONSTORAGEITEMS");
+    }
+    {
+        // CorelDRAW multi-filter separator slot {L"", L""} preserves 1-based indices.
+        PreparationContext corel_ctx;
+        corel_ctx.native_save_defaults_supported = true;
+        auto corel_save = Baseline(DialogFactory::Save);
+        auto corel_types = Types();
+        corel_types.filters = {{u"CDR", u"*.cdr"}, {u"", u""}, {u"AI", u"*.ai"}};
+        corel_save.push_back(corel_types);
+        SetterCall idx; idx.setting = Setting::FileTypeIndex; idx.native_result = S_OK; idx.value = 3;
+        corel_save.push_back(idx);
+        const auto d_save = PrepareFileDialogContract(DialogFactory::Save, corel_save, Id(), AccessPolicy::LocalSaveV1, corel_ctx);
+        Check(d_save.request && RuntimeLocalSaveContractCertified(d_save) &&
+            std::get<wire::Request>(d_save.request->body).filters.size() == 3 &&
+            std::get<wire::Request>(d_save.request->body).filters[1].pattern == u"*.*" &&
+            std::get<wire::Request>(d_save.request->body).filter_index == 2,
+            "Save multi-filter blank separator slot preserves exact 1-based filter indices");
+        auto corel_open = Baseline(DialogFactory::Open);
+        corel_open.push_back(corel_types);
+        corel_open.push_back(idx);
+        const auto d_open = PrepareFileDialogContract(DialogFactory::Open, corel_open, Id(), AccessPolicy::LocalOpenV1, corel_ctx);
+        Check(d_open.request && RuntimeContractCertified(d_open) &&
+            std::get<wire::Request>(d_open.request->body).filters.size() == 3 &&
+            std::get<wire::Request>(d_open.request->body).filter_index == 2,
+            "Open multi-filter blank separator slot preserves exact 1-based filter indices");
+    }
+    {
+        // YJK Save As (dialog_auto-19640.jsonl): SetDefaultExtension("dwg|dxf||") called
+        // before SetFileTypes with all concrete filters and SetOptions(0x42).
+        PreparationContext yjk_ctx;
+        yjk_ctx.native_save_defaults_supported = true;
+        std::vector<SetterCall> yjk_save;
+        yjk_save.push_back(Text(Setting::DefaultExtension, u"dwg|dxf||"));
+        auto yjk_types = Types();
+        yjk_types.filters = {{u"AutoCad 2007 DWG", u"*.dwg"}, {u"AutoCad DXF", u"*.dxf"}, {u"CAD", u"*.dwg;*.dxf"}};
+        yjk_save.push_back(yjk_types);
+        SetterCall yjk_idx; yjk_idx.setting = Setting::FileTypeIndex; yjk_idx.native_result = S_OK; yjk_idx.value = 2;
+        yjk_save.push_back(yjk_idx);
+        yjk_save.push_back(Text(Setting::FileName, u"newfile.dwg"));
+        SetterCall yjk_folder; yjk_folder.setting = Setting::Folder; yjk_folder.native_result = S_OK;
+        yjk_folder.text = u"D:\\Model"; yjk_folder.filesystem_folder = true;
+        yjk_save.push_back(yjk_folder);
+        SetterCall yjk_opts; yjk_opts.setting = Setting::Options; yjk_opts.native_result = S_OK;
+        yjk_opts.value = FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM; // 0x42
+        yjk_save.push_back(yjk_opts);
+
+        const auto d_yjk = PrepareFileDialogContract(DialogFactory::Save, yjk_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx);
+        Check(d_yjk.request && d_yjk.native_save_defaults && RuntimeLocalSaveContractCertified(d_yjk) &&
+            std::get<wire::Request>(d_yjk.request->body).default_extension.empty() &&
+            std::get<wire::Request>(d_yjk.request->body).filter_index == 1,
+            "YJK Save As with pipe default extension and all-concrete filters prepares and certifies");
+
+        auto mixed_save = yjk_save;
+        mixed_save[1].filters.push_back({u"All Files", u"*.*"});
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, mixed_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx),
+                             NativeReason::UnsupportedExtension),
+            "Save pipe default extension with *.* catch-all filter remains native");
+
+        auto no_filters_save = Baseline(DialogFactory::Save);
+        no_filters_save.push_back(Text(Setting::DefaultExtension, u"dwg|dxf||"));
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, no_filters_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx),
+                             NativeReason::UnsupportedExtension),
+            "Save pipe default extension without filters remains native");
+
+        auto no_cap_ctx = yjk_ctx; no_cap_ctx.native_save_defaults_supported = false;
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, yjk_save, Id(), AccessPolicy::LocalSaveV1, no_cap_ctx),
+                             NativeReason::UnsupportedExtension),
+            "Save pipe default extension requires native_save_defaults_supported");
+
+        auto noval_save = yjk_save;
+        noval_save.back().value |= FOS_NOVALIDATE;
+        yjk_ctx.save_caller_validation_supported = true;
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, noval_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx),
+                             NativeReason::UnsupportedExtension),
+            "Save pipe default extension with FOS_NOVALIDATE remains native");
+
+        auto bad_pipe_save = yjk_save;
+        bad_pipe_save[0].text = u"../dwg|dxf";
+        Check(NativeReasonIs(PrepareFileDialogContract(DialogFactory::Save, bad_pipe_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx),
+                             NativeReason::UnsupportedExtension),
+            "Save path-like pipe default extension stays rejected even with concrete filters");
+
+        auto overwritten_save = mixed_save;
+        overwritten_save.push_back(Text(Setting::DefaultExtension, u"dwg"));
+        const auto d_overwritten = PrepareFileDialogContract(DialogFactory::Save, overwritten_save, Id(), AccessPolicy::LocalSaveV1, yjk_ctx);
+        Check(d_overwritten.request && RuntimeLocalSaveContractCertified(d_overwritten) &&
+            std::get<wire::Request>(d_overwritten.request->body).default_extension == u"dwg",
+            "later clean SetDefaultExtension clears earlier shadowed pipe default");
+    }
     std::cout << "Checks: " << checks << ", failures: " << failures << '\n';
     return failures ? 1 : 0;
 }

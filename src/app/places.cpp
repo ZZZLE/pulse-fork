@@ -2029,6 +2029,16 @@ private:
 };
 }  // namespace
 
+std::vector<std::wstring> PlacesCatalog::TaggedPathsUnder(const std::vector<std::wstring>& roots) const {
+    std::vector<std::wstring> paths;
+    for (const auto& tag : tags)
+        for (const auto& assigned : tag.paths)
+            if (std::any_of(roots.begin(), roots.end(), [&](const auto& root) {
+                    return PathIsOrDescendant(assigned, root);
+                })) paths.push_back(assigned);
+    return paths;
+}
+
 void PlacesCatalog::RemapPaths(const std::wstring& old_path, const std::wstring& new_path) {
     RemapPaths(std::vector<std::pair<std::wstring, std::wstring>>{{old_path, new_path}});
 }
@@ -2110,6 +2120,10 @@ void PlacesCatalog::RemapPaths(const std::vector<std::pair<std::wstring, std::ws
         QueueTagSave();
         Save();
     }
+}
+
+void PlacesCatalog::CloneAssignments(const std::vector<std::pair<std::wstring, std::wstring>>& copies) {
+    for (const auto& [source, destination] : copies) CloneAssignments(source, destination);
 }
 
 void PlacesCatalog::CloneAssignments(const std::wstring& source,
@@ -2250,8 +2264,9 @@ void PlacesCatalog::MergeAdsRecords(const std::wstring& path,
 
 void PlacesCatalog::ReadAdsIntoCatalog(const std::wstring& path) {
     const std::wstring n = Norm(path);
-    const auto records = ReadTagAdsV2(n);
-    MergeAdsRecords(n, records, records.empty() ? ReadTagAds(n) : std::vector<std::wstring>{});
+    std::vector<std::wstring> legacy;
+    const auto records = ReadTagAdsV2(n, &legacy);
+    MergeAdsRecords(n, records, legacy);
 }
 
 namespace {
@@ -2266,6 +2281,7 @@ public:
                             FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         have_ = file_ != INVALID_HANDLE_VALUE && GetFileTime(file_, nullptr, &access_, &write_);
     }
+    void Unchanged() { have_ = false; }
     ~KeepFileTimes() {
         const DWORD error = GetLastError();
         if (have_) SetFileTime(file_, nullptr, &access_, &write_);
@@ -2284,10 +2300,11 @@ private:
 bool WriteTagAdsV2(const std::wstring& path, const std::vector<TagAdsRecord>& tags) {
     std::wstring n = Norm(path);
     if (n.empty() || fs::IsVirtualPath(n)) return false;
-    const KeepFileTimes keep_times(n);
+    KeepFileTimes keep_times(n);
     if (tags.empty()) {
         if (DeleteFileW((n + kAdsSuffix).c_str())) return true;
         const DWORD error = GetLastError();
+        keep_times.Unchanged();
         return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
     std::wstring payload = L"PULSE_TAGS_V2\r\n";
@@ -2299,7 +2316,8 @@ bool WriteTagAdsV2(const std::wstring& path, const std::vector<TagAdsRecord>& ta
         payload += tag.id + L"\t" + rgb + L"\t" + name + L"\r\n";
     }
     const std::wstring stream = n + kAdsSuffix;
-    HANDLE h = CreateFileW(stream.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+    HANDLE h = CreateFileW(stream.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
@@ -2335,11 +2353,17 @@ static std::wstring ReadAdsPayload(const std::wstring& path) {
     return payload;
 }
 
-std::vector<TagAdsRecord> ReadTagAdsV2(const std::wstring& path) {
+static std::vector<std::wstring> ParseLegacyNames(const std::wstring& payload);
+
+std::vector<TagAdsRecord> ReadTagAdsV2(const std::wstring& path, std::vector<std::wstring>* legacy) {
     std::vector<TagAdsRecord> out;
     const std::wstring payload = ReadAdsPayload(path);
     constexpr std::wstring_view header = L"PULSE_TAGS_V2\r\n";
-    if (!payload.starts_with(header)) return out;
+    if (legacy) legacy->clear();
+    if (!payload.starts_with(header)) {
+        if (legacy) *legacy = ParseLegacyNames(payload);
+        return out;
+    }
     size_t pos = header.size();
     while (pos < payload.size()) {
         const size_t end = payload.find(L"\r\n", pos);
@@ -2363,12 +2387,16 @@ std::vector<TagAdsRecord> ReadTagAdsV2(const std::wstring& path) {
 
 std::vector<std::wstring> ReadTagAds(const std::wstring& path) {
     std::vector<std::wstring> out;
-    const auto records = ReadTagAdsV2(path);
+    const auto records = ReadTagAdsV2(path, &out);
     if (!records.empty()) {
         for (const auto& record : records) out.push_back(record.name);
         return out;
     }
-    const std::wstring payload = ReadAdsPayload(path);
+    return out;
+}
+
+static std::vector<std::wstring> ParseLegacyNames(const std::wstring& payload) {
+    std::vector<std::wstring> out;
     std::wstring cur;
     for (wchar_t c : payload) {
         if (c == L',') {

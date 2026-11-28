@@ -19,14 +19,21 @@ public:
     PickerOperationSession& operator=(const PickerOperationSession&) = delete;
 
     PickerOperationResult Run(HWND owner, ops::OpRequest request, bool dark, D2D1_COLOR_F accent, bool unique_create = false);
+    // Runs a single non-queue transfer while retaining the same modal pumping and
+    // cancellation lifetime. The worker returns an empty string only on success.
+    PickerOperationResult RunBackground(HWND owner,
+        std::function<std::wstring(const std::atomic_bool&)> worker, bool dark, D2D1_COLOR_F accent);
     PickerOperationResult Undo(HWND owner, bool dark, D2D1_COLOR_F accent);
     bool CanUndo() const;
     void Cancel();
 
 private:
+    void EnsureStarted();
     PickerOperationResult Execute(HWND owner, const std::function<bool()>& submit,
-                                  bool dark, D2D1_COLOR_F accent, const std::function<bool()>& ready = {});
+                                  bool dark, D2D1_COLOR_F accent, const std::function<bool()>& ready = {},
+                                  const ops::OpStatus* background_status = nullptr);
     ops::OpsManager manager_;
+    bool started_ = false;
     bool executing_ = false;
     std::atomic_bool cancelling_{false};
 };

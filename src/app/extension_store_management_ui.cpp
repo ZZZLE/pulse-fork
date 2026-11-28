@@ -1,8 +1,15 @@
 #include "extension_store_management_ui.h"
+#include "extension_developer_mode.h"
+#include "extension_store_permissions.h"
 #include "extension_store_review.h"
 #include "app_state.h"
+#include "extensions/package_signature.h"
+#include "extensions/runtime.h"
+#include "extensions/native/session.h"
+#include "extensions/store/catalog.h"
 #include "../ui/form_dialog.h"
 #include "../common/json_value.h"
+#include <algorithm>
 #include "../common/localization.h"
 
 namespace pulse::app {
@@ -37,7 +44,7 @@ struct ExtensionManagementUi::Impl : std::enable_shared_from_this<Impl> {
     ui::FormDialog dialog;
     HWND owner = nullptr;
     const AppState* owner_state = nullptr; // Identity only, explicitly released at WM_DESTROY.
-    uint64_t prompted = 0, draft_generation = 0;
+    uint64_t prompted = 0, draft_generation = 0, purged_generation = 0;
     bool missing_consent = false;
     std::vector<extensions::UiStateEntry> draft;
     void Prompt(AppState& s) {
@@ -54,17 +61,35 @@ struct ExtensionManagementUi::Impl : std::enable_shared_from_this<Impl> {
         spec.default_button = -1; spec.cancel_button = 1; spec.width_dip = 620;
         extensions::UiTree tree; tree.root.id = "store_change"; tree.root.gap = 8;
         tree.root.children.push_back(Label("action", Text(ActionText(review.action)) + L" · " + json::Wide(review.id)));
+        const std::wstring publisher_line = review.publisher_id.empty()
+            ? Text(Id::StorePublisherUnsigned)
+            : (review.publisher_id == store::kOfficialCatalogPublisher
+                   ? Text(Id::StoreOfficial)
+                   : ReplaceStoreToken(Text(Id::StorePublisherVerified), L"{id}", AbbreviateHexDigest(review.publisher_id)));
+        tree.root.children.push_back(Label("publisher", Text(Id::Publisher) + L": " + publisher_line));
         extensions::UiNode details; details.id = "details"; details.type = extensions::UiNodeType::ScrollView;
         details.min_height = 96; details.max_height = 144;
-        auto description = review.root.wstring() + L"\n" + json::Wide(review.active_revision);
-        if (review.action == store::StoreChangeAction::Rollback) description += L"\n→ " + json::Wide(review.previous_revision);
-        if (!review.publisher_id.empty()) description += L"\n" + Text(Id::Publisher) + L": " + json::Wide(review.publisher_id);
-        for (const auto& permission : review.added_resources) description += L"\n" + json::Wide(permission);
+        std::wstring description = ReplaceStoreToken(Text(Id::StoreExtensionIdLabel), L"{id}", json::Wide(review.id));
+        if (review.action == store::StoreChangeAction::Rollback) {
+            description += L"\n" + ReplaceStoreToken(Text(Id::StoreRollbackRevisionLabel), L"{rev}",
+                AbbreviateHexDigest(review.active_revision) + L" → " + AbbreviateHexDigest(review.previous_revision));
+        }
+        if (!review.added_resources.empty()) {
+            description += L"\n" + Text(Id::StorePermissionsAddedHeading);
+            for (const auto& permission : review.added_resources) {
+                description += L"\n• " + LocalizedResourcePermission(permission);
+            }
+        } else {
+            description += L"\n" + Text(Id::StoreChangeNoAddedPermissions);
+        }
         details.children.push_back(Label("permissions", description)); tree.root.children.push_back(std::move(details));
+        const bool uninstall = review.action == store::StoreChangeAction::Uninstall;
         if (review.native_code) tree.root.children.push_back(Check("native", Id::ExtensionStoreNativeConsent));
         if (!review.added_resources.empty()) tree.root.children.push_back(Check("resources", Id::ExtensionStoreResourcesConsent));
-        tree.state = draft_generation == snapshot.generation ? draft : std::vector<extensions::UiStateEntry>{{"native", "false"}, {"resources", "false"}};
-        spec.form = std::move(tree); spec.form_height_dip = review.native_code || !review.added_resources.empty() ? 312.0f : 208.0f;
+        if (uninstall) tree.root.children.push_back(Check("purge_data", Id::StoreUninstallPurgeData));
+        tree.state = draft_generation == snapshot.generation ? draft : std::vector<extensions::UiStateEntry>{{"native", "false"}, {"resources", "false"}, {"purge_data", "false"}};
+        spec.form = std::move(tree);
+        spec.form_height_dip = review.native_code || !review.added_resources.empty() ? 312.0f : (uninstall ? 272.0f : 208.0f);
         const auto weak = weak_from_this(); const auto generation = snapshot.generation;
         spec.on_closed = [weak, generation](int button, std::vector<extensions::UiStateEntry> states) {
             if (const auto self = weak.lock()) {
@@ -100,15 +125,45 @@ void ExtensionManagementUi::Fill(AppState& s, ui::ExtensionStoreView& view, bool
     for (const auto& entry : snapshot.installed->entries) {
         ui::InstalledExtensionItem item;
         item.id = json::Wide(entry.id); item.name = entry.name.empty() ? item.id : json::Wide(entry.name);
-        item.version = json::Wide(entry.revision.substr(0, 12)); item.publisher = json::Wide(entry.publisher_id);
+        // A registry revision is a manifest digest, not a product version.
+        // FillExtensionStoreView resolves versions from matching signed releases.
+        const bool unsigned_local = entry.publisher_id.empty() && entry.error == "store_open:2";
+        item.publisher = unsigned_local
+            ? Text(Id::StorePublisherUnsigned)
+            : (entry.publisher_id == store::kOfficialCatalogPublisher ? Text(Id::StoreOfficial) : json::Wide(entry.publisher_id));
         item.enabled = entry.enabled; item.native_code = entry.native_code; item.revision = entry.revision;
         item.status = Text(entry.enabled ? Id::StoreExtensionEnabled : Id::StoreExtensionDisabled);
-        item.notice = json::Wide(entry.error);
+        for (size_t p = 0; p < extensions::PackageCount() && p < 10000; ++p) {
+            const auto* manifest = extensions::PackageManifest(p);
+            if (!manifest || manifest->id != entry.id) continue;
+            if (unsigned_local) {
+                item.native_code = item.native_code || manifest->native.has_value();
+            }
+            const auto runtime_state = extensions::native::QueryPackageRuntime(p);
+            if (runtime_state.state == extensions::native::PackageRuntimeState::Draining)
+                item.status += L" · " + Text(Id::StoreExtensionDraining);
+            if (runtime_state.restart_required) {
+                view.pending_restart = true;
+                item.status += L" · " + Text(Id::StoreExtensionRestartRequired);
+            }
+            break;
+        }
+        item.notice = unsigned_local ? std::wstring{} : json::Wide(entry.error);
+        // Left out at startup: unsigned under requireSigned while developer mode was off.
+        if (unsigned_local) {
+            const auto skipped = extensions::SkippedUnsignedPackages();
+            if (std::find(skipped.begin(), skipped.end(), entry.id) != skipped.end())
+                item.notice = Text(entry.previous_revision.empty() ? Id::StoreUnsignedNeedsDevMode
+                                                                   : Id::StoreUnsignedNeedsDevModeRollback);
+        }
         const bool ready = !view.installed_busy && !view.installed_loading;
-        item.can_enable = ready && !entry.enabled && entry.error.empty();
+        const bool can_enable_unsigned = unsigned_local &&
+            (snapshot.installed->policy_allows_unsigned || DeveloperModeSetting(impl_->root));
+        item.can_enable = ready && !entry.enabled && (entry.error.empty() || can_enable_unsigned);
         item.can_disable = ready && entry.enabled;
         item.can_uninstall = ready;
-        item.can_rollback = ready && !entry.previous_revision.empty() && entry.error.empty();
+        // An unsigned (developer-mode) revision can always be rolled back, e.g. to the official build it replaced.
+        item.can_rollback = ready && !entry.previous_revision.empty() && (entry.error.empty() || unsigned_local);
         view.installed.push_back(std::move(item));
     }
 }
@@ -127,9 +182,13 @@ bool ExtensionManagementUi::Action(AppState& s, int action, bool installation_ac
     const auto snapshot = impl_->service.GetSnapshot(); const auto index = static_cast<size_t>(action - base);
     if (installation_active || Active() || snapshot.phase == Phase::Loading || snapshot.generation != s.store_manage_view_generation || !snapshot.installed || index >= snapshot.installed->entries.size()) return true;
     const auto& entry = snapshot.installed->entries[index];
-    if ((change == store::StoreChangeAction::Enable && (entry.enabled || !entry.error.empty())) ||
+    const bool unsigned_local = entry.publisher_id.empty() && entry.error == "store_open:2";
+    const bool can_enable_unsigned = unsigned_local &&
+        (snapshot.installed->policy_allows_unsigned || DeveloperModeSetting(impl_->root));
+    if ((change == store::StoreChangeAction::Enable && (entry.enabled || !(entry.error.empty() || can_enable_unsigned))) ||
         (change == store::StoreChangeAction::Disable && !entry.enabled) ||
-        (change == store::StoreChangeAction::Rollback && (entry.previous_revision.empty() || !entry.error.empty()))) return true;
+        (change == store::StoreChangeAction::Rollback && (entry.previous_revision.empty() ||
+            !(entry.error.empty() || unsigned_local)))) return true;
     impl_->owner = s.hwnd; impl_->owner_state = &s; impl_->missing_consent = false;
     impl_->draft.clear(); impl_->draft_generation = 0;
     impl_->service.PrepareChange(impl_->root, entry.id, change);
@@ -137,6 +196,11 @@ bool ExtensionManagementUi::Action(AppState& s, int action, bool installation_ac
 }
 void ExtensionManagementUi::Tick(AppState& s) {
     const auto snapshot = impl_->service.GetSnapshot();
+    if (snapshot.purged_package_id && snapshot.generation != impl_->purged_generation) {
+        impl_->purged_generation = snapshot.generation;
+        if (extensions::RevokePublishTrustForPackage(s.appPrefs.extension_publish_trusted, *snapshot.purged_package_id) > 0 && !s.isolatedTest)
+            s.appPrefs.Save();
+    }
     const auto token = snapshot.generation * 32 + static_cast<unsigned>(snapshot.phase) * 2 + (snapshot.pending_restart ? 1 : 0);
     if (token != s.store_manage_ui_token) { s.store_manage_ui_token = token; InvalidateRect(s.hwnd, nullptr, FALSE); }
     impl_->Prompt(s);

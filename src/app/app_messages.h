@@ -74,6 +74,7 @@ constexpr UINT WM_TAG_DROP_UNDO = WM_APP + 98;  // the 已给 N 项加上「…�
 constexpr UINT WM_TAG_RULE_HIT = WM_APP + 99;  // 自动规则: files appeared in a watched folder (tag_rules.cpp)
 constexpr UINT WM_TRAY_UNDO = WM_APP + 100;      // the tray release snack: undo the copy / move
 constexpr UINT WM_TRAY_OPEN_DEST = WM_APP + 101;  // the tray release snack: open the target folder
+constexpr UINT WM_TASK_RESULT_OPEN = WM_APP + 145;  // a plugin task's result snack: show what it produced
 constexpr UINT WM_TRAY_RESTORE = WM_APP + 102;   // the 已清空暂存区 snack: put the items back
 constexpr UINT WM_TRAY_TAKE_CLIP = WM_APP + 103;  // stage the Ctrl+C / Ctrl+X offer (剪贴板 N 项 · 收入)
 constexpr UINT WM_TAG_RULE_ACCEPT = WM_APP + 104;  // the 自动规则 snack's 加上
@@ -119,3 +120,13 @@ constexpr UINT WM_DETAILS_PREVIEW_OPEN = WM_APP + 138;
 constexpr UINT WM_DETAILS_PREVIEW_COMMAND = WM_APP + 139;
 constexpr UINT WM_DRAG_RETURN = WM_APP + 143;
 constexpr UINT WM_HISTORY_REDO = WM_APP + 144;
+constexpr UINT WM_STAGING_SHELF_SUMMON = WM_APP + 146;
+// The paste's background clipboard read finished (app_ops_ui.cpp). Posted, so
+// it is not starved like WM_TIMER while a file operation keeps the window painting.
+constexpr UINT WM_FILE_CLIPBOARD_READY = WM_APP + 147;
+// app_vfs_ops.cpp: an archive extract / change finished (lParam owns the result;
+// wParam 1: an opened archive member was saved and goes back in).
+constexpr UINT WM_VFS_OP_DONE = WM_APP + 148;
+constexpr UINT WM_VFS_UNDO = WM_APP + 149;  // the archive "updated" snack's 撤销
+// A grid thumbnail wants a plugin that has not activated yet (extensions::native::RequestThumbnailPackages).
+constexpr UINT WM_PLUGIN_THUMBNAILS = WM_APP + 150;

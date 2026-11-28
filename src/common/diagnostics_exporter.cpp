@@ -83,15 +83,16 @@ bool IsRuntimeArtifact(std::wstring_view name) {
     if (!name.ends_with(L".jsonl")) return false;
     name.remove_suffix(6);
     if (name.ends_with(L".critical")) name.remove_suffix(9);
-    static constexpr std::array<std::wstring_view, 13> prefixes = {
+    static constexpr std::wstring_view prefixes[] = {
         L"app-", L"index-", L"index-service-", L"index-helper-", L"network-agent-",
-        L"dialog_auto-", L"content-agent-", L"preview-", L"shell-", L"test-", L"unknown-", L"launcher-", L"hotkey_broker-"
+        L"dialog_auto-", L"dialog_runtime-", L"dialog_admin_auto-", L"dialog_user_auto-", L"content-agent-",
+        L"preview-", L"shell-", L"test-", L"unknown-", L"launcher-", L"hotkey_broker-"
     };
-    const auto prefix = std::find_if(prefixes.begin(), prefixes.end(), [name](auto value) {
+    const auto prefix = std::find_if(std::begin(prefixes), std::end(prefixes), [name](auto value) {
         return name.starts_with(value) && name.size() > value.size() &&
             name[value.size()] >= L'0' && name[value.size()] <= L'9';
     });
-    if (prefix == prefixes.end()) return false;
+    if (prefix == std::end(prefixes)) return false;
     name.remove_prefix(prefix->size());
     return !name.empty() && std::all_of(name.begin(), name.end(),
         [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
@@ -249,22 +250,39 @@ void CopyDirectoryArtifacts(const ExportOptions& options, std::wstring_view fold
         if (error != ERROR_FILE_NOT_FOUND) RecordError(state, std::wstring(folder) + L"/", error);
         return;
     }
+    std::vector<WIN32_FIND_DATAW> recent;
+    bool omitted = false;
+    const auto newer = [](const WIN32_FIND_DATAW& left, const WIN32_FIND_DATAW& right) {
+        const LONG order = CompareFileTime(&left.ftLastWriteTime, &right.ftLastWriteTime);
+        return order != 0 ? order > 0 : wcscmp(left.cFileName, right.cFileName) < 0;
+    };
     do {
         const std::wstring_view name(data.cFileName);
         if (!(folder == L"Perf" ? IsPerfArtifact(name) :
               runtime ? IsRuntimeArtifact(name) : IsCrashArtifact(name, options.include_dumps)))
             continue;
-        if (state.records.size() >= kMaxFiles) {
-            RecordError(state, std::wstring(folder) + L"/", ERROR_TOO_MANY_OPEN_FILES);
-            break;
+        // Keep selection bounded, but inspect every name so old files cannot crowd out new evidence.
+        const auto position = std::lower_bound(recent.begin(), recent.end(), data, newer);
+        recent.insert(position, data);
+        if (recent.size() > kMaxFiles) {
+            recent.pop_back();
+            omitted = true;
         }
-        CopyArtifact(JoinPath(source, name), JoinPath(destination, name),
-            std::wstring(folder) + L"/" + std::wstring(name), state, false, runtime && options.support_report);
     } while (FindNextFileW(find, &data));
     const DWORD enumeration_error = GetLastError();
     FindClose(find);
-    if (enumeration_error != ERROR_NO_MORE_FILES && state.records.size() <= kMaxFiles)
+    if (enumeration_error != ERROR_NO_MORE_FILES)
         RecordError(state, std::wstring(folder) + L"/", enumeration_error);
+    for (const auto& entry : recent) {
+        if (state.records.size() >= kMaxFiles) {
+            omitted = true;
+            break;
+        }
+        const std::wstring_view name(entry.cFileName);
+        CopyArtifact(JoinPath(source, name), JoinPath(destination, name),
+            std::wstring(folder) + L"/" + std::wstring(name), state, false, runtime && options.support_report);
+    }
+    if (omitted) RecordError(state, std::wstring(folder) + L"/", ERROR_TOO_MANY_OPEN_FILES);
 }
 
 std::string JsonString(std::wstring_view value) {

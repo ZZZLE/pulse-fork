@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <map>
 #include <set>
 #include <utility>
 
@@ -17,6 +18,9 @@ namespace {
 
 constexpr DWORD kVelocityHideId = 0x639bc8;  // the value ContextMenuManager writes
 constexpr wchar_t kBatchHeader[] = L"PULSE-SYSCTX 1";
+constexpr wchar_t kShellLinkClsid[] = L"{00021401-0000-0000-C000-000000000046}";
+constexpr wchar_t kDisabledShellLinkKey[] =
+    L"lnkfile\\shellex\\-ContextMenuHandlers\\{00021401-0000-0000-C000-000000000046}";
 int g_velocity_override = -1;
 
 struct Key {
@@ -85,10 +89,10 @@ bool ReadDword(HKEY key, const wchar_t* name, DWORD& out) {
            type == REG_DWORD;
 }
 
-std::vector<std::wstring> Subkeys(HKEY key) {
+std::vector<std::wstring> Subkeys(HKEY key, size_t limit = SIZE_MAX) {
     std::vector<std::wstring> out;
     wchar_t name[256];
-    for (DWORD i = 0;; ++i) {
+    for (DWORD i = 0; out.size() < limit; ++i) {
         DWORD len = ARRAYSIZE(name);
         const LSTATUS st = RegEnumKeyExW(key, i, name, &len, nullptr, nullptr, nullptr, nullptr);
         if (st == ERROR_NO_MORE_ITEMS) break;
@@ -191,6 +195,7 @@ bool IsProtectedVerb(std::wstring_view verb) {
 
 bool IsProtectedClsid(std::wstring_view clsid) {
     static const wchar_t* const kClsids[] = {
+        kShellLinkClsid,                            // Provides the open verb for .lnk files
         L"{09799AFB-AD67-11d1-ABCD-00C04FC30936}",  // Open With
         L"{D969A300-E7FF-11d0-A93B-00A0C90F2719}",  // New
         L"{37ea3a21-7493-4208-a011-7f9ea79ce9f5}",  // Open containing folder
@@ -282,45 +287,218 @@ void FillHandler(const Roots& roots, Item& it) {
     }
 }
 
+Item ReadVerbItem(const Roots& roots, const Scene& scene, const std::wstring& cls, Root root,
+                  const std::wstring& relative, const std::wstring& absolute,
+                  const std::wstring& verb, HKEY key) {
+    Item it;
+    it.kind = Kind::Verb;
+    it.root = root;
+    it.scene = scene.id;
+    it.class_key = cls;
+    it.key_name = verb;
+    it.key_path = relative;
+    it.registry_path = absolute;
+    std::wstring text;
+    if (!ReadString(key, L"MUIVerb", text) || text.empty()) ReadString(key, nullptr, text);
+    it.display = text.empty() ? verb : StripMnemonic(ResolveIndirect(roots, text));
+    if (!it.display.empty() && it.display[0] == L'@') it.display = verb;
+    ReadString(key, L"Icon", it.icon);
+    Key cmd;
+    if (Open(key, L"command", KEY_READ, cmd) == ERROR_SUCCESS) ReadString(cmd.h, nullptr, it.command);
+    it.file = ResolveFile(RawPath(it.command));
+    if (it.file.empty() && !it.icon.empty()) it.file = ResolveFile(RawPath(it.icon));
+    it.missing = PointsAtMissingFile(it.command) || PointsAtMissingFile(it.icon);
+    it.extended = HasValue(key, L"Extended");
+    it.position = ReadPlace(key);
+    it.legacy_disable = HasValue(key, L"LegacyDisable");
+    it.programmatic_only = HasValue(key, L"ProgrammaticAccessOnly");
+    DWORD velocity = 0, flags = 0;
+    it.velocity_hidden = ReadDword(key, L"HideBasedOnVelocityId", velocity);
+    it.command_flags_hidden = ReadDword(key, L"CommandFlags", flags) && (flags & 0x8);
+    it.enabled = !(it.legacy_disable || it.programmatic_only || it.velocity_hidden || it.command_flags_hidden);
+    it.is_protected = IsProtectedVerb(verb);
+    if (!it.key_path.starts_with(L"commandstore:"))
+        it.trusted_installer = OwnedByTrustedInstaller(roots, root, it.key_path);
+    return it;
+}
+
 void ScanVerbs(const Roots& roots, const Scene& scene, const std::wstring& cls, Root root,
                std::vector<Item>& out) {
     Key shell;
     if (Open(RootKey(roots, root), FullPath(roots, root, cls + L"\\shell"), KEY_READ, shell) != ERROR_SUCCESS)
         return;
     for (const auto& verb : Subkeys(shell.h)) {
-        // printto only serves drag-onto-printer; Explorer never lists it.
         if (IEquals(verb, L"printto")) continue;
-        Key v;
-        if (Open(shell.h, verb, KEY_READ, v) != ERROR_SUCCESS) continue;
-        Item it;
-        it.kind = Kind::Verb;
-        it.root = root;
-        it.scene = scene.id;
-        it.class_key = cls;
-        it.key_name = verb;
-        it.key_path = cls + L"\\shell\\" + verb;
-        std::wstring text;
-        if (!ReadString(v.h, L"MUIVerb", text) || text.empty()) ReadString(v.h, nullptr, text);
-        it.display = text.empty() ? verb : StripMnemonic(ResolveIndirect(roots, text));
-        if (!it.display.empty() && it.display[0] == L'@') it.display = verb;
-        ReadString(v.h, L"Icon", it.icon);
-        Key cmd;
-        if (Open(v.h, L"command", KEY_READ, cmd) == ERROR_SUCCESS) ReadString(cmd.h, nullptr, it.command);
-        it.file = ResolveFile(RawPath(it.command));
-        if (it.file.empty() && !it.icon.empty()) it.file = ResolveFile(RawPath(it.icon));
-        it.missing = PointsAtMissingFile(it.command) || PointsAtMissingFile(it.icon);
-        it.extended = HasValue(v.h, L"Extended");
-        it.position = ReadPlace(v.h);
-        it.legacy_disable = HasValue(v.h, L"LegacyDisable");
-        it.programmatic_only = HasValue(v.h, L"ProgrammaticAccessOnly");
-        DWORD velocity = 0, flags = 0;
-        it.velocity_hidden = ReadDword(v.h, L"HideBasedOnVelocityId", velocity);
-        it.command_flags_hidden = ReadDword(v.h, L"CommandFlags", flags) && (flags & 0x8);
-        it.enabled = !(it.legacy_disable || it.programmatic_only || it.velocity_hidden || it.command_flags_hidden);
-        it.is_protected = IsProtectedVerb(verb);
-        it.trusted_installer = OwnedByTrustedInstaller(roots, root, it.key_path);
-        out.push_back(std::move(it));
+        Key key;
+        if (Open(shell.h, verb, KEY_READ, key) != ERROR_SUCCESS) continue;
+        const auto relative = cls + L"\\shell\\" + verb;
+        out.push_back(ReadVerbItem(roots, scene, cls, root, relative,
+                                  FullPath(roots, root, relative), verb, key.h));
     }
+}
+
+constexpr uint16_t kRegistryTreeDepth = 16;
+constexpr size_t kRegistryTreeRows = 4096;
+constexpr size_t kRegistryBranchRows = 256;
+
+std::wstring RegistryLocation(Root root, const std::wstring& path) {
+    return (root == Root::Machine ? L"m:" : L"u:") + Lower(path);
+}
+
+bool RelativeRegistryPath(std::wstring_view path) {
+    if (path.empty() || path.size() > 512 || path.front() == L'\\' ||
+        path.find(L"..") != path.npos || path.find(L':') != path.npos ||
+        path.find(L'/') != path.npos) return false;
+    return std::none_of(path.begin(), path.end(), [](wchar_t c) { return c < L' '; });
+}
+
+LSTATUS OpenTreePath(HKEY root, const std::wstring& path, Key& key) {
+    // RegOpenKeyEx can reject a single deeply nested path with ERROR_INVALID_PARAMETER.
+    // Traverse bounded relative segments while preserving the original hive/view.
+    size_t split = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        split = path.find(L'\\', split);
+        if (split == path.npos) return Open(root, path, KEY_READ, key);
+        ++split;
+    }
+    Key parent;
+    const auto status = Open(root, path.substr(0, split - 1), KEY_READ, parent);
+    if (status != ERROR_SUCCESS) return status;
+    return OpenTreePath(parent.h, path.substr(split), key);
+}
+
+// A separate occurrence per parent preserves shared CommandStore references.
+// All reads stay on Enumerate's worker; descendants never become write ops.
+void AppendRegistryTree(const Roots& roots, const Scene& scene, Item item,
+                        std::vector<Item>& out, std::set<std::wstring>& active,
+                        size_t& remaining) {
+    const auto location = RegistryLocation(item.root, item.registry_path);
+    const size_t index = out.size();
+    out.push_back(std::move(item));
+    auto& initial = out[index];
+    if (initial.kind != Kind::Verb) return;
+    Key key;
+    if (OpenTreePath(RootKey(roots, initial.root), initial.registry_path, key) != ERROR_SUCCESS) {
+        initial.children_incomplete = true;
+        return;
+    }
+    std::wstring commands, extended;
+    const bool subcommands = ReadString(key.h, L"SubCommands", commands);
+    ReadString(key.h, L"ExtendedSubCommandsKey", extended);
+    Key inline_shell;
+    const bool embedded = Open(key.h, L"shell", KEY_READ, inline_shell) == ERROR_SUCCESS;
+    initial.has_children = subcommands || !extended.empty() || embedded;
+    if (!initial.has_children) return;
+    if (initial.depth >= kRegistryTreeDepth || remaining == 0) {
+        initial.children_incomplete = true;
+        return;
+    }
+    active.insert(location);
+    // Copy parent data before appending: vector growth invalidates references.
+    const auto parent_id = initial.tree_id;
+    const auto class_key = initial.class_key;
+    const auto parent_relative = initial.key_path;
+    const auto parent_path = initial.registry_path;
+    const auto parent_root = initial.root;
+    const uint16_t depth = initial.depth + 1;
+    std::set<std::wstring> siblings;
+    size_t added = 0;
+    auto append = [&](Root root, const std::wstring& relative, const std::wstring& full,
+                      const std::wstring& name, HKEY child_key) {
+        const auto child_location = RegistryLocation(root, full);
+        if (!siblings.insert(child_location).second) return;
+        if (active.contains(child_location) || remaining == 0 || added >= kRegistryBranchRows) {
+            out[index].children_incomplete = true;
+            return;
+        }
+        auto child = ReadVerbItem(roots, scene, class_key, root, relative, full, name, child_key);
+        child.parent_id = parent_id;
+        child.tree_id = parent_id + L"|" + child_location;
+        child.depth = depth;
+        child.registry_read_only = true;
+        --remaining;
+        ++added;
+        const size_t child_index = out.size();
+        AppendRegistryTree(roots, scene, std::move(child), out, active, remaining);
+        out[index].children_incomplete = out[index].children_incomplete || out[child_index].children_incomplete;
+    };
+    auto scan_shell = [&](const std::wstring& relative) {
+        if (!RelativeRegistryPath(relative)) { out[index].children_incomplete = true; return; }
+        std::set<std::wstring> names;
+        bool found = false;
+        for (const Root root : {Root::User, Root::Machine}) {
+            Key shell;
+            if (OpenTreePath(RootKey(roots, root), FullPath(roots, root, relative), shell) != ERROR_SUCCESS)
+                continue;
+            found = true;
+            for (const auto& name : Subkeys(shell.h, kRegistryBranchRows + 1)) {
+                if (IEquals(name, L"printto") || !names.insert(Lower(name)).second) continue;
+                if (added >= kRegistryBranchRows || remaining == 0) {
+                    out[index].children_incomplete = true; break;
+                }
+                Key child;
+                if (Open(shell.h, name, KEY_READ, child) != ERROR_SUCCESS) {
+                    out[index].children_incomplete = true; continue;
+                }
+                const auto path = Join(relative, name);
+                append(root, path, FullPath(roots, root, path), name, child.h);
+            }
+        }
+        if (!found) out[index].children_incomplete = true;
+    };
+    if (!commands.empty()) {
+        size_t offset = 0;
+        size_t references = 0;
+        while (offset <= commands.size()) {
+            if (++references > kRegistryBranchRows || remaining == 0) {
+                out[index].children_incomplete = true; break;
+            }
+            const auto end = commands.find(L';', offset);
+            auto token = commands.substr(offset, end == commands.npos ? commands.npos : end - offset);
+            const auto first = token.find_first_not_of(L" \t\r\n");
+            const auto last = token.find_last_not_of(L" \t\r\n");
+            token = first == token.npos ? L"" : token.substr(first, last - first + 1);
+            if (!token.empty()) {
+                bool found = false;
+                if (RelativeRegistryPath(token) && token.find(L'\\') == token.npos) {
+                    // Match the existing runtime resolver: machine CommandStore first.
+                    for (const Root root : {Root::Machine, Root::User}) {
+                        const auto& store = root == Root::Machine ? roots.machine_command_store : roots.user_command_store;
+                        if (store.empty()) continue;
+                        const auto full = Join(store, token);
+                        Key child;
+                        if (OpenTreePath(RootKey(roots, root), full, child) != ERROR_SUCCESS) continue;
+                        append(root, L"commandstore:" + token, full, token, child.h);
+                        found = true; break;
+                    }
+                }
+                if (!found) out[index].children_incomplete = true;
+            }
+            if (end == commands.npos) break;
+            offset = end + 1;
+        }
+    } else if (embedded || subcommands) {
+        if (parent_relative.starts_with(L"commandstore:")) {
+            if (embedded) {
+                for (const auto& name : Subkeys(inline_shell.h, kRegistryBranchRows + 1)) {
+                    if (IEquals(name, L"printto")) continue;
+                    if (added >= kRegistryBranchRows || remaining == 0) {
+                        out[index].children_incomplete = true; break;
+                    }
+                    Key child;
+                    if (Open(inline_shell.h, name, KEY_READ, child) == ERROR_SUCCESS)
+                        append(parent_root, parent_relative + L"\\shell\\" + name,
+                               parent_path + L"\\shell\\" + name, name, child.h);
+                }
+            }
+        } else scan_shell(parent_relative + L"\\shell");
+    }
+    if (!extended.empty()) {
+        while (!extended.empty() && extended.back() == L'\\') extended.pop_back();
+        if (Lower(extended).ends_with(L"\\shell")) scan_shell(extended);
+        else scan_shell(extended + L"\\shell");
+    }
+    active.erase(location);
 }
 
 void ScanHandlers(const Roots& roots, const Scene& scene, const std::wstring& cls, Root root,
@@ -652,10 +830,29 @@ void PruneEmptyParents(HKEY base, std::wstring path, const std::wstring& stop) {
 }
 
 // Moves <parent>\\<from>\\<name> to <parent>\\<to>\\<name>, keeping values and subkeys.
-OpResult MoveKey(const Roots& roots, Root root, const std::wstring& src_rel, const std::wstring& dst_rel) {
+OpResult MoveKey(const Roots& roots, Root root, const std::wstring& src_rel, const std::wstring& dst_rel,
+                 bool replace_stale) {
     HKEY base = RootKey(roots, root);
     const std::wstring src = FullPath(roots, root, src_rel);
-    const OpResult moved = MoveTree(base, src, FullPath(roots, root, dst_rel));
+    const std::wstring dst = FullPath(roots, root, dst_rel);
+    {
+        Key src_key;
+        const LSTATUS st = Open(base, src, KEY_READ, src_key);
+        if (st != ERROR_SUCCESS) return FromStatus(st);
+    }
+    // An app update may re-register ContextMenuHandlers\X while a prior disabled
+    // -ContextMenuHandlers\X copy remains (#620); clear the stale copy first.
+    if (replace_stale) {
+        Key stale;
+        if (Open(base, dst, KEY_READ, stale) == ERROR_SUCCESS) {
+            RegCloseKey(stale.h);
+            stale.h = nullptr;
+            const LSTATUS del = RegDeleteTreeW(base, dst.c_str());
+            if (del != ERROR_SUCCESS && del != ERROR_FILE_NOT_FOUND && del != ERROR_PATH_NOT_FOUND)
+                return FromStatus(del);
+        }
+    }
+    const OpResult moved = MoveTree(base, src, dst);
     if (moved != OpResult::Ok) return moved;
     // An emptied (-)ContextMenuHandlers group goes too, so a round trip leaves
     // no trace.
@@ -862,9 +1059,11 @@ std::vector<Item> Enumerate(const Roots& roots, const Scene& scene) {
             }
         break;
     }
-    // HKCR shows one entry per key; the user layer wins over the machine one.
+    // HKCR shows one entry per key; the user layer wins over the machine one,
+    // except that a dash-renamed User marker (-ContextMenuHandlers, etc.) never
+    // masks a still-live Machine key in Explorer (#620).
     std::vector<Item> out;
-    std::set<std::wstring> seen;
+    std::map<std::wstring, size_t> seen;
     for (auto& it : raw) {
         std::wstring id = Lower(it.key_path);
         if (it.kind == Kind::ShellEx || it.kind == Kind::DragDrop) {
@@ -875,8 +1074,24 @@ std::vector<Item> Enumerate(const Roots& roots, const Scene& scene) {
             id = Lower(it.key_path.substr(0, it.key_path.size() - 10)) + L"\\shellnew";
         }
         id = std::wstring(KindToken(it.kind)) + L"|" + id;
-        if (!seen.insert(id).second) continue;
+        const auto [pos, inserted] = seen.emplace(std::move(id), out.size());
+        if (!inserted) {
+            if (!out[pos->second].enabled && out[pos->second].dash_marker && it.enabled)
+                out[pos->second] = std::move(it);
+            continue;
+        }
         out.push_back(std::move(it));
+    }
+    if (scene.mode == SceneMode::Menu) {
+        std::vector<Item> tree;
+        size_t remaining = kRegistryTreeRows;
+        std::set<std::wstring> active;
+        for (auto& item : out) {
+            if (item.registry_path.empty()) item.registry_path = FullPath(roots, item.root, item.key_path);
+            item.tree_id = L"registry:" + scene.id + L"|" + RegistryLocation(item.root, item.registry_path);
+            AppendRegistryTree(roots, scene, std::move(item), tree, active, remaining);
+        }
+        return tree;
     }
     return out;
 }
@@ -982,7 +1197,9 @@ Op MakeOp(const Item& item, Action action) {
     op.action = action;
     op.kind = item.kind;
     op.root = item.root;
-    op.key_path = item.key_path;
+    // A child may be a globally shared CommandStore reference. Never turn a
+    // read-only tree occurrence into an Explorer-wide mutation batch.
+    if (!item.registry_read_only) op.key_path = item.key_path;
     return op;
 }
 
@@ -1035,10 +1252,37 @@ Op Inverse(const Op& op) {
 
 bool CanWriteWithoutElevation(const Op& op) { return op.root != Root::Machine; }
 
+bool CanRestoreShellLink(const Item& item) {
+    return item.kind == Kind::ShellEx && item.source == Source::Registry && !item.enabled && item.dash_marker &&
+           IEquals(item.key_path, kDisabledShellLinkKey);
+}
+
+bool IsShellLinkRestore(const Op& op) {
+    return op.kind == Kind::ShellEx && op.action == Action::Enable && IEquals(op.key_path, kDisabledShellLinkKey);
+}
+
 OpResult Apply(const Roots& roots, const Op& op) {
     if (op.root == Root::File) return OpResult::Unsupported;
     if (!IsAllowedKeyPath(op.kind, op.key_path)) return OpResult::Unsupported;
     if (op.action == Action::Position && op.kind != Kind::Verb) return OpResult::Unsupported;
+    if (op.kind == Kind::ShellEx && (op.action == Action::Disable || op.action == Action::Delete)) {
+        const std::wstring_view path = op.key_path;
+        const size_t last = path.rfind(L'\\');
+        const auto parent = path.substr(0, last);
+        if (IEquals(parent, L"lnkfile\\shellex\\ContextMenuHandlers") ||
+            IEquals(parent, L"lnkfile\\shellex\\-ContextMenuHandlers")) {
+            const auto name = path.substr(last + 1);
+            if (IEquals(name, kShellLinkClsid)) return OpResult::Unsupported;
+            if (!LooksLikeGuid(name)) {
+                Key handler;
+                const LSTATUS st = Open(RootKey(roots, op.root), FullPath(roots, op.root, op.key_path), KEY_READ, handler);
+                if (st != ERROR_SUCCESS) return FromStatus(st);
+                std::wstring clsid;
+                if (ReadString(handler.h, nullptr, clsid) && IEquals(clsid, kShellLinkClsid))
+                    return OpResult::Unsupported;
+            }
+        }
+    }
     if (op.action == Action::Delete || op.action == Action::Restore) {
         if (op.kind != Kind::Verb && op.kind != Kind::ShellEx && op.kind != Kind::DragDrop) return OpResult::Unsupported;
         return ApplyTrash(roots, op);
@@ -1049,7 +1293,7 @@ OpResult Apply(const Roots& roots, const Op& op) {
     case Kind::DragDrop: {
         const std::wstring target = KeyPathAfter(op);
         if (IEquals(target, op.key_path)) return OpResult::Ok;  // already in the requested state
-        return MoveKey(roots, op.root, op.key_path, target);
+        return MoveKey(roots, op.root, op.key_path, target, !IsShellLinkRestore(op));
     }
     default: return OpResult::Unsupported;  // ShellNew / SendTo / OpenWith: S3
     }

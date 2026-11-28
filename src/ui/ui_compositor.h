@@ -46,12 +46,33 @@ struct ComPtr {
 
 class Compositor {
     friend struct QuickPreviewAuditTest;
+    friend struct RenameOverlayTest;
 public:
     Compositor();
     ~Compositor();
 
     bool Init(HWND hwnd);
     void SetCompositionAboveChildren(bool enabled) { composition_above_children_ = enabled; }
+    // Secondary tool/progress windows sharing the UI thread's DXGI device use
+    // sync_interval=0 so their Present() never VSync-stalls the main window.
+    void SetSyncInterval(UINT interval) { sync_interval_ = interval; }
+    struct SharedThreadDevices {
+        ID3D11Device* d3d = nullptr;
+        IDXGIDevice1* dxgi = nullptr;
+        ID2D1Factory1* d2d_factory = nullptr;
+        ID2D1Device* d2d = nullptr;
+        IDCompositionDevice* dcomp = nullptr;
+    };
+    // Shares this UI thread's single D3D11 + D2D device with non-Compositor
+    // surfaces (such as the desktop layer and transient overlay windows) so the
+    // process does not pay ~15-20 MB of GPU driver heaps and worker threads per surface.
+    static bool AcquireSharedThreadDevices(SharedThreadDevices& out);
+    static void ReleaseSharedThreadDevices(ID3D11Device* d3d) noexcept;
+    // Creates a composition-only IDCompositionDevice (safe when the thread's IDXGIDevice
+    // is already bound to another IDCompositionDevice, including on Windows 10 where v1
+    // DCompositionCreateDevice(nullptr, ...) returns E_INVALIDARG).
+    static HRESULT CreateCompositionOnlyDevice(IDCompositionDevice** out) noexcept;
+
     // Starts creating the process's first D3D11 device on a worker thread;
     // the first Init on any thread takes it (waiting if needed) instead of
     // creating its own. Driver loading dominates that call (about 250 ms on
@@ -59,6 +80,9 @@ public:
     static void PrefetchSharedDevice();
     const std::wstring& InitializationError() const { return initialization_error_; }
     void Shutdown();
+    void HibernateHiddenSurface() noexcept;
+    void EnsureAwake() noexcept;
+    static void TrimThreadGraphicsForBackground() noexcept;
     void Resize(int width, int height);
     // dirty: the only client rect this frame drew (partial redraw); null for
     // a whole frame. Ignored unless CanPresentPartial().
@@ -69,7 +93,10 @@ public:
     // buffers (FLIP_SEQUENTIAL) and the last frame reached the screen whole,
     // so the next one may redraw part of it. PULSE_PARTIAL_REDRAW=0 turns it off.
     static bool PartialRedrawEnabled();
-    bool CanPresentPartial() const { return partial_swap_ && !full_next_ && !device_lost_; }
+    bool CanPresentPartial() const {
+        return partial_swap_ && !full_next_ && !device_lost_ && !captureNext_ &&
+            (!FrameCopyEnabled() || frameCopy_.get());
+    }
     void ForceFullFrame() { full_next_ = true; }
     // A lost device, or a swap chain that could not be resized: the next
     // Recover() rebuilds the window's graphics.
@@ -78,7 +105,10 @@ public:
     bool NeedsRecovery() const { return device_lost_; }
     bool SaveSnapshot(const wchar_t* path);
 
-    ID2D1DeviceContext* Dc() const { return dc_.get(); }
+    ID2D1DeviceContext* Dc() const {
+        const_cast<Compositor*>(this)->EnsureAwake();
+        return dc_.get();
+    }
     IDWriteFactory2* DwriteFactory() const { return dwriteFactory_.get(); }
     HWND Hwnd() const { return hwnd_; }
     bool AdapterDescription(DXGI_ADAPTER_DESC& description) const {
@@ -94,6 +124,8 @@ public:
     IDWriteTextFormat* SmallFormat() const { return smallFormat_.get(); }
     IDWriteTextFormat* HeaderFormat() const { return headerFormat_.get(); }
     IDWriteTextFormat* TabFormat() const { return tabFormat_.get(); }
+    // The active tab's title: TabFormat in SemiBold.
+    IDWriteTextFormat* TabActiveFormat() const { return tabActiveFormat_.get() ? tabActiveFormat_.get() : tabFormat_.get(); }
     IDWriteTextFormat* AddressFormat() const { return addressFormat_.get(); }
     IDWriteTextFormat* IconFormat() const { return iconFormat_.get(); }
     bool DrawLumaText(std::wstring_view text, IDWriteTextFormat* format,
@@ -172,12 +204,14 @@ private:
     std::wstring initialization_error_;
     bool InitD3D();
     bool CreateSwapChain();
-    void CopyFrame();
+    void CopyFrame(const RECT* dirty);
     void ResizeSwapChain();
+    bool ResizeSwapChainTo(int width, int height);
     static bool IsDeviceLost(HRESULT hr);
 
     HWND hwnd_ = nullptr;
     bool composition_above_children_ = false;
+    UINT sync_interval_ = 1;
     int width_ = 0;
     int height_ = 0;
 
@@ -202,6 +236,7 @@ private:
     ComPtr<IDWriteTextFormat> smallFormat_;
     ComPtr<IDWriteTextFormat> headerFormat_;
     ComPtr<IDWriteTextFormat> tabFormat_;
+    ComPtr<IDWriteTextFormat> tabActiveFormat_;
     ComPtr<IDWriteTextFormat> addressFormat_;
     ComPtr<IDWriteTextFormat> iconFormat_;
     std::unique_ptr<LumaTextRenderer> lumaText_;
@@ -211,6 +246,7 @@ private:
     bool device_lost_ = false;
     bool partial_swap_ = false;   // FLIP_SEQUENTIAL: buffers keep their pixels
     bool full_next_ = true;       // new buffers, a skipped or occluded present
+    bool hibernated_ = false;
 };
 
 } // namespace pulse::ui
