@@ -1,9 +1,13 @@
 # Pulse
 
-<img src="assets/pulse-logo.png" alt="Pulse" width="80">
+<img src="assets/pulse-logo-fork.png" alt="Pulse" width="80">
 
 > 本仓库是 **[jimmgreen/pulse](https://github.com/jimmgreen/pulse)** 的 fork，
 > **只改动下面列出的部分**。未改动的功能、构建方式、下载与历史版本，请以上游仓库为准。
+
+![工具栏「打开」按钮与红绿灯窗口按钮](docs/images/fork-open-button.png)
+
+*上图：红绿灯窗口按钮（右上角），以及工具栏「打开」按钮展开的打开方式菜单。*
 
 ## 本 fork 的改动
 
